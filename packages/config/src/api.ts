@@ -3,7 +3,8 @@ import { z } from 'zod';
 import {
   booleanFromString,
   integerFromString,
-  nodeEnvSchema
+  nodeEnvSchema,
+  optionalUrlFromString
 } from './helpers.js';
 
 export const apiEnvSchema = z.object({
@@ -40,7 +41,7 @@ export const apiEnvSchema = z.object({
   COMMANDS_QUEUE: z.string().min(1).default('commands'),
   APPROVALS_QUEUE: z.string().min(1).default('approvals'),
   EXPORTS_QUEUE: z.string().min(1).default('exports'),
-  TASKS_TARGET_BASE_URL: z.string().url().optional(),
+  TASKS_TARGET_BASE_URL: optionalUrlFromString(),
   AGENT_EVENTS_TOPIC: z.string().min(1).default('agent-events'),
   BUDGET_EVENTS_TOPIC: z.string().min(1).default('budget-events'),
   OPERATOR_ALERTS_TOPIC: z.string().min(1).default('operator-alerts'),

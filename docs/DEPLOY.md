@@ -2,25 +2,43 @@
 
 ## Current Truth
 
-As of `2026-04-20`, the repository has a real build/deploy path prepared for Cloud Run, but no successful deployment has been claimed from this branch.
+As of `2026-04-20`, the API has completed a first real Cloud Build + Cloud Run
+deployment from branch `phase3/live-deploy-and-vertex`.
 
-Prepared artifacts:
+Confirmed deployment:
 
-- Cloud Build config:
-  [infra/cloudbuild/api.cloudbuild.yaml](/D:/Operator-OS-Dev/infra/cloudbuild/api.cloudbuild.yaml)
-- Cloud Run manifest:
-  [infra/cloud-run/api.service.yaml](/D:/Operator-OS-Dev/infra/cloud-run/api.service.yaml)
-- PowerShell deploy script:
-  [deploy-api.ps1](/D:/Operator-OS-Dev/infra/scripts/deploy-api.ps1)
-- verification script:
-  [verify-api.ps1](/D:/Operator-OS-Dev/infra/scripts/verify-api.ps1)
+- Cloud Build id: `44dd3fac-6f49-47f7-a04b-95e663a5f048`
+- image:
+  `europe-west4-docker.pkg.dev/operator-os-dev/operator-os-docker/operator-os-api:phase3-fix2`
+- Cloud Run service: `operator-os-api`
+- region: `europe-west4`
+- ready revision: `operator-os-api-00003-rzm`
+- service URL:
+  `https://operator-os-api-m545sz2isq-ez.a.run.app`
+
+The service requires authentication and uses:
+
+- runtime service account:
+  `cloudrun-runtime@operator-os-dev.iam.gserviceaccount.com`
+
+## What Was Fixed During Pass 3
+
+Two deployment blockers were fixed before the first healthy revision came up:
+
+1. `infra/cloudbuild/api.cloudbuild.yaml`
+   Cloud Build treated `${IMAGE_URI}` as an invalid substitution key.
+2. `apps/api/Dockerfile`
+   the runtime image did not include package-local `node_modules` for the API
+   workspace and shared workspace packages.
+3. `packages/config/src/api.ts`
+   an empty `TASKS_TARGET_BASE_URL` was parsed as an invalid URL instead of an
+   intentionally unset value.
 
 ## Local Build
 
+Workspace validation that currently passes:
+
 ```powershell
-pnpm install
-pnpm lint
-pnpm typecheck
 pnpm test
 pnpm build
 ```
@@ -36,75 +54,92 @@ docker build -f apps/api/Dockerfile -t operator-os-api:local .
 Current blocker:
 
 - Docker Desktop is installed
-- Docker service has been started
-- WSL Windows features were enabled during this pass
-- the local daemon still returns a `500 Internal Server Error` for `docker version`
-- a reboot and Docker engine recovery are still required before a truthful local image build can be claimed
+- Docker Desktop logs report `wslUpdateRequired=true`
+- `wsl --status` still reports that WSL is not installed/available
+- the current shell is not elevated, so Windows feature / WSL repair could not
+  be completed from this pass
+- a truthful local Docker build is still not confirmed
+
+Minimal manual recovery path:
+
+1. open an elevated terminal
+2. run `wsl.exe --install`
+3. reboot Windows
+4. start Docker Desktop
+5. re-run:
+
+```powershell
+docker version
+docker info
+docker build -f apps/api/Dockerfile -t operator-os-api:local .
+```
 
 ## Artifact Registry Target
 
 - repository: `operator-os-docker`
 - project: `operator-os-dev`
-- preferred image path:
+- image path pattern:
   `europe-west4-docker.pkg.dev/operator-os-dev/operator-os-docker/operator-os-api:<tag>`
 
-## Cloud Run Target
+## Cloud Build Deployment Flow
 
-- service: `operator-os-api`
-- region: `europe-west4`
-- service account:
-  `cloudrun-runtime@operator-os-dev.iam.gserviceaccount.com`
-- auth mode: require authentication
+The currently working remote build path uses:
 
-## Deployment Flow
+- build service account:
+  `projects/operator-os-dev/serviceAccounts/deploy-bot@operator-os-dev.iam.gserviceaccount.com`
+- source staging dir:
+  `gs://operator-os-dev-artifacts/cloud-build/source`
+- log dir:
+  `gs://operator-os-dev-artifacts/cloud-build/logs`
 
-### Option A: Cloud Build
+Repository script:
 
-```powershell
-.\infra\scripts\deploy-api.ps1 -ImageTag pass2 -UseCloudBuild -Deploy
-```
+- [deploy-api.ps1](/D:/Operator-OS-Dev/infra/scripts/deploy-api.ps1)
 
-### Option B: Direct gcloud deploy
-
-```powershell
-.\infra\scripts\deploy-api.ps1 -ImageTag pass2 -UseCloudBuild:$false -Deploy
-```
-
-## Required Manual Inputs
-
-Before a real deploy can be validated, these still need to happen:
-
-1. `gcloud auth login`
-2. `gcloud auth application-default login`
-3. apply the least-privilege runtime IAM plan
-4. repair local Docker / WSL if local image verification is required
-5. provide a real `TASKS_TARGET_BASE_URL`
-
-`TASKS_TARGET_BASE_URL` should point at the deployed API base URL once Cloud Run has a stable service URL. Until then, queue dispatch remains in controlled fallback mode.
-
-## Verification Flow
-
-After a real deploy:
+Example:
 
 ```powershell
-.\infra\scripts\verify-api.ps1
+.\infra\scripts\deploy-api.ps1 -ImageTag pass3 -UseCloudBuild -Deploy
 ```
 
-This script expects:
+## Cloud Run Verification
 
-- the Cloud Run service to exist
-- the caller to be able to obtain an identity token
-- authenticated access to `/health` and `/ready`
+Repository script:
 
-## Repo-Based Deploy Path
+- [verify-api.ps1](/D:/Operator-OS-Dev/infra/scripts/verify-api.ps1)
 
-The repo already contains a workable repo-based path:
+Current verified state:
 
-- GitHub Actions validates the monorepo
-- Cloud Build can build and optionally deploy the API image
-- Cloud Run manifest and deploy script share the same service/account assumptions
+- `/health` returns `200`
+- `/ready` currently returns `503`
 
-What is still not finished:
+The readiness result is honest. It remains degraded because:
 
-- no GitHub-to-Cloud-Build trigger or Developer Connect path was configured in this pass
-- no successful end-to-end deploy verification has been recorded from this branch
+- `TASKS_TARGET_BASE_URL` is still unset
+- command/export delivery paths remain in controlled fallback mode
+
+## Required Next Input
+
+Set a real task target after the service URL is accepted as the canonical API
+base URL:
+
+- `TASKS_TARGET_BASE_URL=https://operator-os-api-m545sz2isq-ez.a.run.app`
+
+After that, redeploy and verify that `/ready` moves from `503` to the expected
+state for the remaining integrations.
+
+## Repo-Based Continuous Deployment
+
+Not yet claimed as working.
+
+What exists:
+
+- GitHub Actions CI for the monorepo
+- Cloud Build config for build + deploy
+- Cloud Run manifest and deploy script aligned to the same service assumptions
+
+What is still missing:
+
+- no GitHub-to-Cloud-Build trigger or Developer Connect integration was
+  configured or validated in this pass
+- no real push-triggered continuous deployment has been verified yet

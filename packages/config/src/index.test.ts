@@ -15,6 +15,14 @@ describe('@operator-os/config', () => {
     expect(env.BIGQUERY_DATASET).toBe('ops_analytics');
   });
 
+  it('treats an empty tasks target base url as unset', () => {
+    const env = parseApiEnv({
+      TASKS_TARGET_BASE_URL: ''
+    });
+
+    expect(env.TASKS_TARGET_BASE_URL).toBeUndefined();
+  });
+
   it('parses desktop agent values', () => {
     const env = parseDesktopAgentEnv({
       AGENT_ID: 'agent-1',

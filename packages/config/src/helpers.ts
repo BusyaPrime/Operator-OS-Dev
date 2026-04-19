@@ -24,3 +24,13 @@ export const integerFromString = (defaultValue: number) =>
       value === undefined ? defaultValue : Number.parseInt(value, 10)
     )
     .pipe(z.number().int().positive());
+
+export const optionalUrlFromString = () =>
+  z.preprocess((value) => {
+    if (typeof value !== 'string') {
+      return value;
+    }
+
+    const normalized = value.trim();
+    return normalized.length === 0 ? undefined : normalized;
+  }, z.string().url().optional());

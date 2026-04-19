@@ -32,10 +32,13 @@ ENV NODE_ENV=production
 COPY --from=deps /app/node_modules ./node_modules
 COPY --from=build /app/apps/api/package.json ./apps/api/package.json
 COPY --from=build /app/apps/api/dist ./apps/api/dist
+COPY --from=deps /app/apps/api/node_modules ./apps/api/node_modules
 COPY --from=build /app/packages/contracts/package.json ./packages/contracts/package.json
 COPY --from=build /app/packages/contracts/dist ./packages/contracts/dist
+COPY --from=deps /app/packages/contracts/node_modules ./packages/contracts/node_modules
 COPY --from=build /app/packages/config/package.json ./packages/config/package.json
 COPY --from=build /app/packages/config/dist ./packages/config/dist
+COPY --from=deps /app/packages/config/node_modules ./packages/config/node_modules
 
 EXPOSE 8080
 WORKDIR /app/apps/api

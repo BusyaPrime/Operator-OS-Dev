@@ -42,12 +42,10 @@ steps:
           exit 0
         fi
 
-        IMAGE_URI="europe-west4-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:${_IMAGE_TAG}"
-
         gcloud run deploy "${_SERVICE_NAME}" \
           --project="$PROJECT_ID" \
           --region="${_REGION}" \
-          --image="${IMAGE_URI}" \
+          --image="europe-west4-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:${_IMAGE_TAG}" \
           --platform=managed \
           --service-account="cloudrun-runtime@${PROJECT_ID}.iam.gserviceaccount.com" \
           --no-allow-unauthenticated \
