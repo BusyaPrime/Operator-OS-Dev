@@ -2,19 +2,29 @@
 
 ## Why Vertex Only
 
-The project is GCP-first and intentionally avoids a mixed-model runtime in the product. Vertex AI gives the repo a single managed auth, billing, and deployment context for explainability features such as summaries, activity explanations, cost advice, and task breakdowns.
+The product is GCP-first and intentionally avoids a mixed-model runtime inside the application. Vertex AI keeps auth, billing, deployment, and logging inside one cloud boundary and aligns with the Cloud Run service-identity model.
 
-## Provider Strategy
+## Current Provider Strategy
 
-The API owns the first provider implementation. It exposes a generic `AIProvider` interface and a `VertexAIProvider` implementation so the rest of the system can depend on stable methods instead of a vendor-specific SDK surface.
+The API owns the first provider implementation:
 
-Planned bootstrap methods:
+- `AIProvider`
+- `VertexAIProvider`
+
+Current live-ready entrypoints:
 
 - `generateText()`
 - `summarizeOperatorState()`
 - `explainAgentActivity()`
 - `suggestCostOptimizations()`
 - `planTaskBreakdown()`
+
+Current API routes:
+
+- `/v1/ai/summarize/operator-state`
+- `/v1/ai/explain/agent-activity`
+- `/v1/ai/suggest-cost-optimizations`
+- `/v1/ai/plan-task-breakdown`
 
 ## Auth Model
 
@@ -23,7 +33,7 @@ Preferred auth paths:
 - local development: ADC via `gcloud auth application-default login`
 - Cloud Run: attached service account `cloudrun-runtime@operator-os-dev.iam.gserviceaccount.com`
 
-The bootstrap branch does not assume or require checked-in API keys.
+The current provider does not require a checked-in API key and does not use OpenAI SDKs.
 
 ## Environment
 
@@ -33,22 +43,35 @@ Current expected configuration:
 - `VERTEX_LOCATION=europe-west4`
 - `VERTEX_MODEL=gemini-2.5-flash`
 
-The model ID remains configurable because model lifecycle changes over time on Vertex AI.
+The model ID stays configurable because Vertex model availability changes over time.
 
-## What Is Implemented In Bootstrap
+## Error Behavior
 
-- provider abstraction in the API
+The provider now maps the most important failure classes explicitly:
+
+- missing ADC
+- missing IAM permissions
+- invalid project / region / model configuration
+- unexpected upstream Vertex errors
+
+This means the API can fail honestly with a real status code instead of returning a fake summary.
+
+## What Is Implemented
+
+- provider abstraction
 - lazy Vertex client creation
-- request methods that call Gemini through Vertex
-- honest error handling when ADC or permissions are missing
+- ADC detection
+- readiness reporting
+- explicit error mapping
+- first explainability routes
 
 ## What Is Not Implemented Yet
 
 - tool calling
 - prompt registry
+- evaluation harness
 - safety policy tuning
-- grounding integrations
-- automated evaluation
+- grounding
 - production prompt versioning
 
 ## Manual Step For Local Calls
@@ -59,4 +82,4 @@ If local Vertex calls fail because ADC is not configured, run:
 gcloud auth application-default login
 ```
 
-Cloud Run should not need this manual step because the runtime will use its attached service account.
+Cloud Run should not need this manual step if the runtime service account has the correct IAM roles.

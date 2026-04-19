@@ -1,4 +1,3 @@
-import type { ApiEnv } from '@operator-os/config';
 import type { ServiceCheck } from '@operator-os/contracts';
 
 export interface GenerateTextInput {
@@ -22,6 +21,7 @@ export interface GenerateTextResult {
 export interface AIProvider {
   readonly name: string;
   readonly model: string;
+  describeReadiness(): ServiceCheck;
   generateText(input: GenerateTextInput): Promise<GenerateTextResult>;
   summarizeOperatorState(state: unknown): Promise<GenerateTextResult>;
   explainAgentActivity(activity: unknown): Promise<GenerateTextResult>;
@@ -31,5 +31,5 @@ export interface AIProvider {
 
 export interface OperatorModule {
   name: string;
-  describeReadiness(config: ApiEnv): ServiceCheck;
+  describeReadiness(): ServiceCheck;
 }

@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
 
-import { commandSchema, deviceStateSchema, healthResponseSchema } from './index.js';
+import {
+  authSessionSchema,
+  commandQueuePayloadSchema,
+  commandSchema,
+  deviceStateSchema,
+  healthResponseSchema,
+  operatorStateSchema
+} from './index.js';
 
 describe('@operator-os/contracts', () => {
   it('parses a health response payload', () => {
@@ -44,5 +51,48 @@ describe('@operator-os/contracts', () => {
     });
 
     expect(state.capabilities).toContain('commands');
+  });
+
+  it('parses an operator state snapshot', () => {
+    const state = operatorStateSchema.parse({
+      devices: [],
+      sessions: [],
+      alerts: [],
+      costs: [],
+      generatedAt: '2026-04-20T10:00:00.000Z',
+      dataSource: 'bootstrap-fallback',
+      fallbackReason: 'Firestore is not configured locally yet.'
+    });
+
+    expect(state.dataSource).toBe('bootstrap-fallback');
+  });
+
+  it('parses an auth session payload', () => {
+    const session = authSessionSchema.parse({
+      authenticated: false,
+      source: 'bootstrap-fallback',
+      message: 'Firebase Admin ADC is not configured locally.'
+    });
+
+    expect(session.authenticated).toBe(false);
+  });
+
+  it('parses a queued command payload', () => {
+    const payload = commandQueuePayloadSchema.parse({
+      queue: 'commands',
+      requestedAt: '2026-04-20T10:00:00.000Z',
+      command: {
+        id: 'cmd-1',
+        type: 'start_session',
+        status: 'pending',
+        deviceId: 'device-1',
+        operatorId: 'operator-1',
+        approvalRequired: true,
+        payload: {},
+        createdAt: '2026-04-20T10:00:00.000Z'
+      }
+    });
+
+    expect(payload.queue).toBe('commands');
   });
 });

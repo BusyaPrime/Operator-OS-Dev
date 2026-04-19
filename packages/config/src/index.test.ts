@@ -12,6 +12,7 @@ describe('@operator-os/config', () => {
 
     expect(env.PORT).toBe(8080);
     expect(env.GOOGLE_CLOUD_PROJECT).toBe('operator-os-dev');
+    expect(env.BIGQUERY_DATASET).toBe('ops_analytics');
   });
 
   it('parses desktop agent values', () => {
@@ -23,6 +24,7 @@ describe('@operator-os/config', () => {
 
     expect(env.AGENT_ID).toBe('agent-1');
     expect(env.ENABLE_COMMAND_EXECUTION).toBe(false);
+    expect(env.CONTROLLED_FALLBACK).toBe(true);
   });
 
   it('parses mobile public config', () => {
@@ -32,5 +34,6 @@ describe('@operator-os/config', () => {
     });
 
     expect(env.EXPO_PUBLIC_USE_MOCKS).toBe(true);
+    expect(env.EXPO_PUBLIC_AUTH_MODE).toBe('bootstrap-fallback');
   });
 });

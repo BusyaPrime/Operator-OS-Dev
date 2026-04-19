@@ -6,6 +6,7 @@ on:
     branches:
       - main
       - bootstrap/**
+      - phase2/**
       - feature/**
       - chore/**
 

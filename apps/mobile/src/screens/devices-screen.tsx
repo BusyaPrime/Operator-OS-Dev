@@ -7,7 +7,51 @@ import { useOperatorStore } from '../state/operator-store';
 import { colors, spacing, typography } from '../theme/tokens';
 
 export function DevicesScreen() {
-  const { devices, selectedDeviceId, setSelectedDevice } = useOperatorStore();
+  const { devicesState, selectedDeviceId, setSelectedDevice } = useOperatorStore();
+
+  if (devicesState.status === 'loading') {
+    return (
+      <ScreenShell
+        eyebrow="Desktop Runtime"
+        subtitle="Loading the current device roster from the operator dashboard."
+        title="Devices"
+      >
+        <SectionCard eyebrow="State" title="Loading">
+          <Text style={styles.copy}>Fetching device state from the control plane.</Text>
+        </SectionCard>
+      </ScreenShell>
+    );
+  }
+
+  if (devicesState.status === 'error') {
+    return (
+      <ScreenShell
+        eyebrow="Desktop Runtime"
+        subtitle="Device state could not be refreshed from the API."
+        title="Devices"
+      >
+        <SectionCard eyebrow="State" title="Device state unavailable">
+          <Text style={styles.copy}>{devicesState.errorMessage}</Text>
+        </SectionCard>
+      </ScreenShell>
+    );
+  }
+
+  if (devicesState.status === 'empty') {
+    return (
+      <ScreenShell
+        eyebrow="Desktop Runtime"
+        subtitle="Every device entry shows a visible runtime state and declared capabilities."
+        title="Devices"
+      >
+        <SectionCard eyebrow="State" title="No devices yet">
+          <Text style={styles.copy}>
+            The operator dashboard did not return any visible devices yet.
+          </Text>
+        </SectionCard>
+      </ScreenShell>
+    );
+  }
 
   return (
     <ScreenShell
@@ -15,7 +59,7 @@ export function DevicesScreen() {
       subtitle="Every device entry shows a visible runtime state and declared capabilities."
       title="Devices"
     >
-      {devices.map((device) => (
+      {devicesState.items.map((device) => (
         <SectionCard
           eyebrow={device.platform}
           key={device.deviceId}

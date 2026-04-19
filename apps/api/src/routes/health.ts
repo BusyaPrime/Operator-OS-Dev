@@ -2,12 +2,11 @@ import type { ApiEnv } from '@operator-os/config';
 import { healthResponseSchema } from '@operator-os/contracts';
 import type { FastifyInstance } from 'fastify';
 
-import { buildHealthResponse, buildReadinessResponse } from '../readiness.js';
-import type { OperatorModule } from '../types.js';
+import { buildHealthResponse } from '../readiness.js';
 
 interface HealthRoutesOptions {
+  buildReadiness: () => ReturnType<typeof buildHealthResponse>;
   config: ApiEnv;
-  modules: readonly OperatorModule[];
 }
 
 export const registerHealthRoutes = async (
@@ -19,9 +18,7 @@ export const registerHealthRoutes = async (
   );
 
   app.get('/ready', async (_, reply) => {
-    const payload = healthResponseSchema.parse(
-      buildReadinessResponse(options.config, options.modules)
-    );
+    const payload = healthResponseSchema.parse(options.buildReadiness());
 
     if (payload.status === 'degraded') {
       reply.code(503);

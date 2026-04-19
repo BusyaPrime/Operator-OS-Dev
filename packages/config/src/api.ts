@@ -13,19 +13,51 @@ export const apiEnvSchema = z.object({
   LOG_LEVEL: z.string().min(1).default('info'),
   API_SERVICE_NAME: z.string().min(1).default('operator-os-api'),
   GOOGLE_CLOUD_PROJECT: z.string().min(1).default('operator-os-dev'),
+  GOOGLE_CLOUD_REGION: z.string().min(1).default('europe-west4'),
+  FIREBASE_PROJECT_ID: z.string().min(1).default('operator-os-dev'),
   VERTEX_LOCATION: z.string().min(1).default('europe-west4'),
   VERTEX_MODEL: z.string().min(1).default('gemini-2.5-flash'),
   FIRESTORE_DATABASE: z.string().min(1).default('(default)'),
+  FIRESTORE_DEVICE_STATES_COLLECTION: z
+    .string()
+    .min(1)
+    .default('deviceStates'),
+  FIRESTORE_OPERATOR_STATES_COLLECTION: z
+    .string()
+    .min(1)
+    .default('operatorStates'),
+  FIRESTORE_SESSIONS_COLLECTION: z.string().min(1).default('sessions'),
+  FIRESTORE_ALERTS_COLLECTION: z.string().min(1).default('alerts'),
+  FIRESTORE_COST_SNAPSHOTS_COLLECTION: z
+    .string()
+    .min(1)
+    .default('costSnapshots'),
+  FIRESTORE_AUDIT_EVENTS_COLLECTION: z
+    .string()
+    .min(1)
+    .default('auditEvents'),
+  CLOUD_TASKS_LOCATION: z.string().min(1).default('europe-west1'),
   COMMANDS_QUEUE: z.string().min(1).default('commands'),
   APPROVALS_QUEUE: z.string().min(1).default('approvals'),
   EXPORTS_QUEUE: z.string().min(1).default('exports'),
+  TASKS_TARGET_BASE_URL: z.string().url().optional(),
   AGENT_EVENTS_TOPIC: z.string().min(1).default('agent-events'),
   BUDGET_EVENTS_TOPIC: z.string().min(1).default('budget-events'),
   OPERATOR_ALERTS_TOPIC: z.string().min(1).default('operator-alerts'),
   SESSION_EVENTS_TOPIC: z.string().min(1).default('session-events'),
+  BIGQUERY_DATASET: z.string().min(1).default('ops_analytics'),
   ARTIFACTS_BUCKET: z.string().min(1).default('operator-os-dev-artifacts'),
   EXPORTS_BUCKET: z.string().min(1).default('operator-os-dev-exports'),
   REMOTE_BUCKET: z.string().min(1).default('operator-os-dev-remote'),
+  ARTIFACT_REGISTRY_REPOSITORY: z
+    .string()
+    .min(1)
+    .default('operator-os-docker'),
+  CLOUD_RUN_SERVICE_NAME: z.string().min(1).default('operator-os-api'),
+  CLOUD_RUN_SERVICE_ACCOUNT: z
+    .string()
+    .min(1)
+    .default('cloudrun-runtime@operator-os-dev.iam.gserviceaccount.com'),
   OPERATOR_JWT_SECRET_NAME: z
     .string()
     .min(1)
@@ -34,6 +66,7 @@ export const apiEnvSchema = z.object({
     .string()
     .min(1)
     .default('session-signing-secret'),
+  GITHUB_TOKEN_SECRET_NAME: z.string().min(1).default('github-token'),
   READINESS_STRICT: booleanFromString(false)
 });
 

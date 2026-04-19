@@ -26,6 +26,8 @@ export class CommandPoller {
     this.#timer = setInterval(() => {
       void this.tick(onCommand);
     }, this.#config.COMMAND_POLL_INTERVAL_MS);
+
+    void this.tick(onCommand);
   }
 
   stop() {

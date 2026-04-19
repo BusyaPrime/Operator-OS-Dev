@@ -30,7 +30,7 @@ export const buildReadinessResponse = (
       status: 'ok',
       message: 'Environment parsing completed successfully.'
     },
-    ...modules.map((module) => module.describeReadiness(config))
+    ...modules.map((module) => module.describeReadiness())
   ];
 
   const hasDegraded = checks.some((check) => check.status === 'degraded');

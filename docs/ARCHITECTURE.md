@@ -2,79 +2,116 @@
 
 ## Product Shape
 
-Operator OS Dev is a trusted operator system built around explicit visibility and explicit control. The system is designed so the user can open a phone-first interface, inspect what is happening across agents and runtimes, and then intentionally approve or trigger actions. The product is not a stealth desktop takeover tool.
+Operator OS Dev is a trusted operator system built around explicit visibility and explicit control. The product is designed so the user can inspect the state of devices, sessions, cost posture, alerts, and cloud runtime from a phone-first surface, then initiate deliberate trusted actions. It is not a stealth desktop takeover tool.
 
 ## Main Surfaces
 
 ### Mobile Operator App
 
-The mobile app is the primary operator surface. It is responsible for:
+The mobile app remains the primary operator surface. In the current pass it is a live-ready shell that consumes a typed operator dashboard and exposes:
 
-- session overview
-- device and runtime state visibility
-- cost and budget visibility
-- alerts and approvals
-- deployment and runtime control entry points
-- explain and summary surfaces backed by Vertex
+- Home
+- Devices
+- Sessions
+- Costs
+- Settings
 
-The mobile app should remain thin. It consumes the control-plane API and renders state derived from contracts shared across the monorepo.
+Each screen now has typed loading, empty, error, and controlled fallback behavior. When the backend is unavailable or not fully wired, the shell does not pretend to be live; it switches to an explicit fallback mode.
 
 ### Backend Control Plane
 
-The backend API is the orchestration layer. It is responsible for:
+The Fastify API is now more than a scaffold. It currently owns:
 
-- health and readiness endpoints for Cloud Run
-- authentication boundary integration
-- command intake and approval workflows
-- session coordination
-- analytics and cost aggregation
-- alert fan-out
-- export job management
-- Vertex-backed summarization and explanation features
+- `/health`
+- `/ready`
+- `/v1/auth/session`
+- `/v1/operator/state`
+- `/v1/operator/dashboard`
+- `/v1/devices`
+- `/v1/sessions`
+- `/v1/alerts`
+- `/v1/costs`
+- `/v1/commands`
+- `/v1/agent/*`
+- `/v1/ai/*`
 
-It does not directly become a general-purpose shell host. It coordinates trusted actions across the rest of the platform.
+The control plane now contains live-ready integration modules for:
+
+- Firebase Admin auth via ADC
+- Firestore repository access with a controlled in-memory overlay fallback
+- Pub/Sub publishers
+- Cloud Tasks enqueue abstractions
+- Cloud Storage upload/download abstractions
+- BigQuery analytics writes
+- Secret Manager access
+- Vertex AI / Gemini provider wiring through ADC
 
 ### Desktop Runtime
 
-The desktop runtime is an explicit agent process that:
+The desktop runtime is still intentionally transparent, but it now uses real HTTP interfaces against the API:
 
-- reports heartbeat and capability state
-- polls or receives commands from the control plane
-- participates in trusted visible sessions
-- prepares export jobs and artifacts
-- emits telemetry and notifications
+- heartbeat posts to `/v1/agent/heartbeat`
+- command polling hits `/v1/agent/commands`
+- session updates post to `/v1/agent/sessions`
+- export requests post to `/v1/agent/exports`
+- alerts post to `/v1/agent/alerts`
 
-The desktop runtime must remain transparent. No hidden persistence, no stealth hooks, and no prohibited surveillance behavior are part of the design.
+If the API is unavailable, the runtime falls back explicitly and logs that fact. It does not introduce hidden local behavior.
 
 ## Data And Control Flows
 
-### Analytics And Cost Flows
+### Operator Dashboard Flow
 
-The API receives operational events from the runtime and backend subsystems, then forwards analytics-grade data into `ops_analytics` in BigQuery. Cost snapshots and budget alerts are modeled as first-class records so they can be surfaced in the mobile app.
+1. Mobile requests `/v1/operator/dashboard`.
+2. API resolves optional auth session state.
+3. API reads Firestore-backed state if available.
+4. If Firestore or ADC is unavailable, API returns a controlled fallback dashboard with an explicit reason.
+5. Mobile renders the resulting typed state and transport mode.
+
+### Agent Heartbeat And Command Flow
+
+1. Desktop agent posts a device heartbeat.
+2. API records the state in a transient overlay and tries to persist to Firestore.
+3. API publishes an agent event when Pub/Sub is available.
+4. Desktop agent polls for pending commands.
+5. Current pass keeps queue-to-agent delivery in an honest controlled fallback path until the durable worker path is fully deployed.
+
+### Analytics And Cost Flow
+
+The API foundation now includes typed write paths for:
+
+- command events
+- session events
+- alert events
+- cost snapshots
+
+The current implementation is live-ready but not yet cloud-validated, because local ADC is missing and BigQuery table provisioning has not been executed from this branch.
 
 ### Trusted Session Model
 
-A session is an explicit object with an owner, target device, lifecycle state, approval state, timestamps, and audit trail. Sessions are visible in the mobile app and coordinated by the control plane. The baseline assumes:
+A session remains an explicit, inspectable object with:
 
-- session initiation is deliberate
-- session state is inspectable
-- approvals are explicit
-- the user can see whether a session is idle, pending, active, or closed
+- device
+- operator
+- status
+- mode
+- visibility
+- timestamps
 
-### Cloud Resource Mapping
+The backend and mobile surfaces preserve the visible trusted-session model. No hidden session initiation path exists in this pass.
+
+## Cloud Resource Mapping
 
 - Cloud Run hosts the API
-- Firestore stores operational state and session metadata
-- Cloud Tasks drives commands, approvals, and export workflows
-- Pub/Sub transports operational events and alerts
-- Cloud Storage stores artifacts, exports, and trusted session assets
-- BigQuery stores analytics and cost reporting
-- Secret Manager stores secrets needed by the backend, not by clients
-- Vertex AI provides LLM-based summaries and explanations
+- Firestore stores operator, device, session, alert, and audit data when available
+- Cloud Tasks is the intended worker-dispatch mechanism for commands, approvals, and exports
+- Pub/Sub is the intended event fan-out path
+- Cloud Storage stores artifacts, export requests, and future remote assets
+- BigQuery stores analytics-grade events
+- Secret Manager holds backend secrets
+- Vertex AI provides all LLM functionality
 
 ## Region Mapping
-
-The current target mapping is intentionally conservative and reuses already-created regions:
 
 - Firestore: `eur3`
 - Cloud Tasks queues: `europe-west1`
@@ -82,24 +119,33 @@ The current target mapping is intentionally conservative and reuses already-crea
 - KMS: `europe-west4`
 - BigQuery dataset region: `EU`
 
-The repo should avoid introducing additional regions during bootstrap unless a later phase proves a concrete need.
+The repository should continue to avoid region sprawl without a concrete operational reason.
 
 ## Auth Model
 
-The primary user auth boundary is Firebase / Identity Platform. The expected model is:
+The current server-side auth shape is:
 
-- end users authenticate with Email/Password or Google sign-in
-- mobile clients exchange authenticated requests with the API
-- the API validates identity and authorization before acting on commands or sessions
+- Firebase Admin via ADC / attached service identity
+- optional auth session resolution for operator-facing read routes
+- required-auth guard skeleton available for future privileged routes
+- explicit bootstrap fallback when Firebase token verification cannot run locally
 
-Bootstrap does not yet include the end-to-end Firebase integration, but the repository layout reserves clear modules for it.
+This means auth wiring is honest: readiness reports that local auth is not configured instead of faking success.
 
 ## Service Identity Model
 
-The preferred service-to-service identity model is workload identity through Google-managed service accounts, not downloaded long-lived JSON keys.
+The preferred runtime identity remains:
 
-- Cloud Run API target SA: `cloudrun-runtime@operator-os-dev.iam.gserviceaccount.com`
-- deployment and CI can use dedicated service accounts when configured
-- local development should use ADC, ideally from `gcloud auth application-default login`
+- `cloudrun-runtime@operator-os-dev.iam.gserviceaccount.com`
 
-This keeps the repo aligned with GCP-native identity and avoids smuggling static credentials into source control.
+This service identity is the target for:
+
+- Vertex AI access
+- Firestore access
+- Pub/Sub publish access
+- Cloud Tasks enqueue access
+- Secret Manager reads
+- Storage bucket access
+- BigQuery writes
+
+The concrete least-privilege plan is recorded in [IAM_PLAN.md](/D:/Operator-OS-Dev/docs/IAM_PLAN.md).

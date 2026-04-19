@@ -8,8 +8,16 @@ import { useOperatorStore } from '../state/operator-store';
 import { colors, spacing, typography } from '../theme/tokens';
 
 export function HomeScreen() {
-  const { alerts, costs, devices, health, refreshDashboard, sessions } =
-    useOperatorStore();
+  const {
+    alerts,
+    costs,
+    dashboardTransportMode,
+    devices,
+    health,
+    refreshDashboard,
+    sessions,
+    transportMessage
+  } = useOperatorStore();
 
   useEffect(() => {
     void refreshDashboard();
@@ -36,10 +44,19 @@ export function HomeScreen() {
             tone={health?.status === 'ok' ? 'live' : 'warning'}
           />
           <StatusPill
+            label={
+              dashboardTransportMode === 'live-api'
+                ? 'Live API mode'
+                : 'Controlled fallback'
+            }
+            tone={dashboardTransportMode === 'live-api' ? 'live' : 'warning'}
+          />
+          <StatusPill
             label={`Spend $${costs[0]?.totalUsd.toFixed(2) ?? '0.00'}`}
             tone="info"
           />
         </View>
+        {transportMessage ? <Text style={styles.copy}>{transportMessage}</Text> : null}
       </SectionCard>
 
       <SectionCard eyebrow="Why this exists" title="Trust boundary">

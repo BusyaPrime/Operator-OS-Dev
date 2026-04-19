@@ -1,9 +1,24 @@
 import Fastify from 'fastify';
 import type { ApiEnv } from '@operator-os/config';
 
-import { operatorModules } from './modules/index.js';
+import { BigQueryAnalyticsWriter } from './integrations/bigquery.js';
+import { FirebaseAuthService } from './integrations/auth.js';
+import { FirestoreOperatorRepository } from './integrations/firestore.js';
+import { PubSubPublisher } from './integrations/pubsub.js';
+import { SecretManagerAccessor } from './integrations/secrets.js';
+import { GcsStorageService } from './integrations/storage.js';
+import { TasksQueueClient } from './integrations/tasks.js';
+import { IntegrationError } from './integrations/runtime.js';
 import { registerHealthRoutes } from './routes/health.js';
+import { registerAiRoutes } from './routes/ai.js';
+import { registerAgentRoutes } from './routes/agent.js';
+import { registerOperatorRoutes } from './routes/operator.js';
 import { VertexAIProvider } from './providers/index.js';
+import { buildReadinessResponse } from './readiness.js';
+import { AlertsService } from './services/alerts.js';
+import { CommandsService } from './services/commands.js';
+import { ExportsService } from './services/exports.js';
+import { SessionsService } from './services/sessions.js';
 import type { AIProvider } from './types.js';
 
 interface BuildServerOptions {
@@ -22,6 +37,9 @@ export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) =>
     trustProxy: true
   });
 
+  app.decorateRequest('authSession', undefined);
+  app.decorateRequest('currentUser', undefined);
+
   const aiProvider =
     options.aiProvider ??
     new VertexAIProvider({
@@ -29,6 +47,56 @@ export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) =>
       location: config.VERTEX_LOCATION,
       model: config.VERTEX_MODEL
     });
+  const authService = new FirebaseAuthService(config, app.log);
+  const firestoreRepository = new FirestoreOperatorRepository(config, app.log);
+  const pubSubPublisher = new PubSubPublisher(config, app.log);
+  const tasksQueue = new TasksQueueClient(config, app.log);
+  const storageService = new GcsStorageService(config, app.log);
+  const analyticsWriter = new BigQueryAnalyticsWriter(config, app.log);
+  const secretsAccessor = new SecretManagerAccessor(config, app.log);
+  const commandsService = new CommandsService({
+    analyticsWriter,
+    logger: app.log,
+    repository: firestoreRepository,
+    storageService,
+    tasksQueue
+  });
+  const sessionsService = new SessionsService({
+    analyticsWriter,
+    logger: app.log,
+    pubSubPublisher,
+    repository: firestoreRepository
+  });
+  const alertsService = new AlertsService({
+    analyticsWriter,
+    logger: app.log,
+    pubSubPublisher,
+    repository: firestoreRepository
+  });
+  const exportsService = new ExportsService({
+    logger: app.log,
+    repository: firestoreRepository,
+    storageService,
+    tasksQueue
+  });
+  const operatorModules = [
+    authService,
+    firestoreRepository,
+    pubSubPublisher,
+    tasksQueue,
+    storageService,
+    analyticsWriter,
+    secretsAccessor,
+    commandsService,
+    sessionsService,
+    alertsService,
+    exportsService,
+    {
+      name: 'vertex',
+      describeReadiness: () => aiProvider.describeReadiness()
+    }
+  ] as const;
+  const buildReadiness = () => buildReadinessResponse(config, operatorModules);
 
   app.addHook('onReady', async () => {
     app.log.info(
@@ -43,6 +111,17 @@ export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) =>
   });
 
   app.setErrorHandler((error, request, reply) => {
+    if (error instanceof IntegrationError) {
+      reply.status(error.statusCode).send({
+        code: error.code,
+        dependency: error.dependency,
+        details: error.details,
+        message: error.message,
+        requestId: request.id
+      });
+      return;
+    }
+
     request.log.error({ err: error }, 'request failed');
     reply.status(500).send({
       message: 'Internal server error',
@@ -51,8 +130,25 @@ export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) =>
   });
 
   void registerHealthRoutes(app, {
+    buildReadiness,
+    config
+  });
+  void registerOperatorRoutes(app, {
+    authService,
+    buildReadiness,
     config,
-    modules: operatorModules
+    repository: firestoreRepository
+  });
+  void registerAgentRoutes(app, {
+    alertsService,
+    commandsService,
+    exportsService,
+    pubSubPublisher,
+    repository: firestoreRepository,
+    sessionsService
+  });
+  void registerAiRoutes(app, {
+    aiProvider
   });
 
   return app;

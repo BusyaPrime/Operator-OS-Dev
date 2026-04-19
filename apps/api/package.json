@@ -6,11 +6,19 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "dependencies": {
+    "@google-cloud/bigquery": "^8.1.1",
+    "@google-cloud/firestore": "^8.5.0",
+    "@google-cloud/pubsub": "^5.3.0",
+    "@google-cloud/secret-manager": "^6.1.1",
+    "@google-cloud/storage": "^7.19.0",
+    "@google-cloud/tasks": "^6.2.1",
     "@google-cloud/vertexai": "^1.10.0",
     "@operator-os/config": "workspace:*",
     "@operator-os/contracts": "workspace:*",
     "dotenv": "^17.2.3",
-    "fastify": "^5.6.1"
+    "fastify": "^5.6.1",
+    "firebase-admin": "^13.8.0",
+    "zod": "^4.1.12"
   },
   "scripts": {
     "build": "pnpm exec tsc -p tsconfig.json",

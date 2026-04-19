@@ -7,7 +7,51 @@ import { useOperatorStore } from '../state/operator-store';
 import { colors, typography } from '../theme/tokens';
 
 export function CostsScreen() {
-  const { costs } = useOperatorStore();
+  const { costsState } = useOperatorStore();
+
+  if (costsState.status === 'loading') {
+    return (
+      <ScreenShell
+        eyebrow="Budget Lens"
+        subtitle="Costs and alerts should be visible from the same mobile operator surface."
+        title="Costs"
+      >
+        <SectionCard eyebrow="State" title="Loading">
+          <Text style={styles.copy}>Refreshing cost snapshots from the dashboard.</Text>
+        </SectionCard>
+      </ScreenShell>
+    );
+  }
+
+  if (costsState.status === 'error') {
+    return (
+      <ScreenShell
+        eyebrow="Budget Lens"
+        subtitle="Costs and alerts should be visible from the same mobile operator surface."
+        title="Costs"
+      >
+        <SectionCard eyebrow="State" title="Cost state unavailable">
+          <Text style={styles.copy}>{costsState.errorMessage}</Text>
+        </SectionCard>
+      </ScreenShell>
+    );
+  }
+
+  if (costsState.status === 'empty') {
+    return (
+      <ScreenShell
+        eyebrow="Budget Lens"
+        subtitle="Costs and alerts should be visible from the same mobile operator surface."
+        title="Costs"
+      >
+        <SectionCard eyebrow="State" title="No cost snapshots">
+          <Text style={styles.copy}>
+            No cost snapshots were returned by the current dashboard payload.
+          </Text>
+        </SectionCard>
+      </ScreenShell>
+    );
+  }
 
   return (
     <ScreenShell
@@ -15,7 +59,7 @@ export function CostsScreen() {
       subtitle="Costs and alerts should be visible from the same mobile operator surface."
       title="Costs"
     >
-      {costs.map((cost) => (
+      {costsState.items.map((cost) => (
         <SectionCard
           eyebrow={cost.scope}
           key={cost.id}

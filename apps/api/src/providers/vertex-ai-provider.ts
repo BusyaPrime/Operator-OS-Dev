@@ -1,7 +1,15 @@
 import { VertexAI } from '@google-cloud/vertexai';
+import type { ServiceCheck } from '@operator-os/contracts';
 
 import type { GenerateTextInput, GenerateTextResult } from '../types.js';
 import type { AIProvider } from './ai-provider.js';
+import {
+  buildConfiguredCheck,
+  buildNotConfiguredCheck,
+  detectApplicationDefaultCredentials,
+  IntegrationError,
+  mapGoogleIntegrationError
+} from '../integrations/runtime.js';
 
 interface VertexAIProviderOptions {
   project: string;
@@ -13,6 +21,7 @@ export class VertexAIProvider implements AIProvider {
   readonly name = 'vertex-ai';
   readonly model: string;
 
+  #adcStatus = detectApplicationDefaultCredentials();
   #client?: VertexAI;
   #options: VertexAIProviderOptions;
 
@@ -21,38 +30,75 @@ export class VertexAIProvider implements AIProvider {
     this.model = options.model;
   }
 
-  async generateText(input: GenerateTextInput): Promise<GenerateTextResult> {
-    const model = this.#getModel(input.maxOutputTokens);
-    const result = await model.generateContent({
-      contents: [{ role: 'user', parts: [{ text: input.prompt }] }],
-      labels: input.labels,
-      systemInstruction: input.systemInstruction
-        ? {
-            role: 'system',
-            parts: [{ text: input.systemInstruction }]
-          }
-        : undefined
-    });
-
-    const response = result.response;
-    const text = this.#extractText(response);
-
-    if (!text) {
-      throw new Error(
-        'Vertex AI returned no text candidate. Verify model access, ADC, and request safety settings.'
-      );
+  describeReadiness(): ServiceCheck {
+    if (!this.#adcStatus.available) {
+      return buildNotConfiguredCheck('vertex', this.#adcStatus.message, {
+        location: this.#options.location,
+        model: this.#options.model,
+        project: this.#options.project
+      });
     }
 
-    return {
-      provider: this.name,
-      model: this.model,
-      text,
-      usage: {
-        promptTokenCount: response.usageMetadata?.promptTokenCount,
-        candidatesTokenCount: response.usageMetadata?.candidatesTokenCount,
-        totalTokenCount: response.usageMetadata?.totalTokenCount
+    return buildConfiguredCheck(
+      'vertex',
+      'Vertex AI provider is configured through ADC / service identity.',
+      {
+        location: this.#options.location,
+        model: this.#options.model,
+        project: this.#options.project
       }
-    };
+    );
+  }
+
+  async generateText(input: GenerateTextInput): Promise<GenerateTextResult> {
+    if (!this.#adcStatus.available) {
+      throw new IntegrationError({
+        code: 'missing_adc',
+        dependency: 'vertex',
+        message: this.#adcStatus.message,
+        statusCode: 503
+      });
+    }
+
+    const model = this.#getModel(input.maxOutputTokens);
+    try {
+      const result = await model.generateContent({
+        contents: [{ role: 'user', parts: [{ text: input.prompt }] }],
+        labels: input.labels,
+        systemInstruction: input.systemInstruction
+          ? {
+              role: 'system',
+              parts: [{ text: input.systemInstruction }]
+            }
+          : undefined
+      });
+
+      const response = result.response;
+      const text = this.#extractText(response);
+
+      if (!text) {
+        throw new IntegrationError({
+          code: 'upstream_error',
+          dependency: 'vertex',
+          message:
+            'Vertex AI returned no text candidate. Verify model access, ADC, and request safety settings.',
+          statusCode: 502
+        });
+      }
+
+      return {
+        provider: this.name,
+        model: this.model,
+        text,
+        usage: {
+          promptTokenCount: response.usageMetadata?.promptTokenCount,
+          candidatesTokenCount: response.usageMetadata?.candidatesTokenCount,
+          totalTokenCount: response.usageMetadata?.totalTokenCount
+        }
+      };
+    } catch (error) {
+      throw mapGoogleIntegrationError('vertex', error);
+    }
   }
 
   summarizeOperatorState(state: unknown) {

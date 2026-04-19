@@ -8,7 +8,14 @@ import { apiClient } from '../services/api-client';
 import { colors, spacing, typography } from '../theme/tokens';
 
 export function SettingsScreen() {
-  const { lastSyncAt, useMocks } = useOperatorStore();
+  const {
+    authSession,
+    dashboardTransportMode,
+    lastSyncAt,
+    readiness,
+    transportMessage,
+    useMocks
+  } = useOperatorStore();
 
   return (
     <ScreenShell
@@ -22,10 +29,20 @@ export function SettingsScreen() {
             label={useMocks ? 'Mocks enabled' : 'Live API mode'}
             tone={useMocks ? 'warning' : 'live'}
           />
+          <StatusPill
+            label={
+              authSession.authenticated ? 'Authenticated operator' : authSession.source
+            }
+            tone={authSession.authenticated ? 'live' : 'warning'}
+          />
         </View>
         <Text style={styles.copy}>API base URL: {apiClient.env.EXPO_PUBLIC_API_BASE_URL}</Text>
+        <Text style={styles.copy}>Transport mode: {dashboardTransportMode}</Text>
         <Text style={styles.copy}>
           Last dashboard sync: {lastSyncAt ?? 'Not synced yet'}
+        </Text>
+        <Text style={styles.copy}>
+          Readiness: {readiness?.status ?? 'Unknown'} ({transportMessage ?? 'No transport note'})
         </Text>
       </SectionCard>
 

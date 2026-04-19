@@ -4,7 +4,7 @@ import { useOperatorStore } from './operator-store';
 
 describe('@operator-os/mobile store', () => {
   it('starts with mocked devices', () => {
-    expect(useOperatorStore.getState().devices.length).toBeGreaterThan(0);
+    expect(useOperatorStore.getState().devicesState.items.length).toBeGreaterThan(0);
   });
 
   it('updates the selected device', () => {

@@ -1,5 +1,6 @@
 param(
   [string]$ImageTag = "manual",
+  [string]$TasksTargetBaseUrl = "",
   [switch]$UseCloudBuild = $true,
   [switch]$Deploy = $true
 )
@@ -21,7 +22,7 @@ if ($UseCloudBuild) {
   & gcloud builds submit `
     --project=$ProjectId `
     --config=infra/cloudbuild/api.cloudbuild.yaml `
-    --substitutions="_IMAGE_TAG=$ImageTag,_DEPLOY=$deployValue" `
+    --substitutions="_IMAGE_TAG=$ImageTag,_DEPLOY=$deployValue,_TASKS_TARGET_BASE_URL=$TasksTargetBaseUrl" `
     .
 
   exit $LASTEXITCODE
@@ -40,4 +41,4 @@ if (-not $Deploy) {
   --service-account="cloudrun-runtime@$ProjectId.iam.gserviceaccount.com" `
   --no-allow-unauthenticated `
   --port=8080 `
-  --set-env-vars="NODE_ENV=production,GOOGLE_CLOUD_PROJECT=$ProjectId,VERTEX_LOCATION=$Region,VERTEX_MODEL=gemini-2.5-flash"
+  --set-env-vars="NODE_ENV=production,GOOGLE_CLOUD_PROJECT=$ProjectId,GOOGLE_CLOUD_REGION=$Region,FIREBASE_PROJECT_ID=$ProjectId,VERTEX_LOCATION=$Region,VERTEX_MODEL=gemini-2.5-flash,BIGQUERY_DATASET=ops_analytics,CLOUD_TASKS_LOCATION=europe-west1,TASKS_TARGET_BASE_URL=$TasksTargetBaseUrl"

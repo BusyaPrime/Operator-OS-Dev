@@ -20,7 +20,17 @@ spec:
               value: production
             - name: GOOGLE_CLOUD_PROJECT
               value: operator-os-dev
+            - name: GOOGLE_CLOUD_REGION
+              value: europe-west4
+            - name: FIREBASE_PROJECT_ID
+              value: operator-os-dev
             - name: VERTEX_LOCATION
               value: europe-west4
             - name: VERTEX_MODEL
               value: gemini-2.5-flash
+            - name: BIGQUERY_DATASET
+              value: ops_analytics
+            - name: CLOUD_TASKS_LOCATION
+              value: europe-west1
+            - name: TASKS_TARGET_BASE_URL
+              value: ""
