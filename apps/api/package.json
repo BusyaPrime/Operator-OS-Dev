@@ -1,0 +1,13 @@
+{
+  "name": "@operator-os/api",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "node ../../packages/tooling/scripts/placeholder-task.mjs build @operator-os/api",
+    "dev": "node ../../packages/tooling/scripts/placeholder-task.mjs dev @operator-os/api",
+    "lint": "node ../../packages/tooling/scripts/placeholder-task.mjs lint @operator-os/api",
+    "test": "node ../../packages/tooling/scripts/placeholder-task.mjs test @operator-os/api",
+    "typecheck": "node ../../packages/tooling/scripts/placeholder-task.mjs typecheck @operator-os/api"
+  }
+}

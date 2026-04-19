@@ -1,0 +1,13 @@
+{
+  "name": "@operator-os/mobile",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "node ../../packages/tooling/scripts/placeholder-task.mjs build @operator-os/mobile",
+    "dev": "node ../../packages/tooling/scripts/placeholder-task.mjs dev @operator-os/mobile",
+    "lint": "node ../../packages/tooling/scripts/placeholder-task.mjs lint @operator-os/mobile",
+    "test": "node ../../packages/tooling/scripts/placeholder-task.mjs test @operator-os/mobile",
+    "typecheck": "node ../../packages/tooling/scripts/placeholder-task.mjs typecheck @operator-os/mobile"
+  }
+}

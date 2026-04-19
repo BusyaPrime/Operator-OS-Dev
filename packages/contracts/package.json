@@ -1,0 +1,17 @@
+{
+  "name": "@operator-os/contracts",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "pnpm exec tsc -p tsconfig.json",
+    "lint": "pnpm exec eslint \"src/**/*.ts\"",
+    "test": "node ../tooling/scripts/placeholder-task.mjs test @operator-os/contracts",
+    "typecheck": "pnpm exec tsc -p tsconfig.json --noEmit"
+  }
+}
