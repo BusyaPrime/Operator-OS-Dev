@@ -1,0 +1,14 @@
+{
+  "expo": {
+    "name": "Operator OS",
+    "slug": "operator-os-dev",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "resizeMode": "contain",
+      "backgroundColor": "#0f1720"
+    },
+    "assetBundlePatterns": ["**/*"]
+  }
+}

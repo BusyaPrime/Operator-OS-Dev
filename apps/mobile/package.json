@@ -1,13 +1,26 @@
 {
   "name": "@operator-os/mobile",
   "private": true,
-  "version": "0.0.0",
-  "type": "module",
+  "version": "0.1.0",
   "scripts": {
-    "build": "node ../../packages/tooling/scripts/placeholder-task.mjs build @operator-os/mobile",
-    "dev": "node ../../packages/tooling/scripts/placeholder-task.mjs dev @operator-os/mobile",
-    "lint": "node ../../packages/tooling/scripts/placeholder-task.mjs lint @operator-os/mobile",
-    "test": "node ../../packages/tooling/scripts/placeholder-task.mjs test @operator-os/mobile",
-    "typecheck": "node ../../packages/tooling/scripts/placeholder-task.mjs typecheck @operator-os/mobile"
+    "build": "pnpm run typecheck && node ./scripts/build-scaffold.mjs",
+    "dev": "pnpm exec expo start --clear",
+    "lint": "pnpm exec eslint \"./**/*.{ts,tsx}\" --ignore-pattern \"src/**/*.test.ts\" --ignore-pattern \"src/**/*.test.tsx\"",
+    "test": "pnpm exec vitest run",
+    "typecheck": "pnpm exec tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@operator-os/config": "workspace:*",
+    "@operator-os/contracts": "workspace:*",
+    "@react-navigation/bottom-tabs": "^7.8.1",
+    "@react-navigation/native": "^7.1.18",
+    "expo": "^54.0.13",
+    "expo-linear-gradient": "^15.0.7",
+    "expo-status-bar": "^3.0.8",
+    "react": "^19.1.0",
+    "react-native": "^0.81.4",
+    "react-native-safe-area-context": "^5.6.1",
+    "react-native-screens": "^4.18.0",
+    "zustand": "^5.0.8"
   }
 }

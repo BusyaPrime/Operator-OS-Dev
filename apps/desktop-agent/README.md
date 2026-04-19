@@ -1,3 +1,17 @@
-# Desktop Agent
+# Operator OS Desktop Agent
 
-TODO(phase-7): add the transparent desktop runtime scaffold in this workspace.
+Transparent runtime scaffold for device heartbeat, command polling, session stubs, export stubs, and notifier stubs.
+
+## Explicit Non-Goals
+
+- no hidden remote control
+- no keylogging
+- no credential harvesting
+- no silent OS hooks
+- no stealth persistence
+
+## Local Run
+
+```powershell
+pnpm --filter @operator-os/desktop-agent dev
+```

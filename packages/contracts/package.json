@@ -1,17 +1,26 @@
 {
   "name": "@operator-os/contracts",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
   "files": [
     "dist"
   ],
+  "dependencies": {
+    "zod": "^4.1.12"
+  },
   "scripts": {
     "build": "pnpm exec tsc -p tsconfig.json",
-    "lint": "pnpm exec eslint \"src/**/*.ts\"",
-    "test": "node ../tooling/scripts/placeholder-task.mjs test @operator-os/contracts",
+    "lint": "pnpm exec eslint \"src/**/*.ts\" --ignore-pattern \"src/**/*.test.ts\"",
+    "test": "pnpm exec vitest run",
     "typecheck": "pnpm exec tsc -p tsconfig.json --noEmit"
   }
 }

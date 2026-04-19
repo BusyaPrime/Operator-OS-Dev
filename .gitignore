@@ -5,9 +5,13 @@ dist/
 build/
 coverage/
 .expo/
+.expo-shared/
 .env
 .env.local
 .env.*.local
 *.log
+*.tsbuildinfo
+pnpm-debug.log*
+web-build/
 .DS_Store
 Thumbs.db

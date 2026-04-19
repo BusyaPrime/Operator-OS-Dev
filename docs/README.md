@@ -1,12 +1,13 @@
 # Documentation Map
 
-- `ARCHITECTURE.md`: system layout and trusted control model
-- `GCP_RESOURCES.md`: existing cloud resource inventory
-- `DECISIONS.md`: architecture decisions and rationale
-- `ROADMAP.md`: staged delivery plan
-- `SECURITY_MODEL.md`: explicit safety and trust boundaries
-- `VERTEX.md`: Vertex AI and ADC integration notes
-- `DEPLOY.md`: local build and Cloud Run deployment notes
-- `HANDOFF.md`: current state and next-agent guidance
+These documents are the current source of truth for the bootstrap branch.
 
-TODO(phase-3): expand each document into the project source of truth.
+- [ARCHITECTURE.md](/D:/Operator-OS-Dev/docs/ARCHITECTURE.md): system topology and runtime boundaries
+- [GCP_RESOURCES.md](/D:/Operator-OS-Dev/docs/GCP_RESOURCES.md): existing cloud resources that this repo is allowed to assume
+- [SECURITY_MODEL.md](/D:/Operator-OS-Dev/docs/SECURITY_MODEL.md): trust boundaries and prohibited behavior
+- [DECISIONS.md](/D:/Operator-OS-Dev/docs/DECISIONS.md): architecture decisions and rationale
+- [ROADMAP.md](/D:/Operator-OS-Dev/docs/ROADMAP.md): staged delivery plan
+- [VERTEX.md](/D:/Operator-OS-Dev/docs/VERTEX.md): Vertex AI usage model and manual setup notes
+- [DEPLOY.md](/D:/Operator-OS-Dev/docs/DEPLOY.md): local build and Cloud Run deployment workflow
+- [HANDOFF.md](/D:/Operator-OS-Dev/docs/HANDOFF.md): branch state and recommended next actions
+- [BOOTSTRAP_STATUS.md](/D:/Operator-OS-Dev/docs/BOOTSTRAP_STATUS.md): audit and bootstrap checkpoint record

@@ -1,0 +1,53 @@
+substitutions:
+  _SERVICE_NAME: operator-os-api
+  _REGION: europe-west4
+  _REPOSITORY: operator-os-docker
+  _IMAGE_NAME: operator-os-api
+  _IMAGE_TAG: latest
+  _VERTEX_LOCATION: europe-west4
+  _VERTEX_MODEL: gemini-2.5-flash
+  _DEPLOY: "false"
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      [
+        "build",
+        "-f",
+        "apps/api/Dockerfile",
+        "-t",
+        "europe-west4-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:${_IMAGE_TAG}",
+        "."
+      ]
+
+  - name: gcr.io/cloud-builders/docker
+    args:
+      [
+        "push",
+        "europe-west4-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:${_IMAGE_TAG}"
+      ]
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        if [[ "${_DEPLOY}" != "true" ]]; then
+          echo "Skipping Cloud Run deploy step because _DEPLOY=${_DEPLOY}."
+          exit 0
+        fi
+
+        IMAGE_URI="europe-west4-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:${_IMAGE_TAG}"
+
+        gcloud run deploy "${_SERVICE_NAME}" \
+          --project="$PROJECT_ID" \
+          --region="${_REGION}" \
+          --image="${IMAGE_URI}" \
+          --platform=managed \
+          --service-account="cloudrun-runtime@${PROJECT_ID}.iam.gserviceaccount.com" \
+          --no-allow-unauthenticated \
+          --port=8080 \
+          --set-env-vars="NODE_ENV=production,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},VERTEX_LOCATION=${_VERTEX_LOCATION},VERTEX_MODEL=${_VERTEX_MODEL}"
+
+images:
+  - europe-west4-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:${_IMAGE_TAG}

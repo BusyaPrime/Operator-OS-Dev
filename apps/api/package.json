@@ -1,13 +1,23 @@
 {
   "name": "@operator-os/api",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
   "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "dependencies": {
+    "@google-cloud/vertexai": "^1.10.0",
+    "@operator-os/config": "workspace:*",
+    "@operator-os/contracts": "workspace:*",
+    "dotenv": "^17.2.3",
+    "fastify": "^5.6.1"
+  },
   "scripts": {
-    "build": "node ../../packages/tooling/scripts/placeholder-task.mjs build @operator-os/api",
-    "dev": "node ../../packages/tooling/scripts/placeholder-task.mjs dev @operator-os/api",
-    "lint": "node ../../packages/tooling/scripts/placeholder-task.mjs lint @operator-os/api",
-    "test": "node ../../packages/tooling/scripts/placeholder-task.mjs test @operator-os/api",
-    "typecheck": "node ../../packages/tooling/scripts/placeholder-task.mjs typecheck @operator-os/api"
+    "build": "pnpm exec tsc -p tsconfig.json",
+    "dev": "pnpm exec tsx watch src/server.ts",
+    "lint": "pnpm exec eslint \"src/**/*.ts\" --ignore-pattern \"src/**/*.test.ts\"",
+    "start": "node dist/server.js",
+    "test": "pnpm exec vitest run",
+    "typecheck": "pnpm exec tsc -p tsconfig.json --noEmit"
   }
 }

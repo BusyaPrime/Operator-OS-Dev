@@ -1,13 +1,22 @@
 {
   "name": "@operator-os/desktop-agent",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
   "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "dependencies": {
+    "@operator-os/config": "workspace:*",
+    "@operator-os/contracts": "workspace:*",
+    "dotenv": "^17.2.3",
+    "pino": "^10.1.0"
+  },
   "scripts": {
-    "build": "node ../../packages/tooling/scripts/placeholder-task.mjs build @operator-os/desktop-agent",
-    "dev": "node ../../packages/tooling/scripts/placeholder-task.mjs dev @operator-os/desktop-agent",
-    "lint": "node ../../packages/tooling/scripts/placeholder-task.mjs lint @operator-os/desktop-agent",
-    "test": "node ../../packages/tooling/scripts/placeholder-task.mjs test @operator-os/desktop-agent",
-    "typecheck": "node ../../packages/tooling/scripts/placeholder-task.mjs typecheck @operator-os/desktop-agent"
+    "build": "pnpm exec tsc -p tsconfig.json",
+    "dev": "pnpm exec tsx watch src/main.ts",
+    "lint": "pnpm exec eslint \"src/**/*.ts\" --ignore-pattern \"src/**/*.test.ts\"",
+    "start": "node dist/main.js",
+    "test": "pnpm exec vitest run",
+    "typecheck": "pnpm exec tsc -p tsconfig.json --noEmit"
   }
 }

@@ -1,0 +1,26 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: operator-os-api
+  annotations:
+    run.googleapis.com/ingress: all
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "0"
+    spec:
+      serviceAccountName: cloudrun-runtime@operator-os-dev.iam.gserviceaccount.com
+      containers:
+        - image: europe-west4-docker.pkg.dev/operator-os-dev/operator-os-docker/operator-os-api:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: NODE_ENV
+              value: production
+            - name: GOOGLE_CLOUD_PROJECT
+              value: operator-os-dev
+            - name: VERTEX_LOCATION
+              value: europe-west4
+            - name: VERTEX_MODEL
+              value: gemini-2.5-flash
