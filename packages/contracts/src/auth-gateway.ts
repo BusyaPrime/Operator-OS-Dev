@@ -54,9 +54,27 @@ export const refreshTokenRecordSchema = z.object({
   userAgent: z.string().max(512).optional()
 });
 
+export const refreshRequestSchema = z.object({
+  refreshToken: z.string().min(1)
+});
+
+export const refreshResponseSchema = z.object({
+  accessToken: z.string().min(1),
+  refreshToken: z.string().min(1),
+  accessTokenExpiresAt: isoTimestampSchema,
+  refreshTokenExpiresAt: isoTimestampSchema
+});
+
+export const signoutRequestSchema = z.object({
+  refreshToken: z.string().min(1)
+});
+
 export type OperatorUser = z.infer<typeof operatorUserSchema>;
 export type PlanTier = z.infer<typeof planTierSchema>;
 export type SigninRequest = z.infer<typeof signinRequestSchema>;
 export type AccessTokenPayload = z.infer<typeof accessTokenPayloadSchema>;
 export type SigninResponse = z.infer<typeof signinResponseSchema>;
 export type RefreshTokenRecord = z.infer<typeof refreshTokenRecordSchema>;
+export type RefreshRequest = z.infer<typeof refreshRequestSchema>;
+export type RefreshResponse = z.infer<typeof refreshResponseSchema>;
+export type SignoutRequest = z.infer<typeof signoutRequestSchema>;

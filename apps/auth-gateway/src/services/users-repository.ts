@@ -57,6 +57,28 @@ export class UsersRepository {
     );
   }
 
+  async findById(id: string): Promise<OperatorUser | undefined> {
+    if (!this.#adcStatus.available) {
+      return this.#inMemory.get(id);
+    }
+
+    try {
+      const doc = await this.#getFirestore()
+        .collection(this.#config.FIRESTORE_USERS_COLLECTION)
+        .doc(id)
+        .get();
+
+      if (!doc.exists) {
+        return undefined;
+      }
+
+      return operatorUserSchema.parse({ ...doc.data(), id: doc.id });
+    } catch (error) {
+      this.#logger.warn({ err: error }, 'firestore user read failed');
+      throw mapGoogleIntegrationError('users-repository', error);
+    }
+  }
+
   async upsertByGoogleSubject(input: UserUpsertInput): Promise<OperatorUser> {
     const now = new Date().toISOString();
 
