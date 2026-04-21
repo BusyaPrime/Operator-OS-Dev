@@ -38,15 +38,11 @@ export class CommandsService {
   }
 
   describeReadiness() {
-    const tasksStatus = this.#tasksQueue.describeReadiness().status;
-
     return {
       name: 'commands',
-      status: tasksStatus === 'ok' ? 'ok' : 'degraded',
+      status: 'degraded',
       message:
-        tasksStatus === 'ok'
-          ? 'Command intake and dispatch pipeline is wired to Cloud Tasks.'
-          : 'Command intake works, but queue delivery is still in a controlled fallback mode until Cloud Tasks targets are configured.'
+        'Command intake and Cloud Tasks enqueue are wired. A durable worker consumer is not implemented yet; commands remain in-memory fallback only.'
     } as const;
   }
 
