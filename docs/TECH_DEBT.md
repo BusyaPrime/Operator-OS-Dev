@@ -315,6 +315,65 @@ Estimate: 15 minutes.
 
 ---
 
+## TD-008: `infra/scripts/deploy-api.ps1` variable interpolation is broken
+
+Discovered: 2026-04-22 (during P0.1 Phase D deploy attempt)
+Type: tech-gap
+Priority: P2
+Status: open
+
+### Description
+
+`infra/scripts/deploy-api.ps1` line 17 builds the image URI as:
+
+```
+$ImageUri = "europe-west4-docker.pkg.dev/$ProjectId/$Repository/$ServiceName:$ImageTag"
+```
+
+Windows PowerShell parses `$ServiceName:$ImageTag` as a drive-qualified
+variable reference (colon is a drive-scope separator), which throws
+`InvalidVariableReferenceWithDrive`. The script cannot even enter its
+first real step.
+
+### Risk if unaddressed
+
+- The documented deploy path in `docs/DEPLOY.md` (`.\infra\scripts\deploy-api.ps1 -ImageTag <tag> -UseCloudBuild -Deploy`)
+  is non-functional on Windows PowerShell 5.1.
+- Anyone following `docs/DEPLOY.md` verbatim will hit a parser error
+  and have to bypass the script (calling `gcloud builds submit`
+  manually with the right substitutions, which is what the P0.1
+  Phase D deploy actually did).
+- This is a deploy footgun: the last verified deploy before P0.1
+  (`operator-os-api-00003-rzm` in pass 3) was produced through this
+  script, meaning either the script was working in a different shell
+  or the blocker was introduced between pass 3 and P0.1. Until the
+  script is fixed, the docs are lying about how to deploy.
+
+### Proposed fix
+
+- Wrap every ambiguous variable reference in `${}` to force
+  PowerShell to stop at the closing brace:
+  - Line 17: `"europe-west4-docker.pkg.dev/${ProjectId}/${Repository}/${ServiceName}:${ImageTag}"`
+- Audit the rest of the script for similar patterns (`$SomeName:`).
+- Add a smoke run on a harmless tag to CI so the script does not
+  regress again.
+
+Estimate: ~30 minutes including smoke.
+
+### Related
+
+- Discovered in: P0.1 Phase D (PR-3 session).
+- References: `infra/scripts/deploy-api.ps1:17`, `docs/DEPLOY.md`.
+
+### History
+
+- 2026-04-22: hit `InvalidVariableReferenceWithDrive` when trying to
+  run the script from Git Bash via `powershell.exe -File`. Bypassed
+  by calling `gcloud builds submit` directly with the substitutions
+  the script would have passed. Script itself still broken.
+
+---
+
 ## TD-007: `docs/DECISIONS.md` is not in ADR format
 
 Discovered: 2026-04-22 (during P0.1 diagnostic sweep)
