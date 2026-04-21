@@ -140,8 +140,14 @@ export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) =>
     config,
     repository: firestoreRepository
   });
+  const agentAudience =
+    config.AGENT_AUDIENCE ??
+    config.TASKS_TARGET_BASE_URL ??
+    'https://operator-os-api-m545sz2isq-ez.a.run.app';
+
   void registerAgentRoutes(app, {
     alertsService,
+    authGuard: authService.createAgentGuard(agentAudience),
     commandsService,
     exportsService,
     pubSubPublisher,
@@ -149,7 +155,8 @@ export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) =>
     sessionsService
   });
   void registerAiRoutes(app, {
-    aiProvider
+    aiProvider,
+    authGuard: authService.createRequiredGuard()
   });
   void registerInternalTasksRoutes(app);
 

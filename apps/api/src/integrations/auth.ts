@@ -1,5 +1,6 @@
 import { applicationDefault, getApps, initializeApp } from 'firebase-admin/app';
 import { getAuth } from 'firebase-admin/auth';
+import { OAuth2Client } from 'google-auth-library';
 import type { ApiEnv } from '@operator-os/config';
 import {
   authSessionSchema,
@@ -49,6 +50,7 @@ export class FirebaseAuthService {
   #adcStatus = detectApplicationDefaultCredentials();
   #config: ApiEnv;
   #logger: FastifyBaseLogger;
+  #oauthClient?: OAuth2Client;
 
   constructor(config: ApiEnv, logger: FastifyBaseLogger) {
     this.#config = config;
@@ -95,10 +97,74 @@ export class FirebaseAuthService {
           ? decoded.roles.filter((role): role is string => typeof role === 'string')
           : ['viewer'],
         source: 'firebase-id-token',
+        kind: 'user',
         authTime: toIsoTimestamp(decoded.auth_time),
         claims: decoded
       });
     } catch (error) {
+      throw mapGoogleIntegrationError('auth', error);
+    }
+  }
+
+  async verifyGoogleIdToken(idToken: string, expectedAudience: string) {
+    try {
+      const ticket = await this.#getOAuthClient().verifyIdToken({
+        idToken,
+        audience: expectedAudience
+      });
+
+      const payload = ticket.getPayload();
+
+      if (!payload) {
+        throw new IntegrationError({
+          code: 'upstream_error',
+          dependency: 'auth',
+          message: 'Google ID token had no payload after verification.',
+          statusCode: 401
+        });
+      }
+
+      if (payload.iss !== 'https://accounts.google.com' && payload.iss !== 'accounts.google.com') {
+        throw new IntegrationError({
+          code: 'invalid_config',
+          dependency: 'auth',
+          message: `Google ID token issuer is not trusted: ${payload.iss ?? 'unknown'}`,
+          statusCode: 401
+        });
+      }
+
+      const subject = payload.sub;
+
+      if (!subject) {
+        throw new IntegrationError({
+          code: 'upstream_error',
+          dependency: 'auth',
+          message: 'Google ID token is missing a subject claim.',
+          statusCode: 401
+        });
+      }
+
+      const callerIdentifier = payload.email ?? subject;
+
+      return verifiedUserContextSchema.parse({
+        uid: subject,
+        operatorId: callerIdentifier,
+        email: payload.email,
+        displayName:
+          typeof payload.name === 'string'
+            ? payload.name
+            : payload.email ?? undefined,
+        roles: ['agent'],
+        source: 'google-id-token',
+        kind: 'service',
+        authTime: toIsoTimestamp(payload.iat),
+        claims: payload as unknown as Record<string, unknown>
+      });
+    } catch (error) {
+      if (error instanceof IntegrationError) {
+        throw error;
+      }
+
       throw mapGoogleIntegrationError('auth', error);
     }
   }
@@ -173,6 +239,72 @@ export class FirebaseAuthService {
     };
   }
 
+  /**
+   * Guard for /v1/agent/* routes. Accepts a Firebase ID token (human
+   * caller from mobile) OR a Google OIDC ID token minted for the
+   * service's own audience (desktop-agent or Cloud Tasks service-to-
+   * service). Either path produces a VerifiedUserContext that routes
+   * can audit. Missing or invalid token returns 401.
+   *
+   * The expected audience for Google OIDC tokens is the service URL.
+   * Cloud Run injects requests with tokens whose audience matches the
+   * service URL, so desktop-agent calling through the runtime SA will
+   * land here cleanly.
+   */
+  createAgentGuard(expectedAudience: string) {
+    return async (request: FastifyRequest, reply: FastifyReply) => {
+      const token = extractBearerToken(request.headers.authorization);
+
+      if (!token) {
+        reply.code(401);
+        return reply.send({
+          message:
+            'A Firebase ID token or a Google OIDC ID token is required for this route.'
+        });
+      }
+
+      try {
+        const currentUser = await this.verifyFirebaseIdToken(token);
+        const session = authSessionSchema.parse({
+          authenticated: true,
+          source: 'firebase-id-token',
+          currentUser
+        });
+        request.authSession = session;
+        request.currentUser = currentUser;
+        return;
+      } catch (firebaseError) {
+        this.#logger.debug(
+          { err: firebaseError },
+          'firebase verification failed, trying google OIDC'
+        );
+      }
+
+      try {
+        const currentUser = await this.verifyGoogleIdToken(token, expectedAudience);
+        const session = authSessionSchema.parse({
+          authenticated: true,
+          source: 'google-id-token',
+          currentUser
+        });
+        request.authSession = session;
+        request.currentUser = currentUser;
+        return;
+      } catch (googleError) {
+        this.#logger.warn(
+          { err: googleError },
+          'agent guard rejected token: neither firebase nor google OIDC accepted it'
+        );
+
+        reply.code(401);
+        return reply.send({
+          message:
+            'Provided bearer token is neither a valid Firebase ID token nor a valid Google OIDC ID token for this service.'
+        });
+      }
+    };
+  }
+
   #getFirebaseApp() {
     return (
       getApps().find((app) => app.name === firebaseAppName) ??
@@ -184,5 +316,10 @@ export class FirebaseAuthService {
         firebaseAppName
       )
     );
+  }
+
+  #getOAuthClient() {
+    this.#oauthClient ??= new OAuth2Client();
+    return this.#oauthClient;
   }
 }
