@@ -1,3 +1,21 @@
+# Cloud Run service manifest for operator-os-api.
+#
+# This file is a TEMPLATE. The `image:` field uses a ${IMAGE_TAG}
+# placeholder which must be rendered before the manifest is applied.
+# CLAUDE.md rule R9 forbids `:latest` in production; resolve the
+# template with a concrete git-SHA-derived tag.
+#
+# Typical rendering (bash):
+#     IMAGE_TAG=phase3-<short-sha> envsubst < infra/cloud-run/api.service.yaml \
+#       > /tmp/api.service.rendered.yaml
+#     gcloud run services replace /tmp/api.service.rendered.yaml \
+#       --region=europe-west4 --project=operator-os-dev
+#
+# The imperative `infra/scripts/deploy-api.ps1` path does not apply
+# this manifest directly; it calls `gcloud run deploy` with an
+# explicit `--image=` flag and passes env vars through
+# `--set-env-vars`. This manifest is kept in sync as the canonical
+# declarative shape and env-var reference.
 apiVersion: serving.knative.dev/v1
 kind: Service
 metadata:
@@ -12,7 +30,7 @@ spec:
     spec:
       serviceAccountName: cloudrun-runtime@operator-os-dev.iam.gserviceaccount.com
       containers:
-        - image: europe-west4-docker.pkg.dev/operator-os-dev/operator-os-docker/operator-os-api:latest
+        - image: europe-west4-docker.pkg.dev/operator-os-dev/operator-os-docker/operator-os-api:${IMAGE_TAG}
           ports:
             - containerPort: 8080
           env:
