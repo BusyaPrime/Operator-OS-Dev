@@ -34,3 +34,5 @@ spec:
               value: europe-west1
             - name: TASKS_TARGET_BASE_URL
               value: "https://operator-os-api-m545sz2isq-ez.a.run.app"
+            - name: AGENT_AUDIENCE
+              value: "https://operator-os-api-m545sz2isq-ez.a.run.app"
