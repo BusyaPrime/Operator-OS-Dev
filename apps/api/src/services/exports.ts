@@ -31,15 +31,11 @@ export class ExportsService {
   }
 
   describeReadiness() {
-    const tasksStatus = this.#tasksQueue.describeReadiness().status;
-
     return {
       name: 'exports',
-      status: tasksStatus === 'ok' ? 'ok' : 'degraded',
+      status: 'degraded',
       message:
-        tasksStatus === 'ok'
-          ? 'Export requests can be recorded and queued.'
-          : 'Export requests can be recorded, but worker dispatch remains in a controlled fallback mode.'
+        'Export requests are persisted and enqueued, but a durable worker consumer is not implemented yet.'
     } as const;
   }
 
