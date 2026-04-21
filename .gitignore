@@ -15,3 +15,6 @@ pnpm-debug.log*
 web-build/
 .DS_Store
 Thumbs.db
+
+# Claude Code local harness state (not part of repo)
+.claude/
