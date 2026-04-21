@@ -1,6 +1,6 @@
 param(
   [string]$ImageTag = "manual",
-  [string]$TasksTargetBaseUrl = "",
+  [string]$TasksTargetBaseUrl = "https://operator-os-api-m545sz2isq-ez.a.run.app",
   [string]$BuildServiceAccount = "projects/operator-os-dev/serviceAccounts/deploy-bot@operator-os-dev.iam.gserviceaccount.com",
   [string]$SourceStagingDir = "gs://operator-os-dev-artifacts/cloud-build/source",
   [string]$LogDir = "gs://operator-os-dev-artifacts/cloud-build/logs",
