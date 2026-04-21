@@ -12,6 +12,7 @@ import { IntegrationError } from './integrations/runtime.js';
 import { registerHealthRoutes } from './routes/health.js';
 import { registerAiRoutes } from './routes/ai.js';
 import { registerAgentRoutes } from './routes/agent.js';
+import { registerInternalTasksRoutes } from './routes/internal-tasks.js';
 import { registerOperatorRoutes } from './routes/operator.js';
 import { VertexAIProvider } from './providers/index.js';
 import { buildReadinessResponse } from './readiness.js';
@@ -150,6 +151,7 @@ export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) =>
   void registerAiRoutes(app, {
     aiProvider
   });
+  void registerInternalTasksRoutes(app);
 
   return app;
 };
