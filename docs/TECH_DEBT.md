@@ -216,9 +216,10 @@ Estimate: ~4 hours including unit tests with a stubbed verifier.
 ## TD-005: `/v1/agent/*` and `/v1/ai/*` routes are anonymous
 
 Discovered: 2026-04-22 (during P0.1 diagnostic sweep)
+Resolved: 2026-04-22 (Day 2, PR #6, Cloud Run revision operator-os-api-00006-zng)
 Type: security
 Priority: P1
-Status: open
+Status: resolved
 
 ### Description
 
@@ -270,6 +271,14 @@ attach its token.
 
 - 2026-04-22: discovered during P0.1 diagnostic sweep; captured here
   so the auth rollout can be scoped properly.
+- 2026-04-22 (Day 2, PR #6): resolved. `createRequiredGuard()` on
+  `/v1/ai/*`, `createAgentGuard(audience)` on `/v1/agent/*` plus
+  `/v1/commands` and `/v1/sessions`. Deployed as revision
+  `operator-os-api-00006-zng`. Verified live: Cloud Run IAM returns
+  403 for unauthenticated callers; authenticated callers with
+  wrong-audience OIDC tokens get 401 from the agent guard; non-
+  Firebase tokens hitting `/v1/ai/*` currently surface as 502
+  upstream_error, which is tracked separately as TD-009.
 
 ---
 
@@ -417,3 +426,64 @@ Estimate: ~3 hours for the rewrite plus tooling.
 ### History
 
 - 2026-04-22: discovered.
+
+---
+
+## TD-009: `/v1/ai/*` returns 502 upstream_error instead of 401 for invalid tokens
+
+Discovered: 2026-04-22 (Day 2 TD-005 post-deploy verification)
+Type: maintainability
+Priority: P3
+Status: open
+
+### Description
+
+`createRequiredGuard()` on `/v1/ai/*` calls
+`resolveSession(authorization, { strict: true })`. When the supplied
+bearer token is well-formed but fails Firebase verification (for
+example a valid Google OIDC token with the wrong audience), the
+strict path throws an `IntegrationError{code:'upstream_error',
+statusCode:502}` mapped by `mapGoogleIntegrationError('auth', ...)`.
+
+The global error handler returns the 502 verbatim, so the client
+sees HTTP 502 for what is really a client-side authentication
+failure.
+
+Verified live on revision `operator-os-api-00006-zng`: a valid
+Google OIDC user token (from `gcloud auth print-identity-token`)
+posted to `/v1/ai/summarize/operator-state` returns 502 with body
+`{"code":"upstream_error","dependency":"auth","details":{...aud
+mismatch...}}`.
+
+### Risk if unaddressed
+
+- Client developers reading 502 assume the server crashed. They may
+  retry aggressively instead of fixing their token.
+- 5xx response rates look like service regression in monitoring
+  dashboards; a real 5xx can be missed in the noise.
+- LAW #5 (verifiable honesty): the response code does not describe
+  the actual failure.
+
+### Proposed fix
+
+In `FirebaseAuthService.verifyFirebaseIdToken`, catch errors that
+indicate token-validation failure (invalid signature, wrong
+audience, expired, revoked) and throw
+`IntegrationError{code:'unauthenticated', statusCode:401}` instead
+of letting `mapGoogleIntegrationError` produce `upstream_error`.
+
+Same applies to `verifyGoogleIdToken` for OIDC-verification errors
+when the guard path does not fall back.
+
+Estimated fix: ~1 hour including tests.
+
+### Related
+
+- Discovered in: Day 2 TD-005 deploy verification.
+- References: `apps/api/src/integrations/auth.ts`,
+  `apps/api/src/integrations/runtime.ts` (`mapGoogleIntegrationError`).
+- Architecture laws: LAW #5.
+
+### History
+
+- 2026-04-22: discovered during TD-005 deploy probe.
