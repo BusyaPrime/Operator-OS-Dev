@@ -87,6 +87,36 @@ importers:
         specifier: ^4.1.12
         version: 4.3.6
 
+  apps/auth-gateway:
+    dependencies:
+      '@google-cloud/secret-manager':
+        specifier: ^6.1.1
+        version: 6.1.1
+      '@operator-os/config':
+        specifier: workspace:*
+        version: link:../../packages/config
+      '@operator-os/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
+      dotenv:
+        specifier: ^17.2.3
+        version: 17.4.2
+      fastify:
+        specifier: ^5.6.1
+        version: 5.8.5
+      firebase-admin:
+        specifier: ^13.8.0
+        version: 13.8.0
+      google-auth-library:
+        specifier: ^10.4.0
+        version: 10.6.2
+      jose:
+        specifier: ^5.10.0
+        version: 5.10.0
+      zod:
+        specifier: ^4.1.12
+        version: 4.3.6
+
   apps/desktop-agent:
     dependencies:
       '@operator-os/config':
@@ -2862,6 +2892,9 @@ packages:
 
   jose@4.15.9:
     resolution: {integrity: sha512-1vUQX+IdDMVPj4k8kOxgUqlcK518yluMuGZwqlr44FS1ppZB/5GWh4rZG89erpOBOJjU/OBsnCVFfapsRz6nEA==}
+
+  jose@5.10.0:
+    resolution: {integrity: sha512-s+3Al/p9g32Iq+oqXxkW//7jk2Vig6FF1CFqzVXoTUXt2qz89YWbL+OwS17NFYEvxC35n0FKeGO2LGYSxeM2Gg==}
 
   js-tokens@4.0.0:
     resolution: {integrity: sha512-RdJUflcE3cUzKiMqQgsCu06FPu9UdIJO0beYbPhHN4k6apgJtifcoCtT9bcxOpYBtpD2kCM6Sbzg4CausW/PKQ==}
@@ -7746,6 +7779,8 @@ snapshots:
   jimp-compact@0.16.1: {}
 
   jose@4.15.9: {}
+
+  jose@5.10.0: {}
 
   js-tokens@4.0.0: {}
 
