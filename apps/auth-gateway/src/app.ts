@@ -1,10 +1,26 @@
 import Fastify from 'fastify';
 import type { AuthGatewayEnv } from '@operator-os/config';
+import { ZodError } from 'zod';
 
+import { IntegrationError } from './integrations/runtime.js';
+import { SigningSecretLoader } from './integrations/signing-secret.js';
 import { buildReadinessResponse } from './readiness.js';
+import { registerAuthRoutes } from './routes/auth.js';
 import { registerHealthRoutes } from './routes/health.js';
+import { GoogleIdTokenVerifier } from './services/google-id-token-verifier.js';
+import { JwtIssuer } from './services/jwt-issuer.js';
+import { RefreshTokenStore } from './services/refresh-token-store.js';
+import { SigninService } from './services/signin-service.js';
+import { UsersRepository } from './services/users-repository.js';
 
-export const buildServer = (config: AuthGatewayEnv) => {
+export interface BuildServerOptions {
+  signinService?: SigninService;
+}
+
+export const buildServer = (
+  config: AuthGatewayEnv,
+  options: BuildServerOptions = {}
+) => {
   const app = Fastify({
     logger: {
       level: config.LOG_LEVEL,
@@ -16,7 +32,29 @@ export const buildServer = (config: AuthGatewayEnv) => {
     trustProxy: true
   });
 
-  const buildReadiness = () => buildReadinessResponse(config, []);
+  const signingSecretLoader = new SigningSecretLoader(config, app.log);
+  const googleVerifier = new GoogleIdTokenVerifier(config, app.log);
+  const jwtIssuer = new JwtIssuer(config, signingSecretLoader);
+  const usersRepository = new UsersRepository(config, app.log);
+  const refreshTokenStore = new RefreshTokenStore(config, app.log);
+
+  const signinService =
+    options.signinService ??
+    new SigninService({
+      googleVerifier,
+      jwtIssuer,
+      logger: app.log,
+      refreshTokenStore,
+      usersRepository
+    });
+
+  const moduleChecks = [
+    signingSecretLoader.describeReadiness(),
+    usersRepository.describeReadiness(),
+    refreshTokenStore.describeReadiness()
+  ];
+
+  const buildReadiness = () => buildReadinessResponse(config, moduleChecks);
 
   app.addHook('onReady', async () => {
     app.log.info(
@@ -25,11 +63,32 @@ export const buildServer = (config: AuthGatewayEnv) => {
         issuer: config.AUTH_ACCESS_TOKEN_ISSUER,
         audience: config.AUTH_ACCESS_TOKEN_AUDIENCE
       },
-      'auth-gateway scaffold ready'
+      'auth-gateway ready'
     );
   });
 
   app.setErrorHandler((error, request, reply) => {
+    if (error instanceof ZodError) {
+      reply.status(400).send({
+        code: 'invalid_request',
+        message: 'Request payload failed schema validation.',
+        issues: error.issues,
+        requestId: request.id
+      });
+      return;
+    }
+
+    if (error instanceof IntegrationError) {
+      reply.status(error.statusCode).send({
+        code: error.code,
+        dependency: error.dependency,
+        details: error.details,
+        message: error.message,
+        requestId: request.id
+      });
+      return;
+    }
+
     request.log.error({ err: error }, 'request failed');
     reply.status(500).send({
       message: 'Internal server error',
@@ -40,6 +99,9 @@ export const buildServer = (config: AuthGatewayEnv) => {
   void registerHealthRoutes(app, {
     buildReadiness,
     config
+  });
+  void registerAuthRoutes(app, {
+    signinService
   });
 
   return app;

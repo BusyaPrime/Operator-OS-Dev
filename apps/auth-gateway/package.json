@@ -6,6 +6,7 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "dependencies": {
+    "@google-cloud/firestore": "^8.5.0",
     "@google-cloud/secret-manager": "^6.1.1",
     "@operator-os/config": "workspace:*",
     "@operator-os/contracts": "workspace:*",

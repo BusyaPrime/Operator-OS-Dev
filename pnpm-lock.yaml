@@ -89,6 +89,9 @@ importers:
 
   apps/auth-gateway:
     dependencies:
+      '@google-cloud/firestore':
+        specifier: ^8.5.0
+        version: 8.5.0
       '@google-cloud/secret-manager':
         specifier: ^6.1.1
         version: 6.1.1
