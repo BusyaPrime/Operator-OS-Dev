@@ -42,6 +42,7 @@ export const apiEnvSchema = z.object({
   APPROVALS_QUEUE: z.string().min(1).default('approvals'),
   EXPORTS_QUEUE: z.string().min(1).default('exports'),
   TASKS_TARGET_BASE_URL: optionalUrlFromString(),
+  AGENT_AUDIENCE: optionalUrlFromString(),
   AGENT_EVENTS_TOPIC: z.string().min(1).default('agent-events'),
   BUDGET_EVENTS_TOPIC: z.string().min(1).default('budget-events'),
   OPERATOR_ALERTS_TOPIC: z.string().min(1).default('operator-alerts'),
