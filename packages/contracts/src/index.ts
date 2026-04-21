@@ -1,4 +1,5 @@
 export * from './auth.js';
+export * from './auth-gateway.js';
 export * from './common.js';
 export * from './health.js';
 export * from './messaging.js';

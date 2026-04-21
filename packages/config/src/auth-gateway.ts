@@ -41,6 +41,7 @@ export const authGatewayEnvSchema = z.object({
     .string()
     .min(1)
     .default('operator-jwt-secret'),
+  AUTH_JWT_SIGNING_SECRET_LITERAL: z.string().optional(),
   AUTH_ACCEPTED_GOOGLE_CLIENT_IDS: commaSeparatedStringList(),
   FIRESTORE_USERS_COLLECTION: z.string().min(1).default('users'),
   FIRESTORE_REFRESH_TOKENS_COLLECTION: z
