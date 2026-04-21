@@ -22,16 +22,29 @@ export interface IssuedRefreshToken {
   record: RefreshTokenRecord;
 }
 
+export type ValidationOutcome =
+  | { ok: true; record: RefreshTokenRecord }
+  | {
+      ok: false;
+      reason:
+        | 'unknown'
+        | 'revoked'
+        | 'rotated'
+        | 'expired'
+        | 'malformed';
+    };
+
 /**
- * Generates, stores, and validates refresh tokens.
+ * Generates, stores, rotates, and revokes refresh tokens.
  *
- * Tokens are opaque 32-byte random strings encoded as base64url.
- * The SHA-256 hash of the token is the Firestore document id (and
- * the in-memory map key in fallback mode). Plaintext is never
- * stored.
+ * Tokens are opaque 32-byte random strings encoded base64url. The
+ * SHA-256 hash of the token is the Firestore document id (and the
+ * in-memory map key in fallback mode). Plaintext is never stored.
  *
- * Rotation on use lives in PR C. This file only covers issuance
- * so PR B can land a complete signin flow end to end.
+ * Rotation on use: every successful refresh marks the old record
+ * with `rotatedTo = <new hash>` and `revokedAt = now()`. A reused
+ * already-rotated token returns `reason: 'rotated'` so the caller
+ * can treat it as a security signal.
  */
 export class RefreshTokenStore {
   readonly name = 'refresh-token-store';
@@ -83,29 +96,121 @@ export class RefreshTokenStore {
       userAgent: input.userAgent
     });
 
+    await this.#write(record);
+    return { token, hash, expiresAt: expires, record };
+  }
+
+  async validate(token: string): Promise<ValidationOutcome> {
+    if (!token || typeof token !== 'string') {
+      return { ok: false, reason: 'malformed' };
+    }
+
+    const hash = this.#hashToken(token);
+    const record = await this.#read(hash);
+
+    if (!record) {
+      return { ok: false, reason: 'unknown' };
+    }
+
+    if (record.rotatedTo) {
+      return { ok: false, reason: 'rotated' };
+    }
+
+    if (record.revokedAt) {
+      return { ok: false, reason: 'revoked' };
+    }
+
+    if (new Date(record.expiresAt).getTime() <= Date.now()) {
+      return { ok: false, reason: 'expired' };
+    }
+
+    return { ok: true, record };
+  }
+
+  async rotate(oldToken: string, userAgent?: string): Promise<{
+    outcome: ValidationOutcome;
+    issued?: IssuedRefreshToken;
+  }> {
+    const outcome = await this.validate(oldToken);
+    if (!outcome.ok) {
+      return { outcome };
+    }
+
+    const issued = await this.issue({
+      userId: outcome.record.userId,
+      source: 'refresh',
+      userAgent
+    });
+
+    const now = new Date().toISOString();
+    const updated: RefreshTokenRecord = {
+      ...outcome.record,
+      revokedAt: now,
+      rotatedTo: issued.hash
+    };
+
+    await this.#write(refreshTokenRecordSchema.parse(updated));
+
+    return { outcome, issued };
+  }
+
+  async revoke(token: string): Promise<ValidationOutcome> {
+    const outcome = await this.validate(token);
+    if (!outcome.ok) {
+      return outcome;
+    }
+
+    const now = new Date().toISOString();
+    const updated: RefreshTokenRecord = {
+      ...outcome.record,
+      revokedAt: now
+    };
+
+    await this.#write(refreshTokenRecordSchema.parse(updated));
+    return outcome;
+  }
+
+  hashToken(token: string) {
+    return this.#hashToken(token);
+  }
+
+  async #write(record: RefreshTokenRecord) {
     if (!this.#adcStatus.available) {
-      this.#inMemory.set(hash, record);
-      this.#logger.debug(
-        { userId: input.userId, source: record.source },
-        'refresh token stored in memory fallback'
-      );
-      return { token, hash, expiresAt: expires, record };
+      this.#inMemory.set(record.hash, record);
+      return;
     }
 
     try {
       await this.#getFirestore()
         .collection(this.#config.FIRESTORE_REFRESH_TOKENS_COLLECTION)
-        .doc(hash)
+        .doc(record.hash)
         .set(record);
-      return { token, hash, expiresAt: expires, record };
     } catch (error) {
       this.#logger.warn({ err: error }, 'firestore refresh token write failed');
       throw mapGoogleIntegrationError('refresh-token-store', error);
     }
   }
 
-  hashToken(token: string) {
-    return this.#hashToken(token);
+  async #read(hash: string): Promise<RefreshTokenRecord | undefined> {
+    if (!this.#adcStatus.available) {
+      return this.#inMemory.get(hash);
+    }
+
+    try {
+      const doc = await this.#getFirestore()
+        .collection(this.#config.FIRESTORE_REFRESH_TOKENS_COLLECTION)
+        .doc(hash)
+        .get();
+
+      if (!doc.exists) {
+        return undefined;
+      }
+
+      return refreshTokenRecordSchema.parse(doc.data());
+    } catch (error) {
+      this.#logger.warn({ err: error }, 'firestore refresh token read failed');
+      throw mapGoogleIntegrationError('refresh-token-store', error);
+    }
   }
 
   #generateToken() {

@@ -9,12 +9,16 @@ import { registerAuthRoutes } from './routes/auth.js';
 import { registerHealthRoutes } from './routes/health.js';
 import { GoogleIdTokenVerifier } from './services/google-id-token-verifier.js';
 import { JwtIssuer } from './services/jwt-issuer.js';
+import { RefreshService } from './services/refresh-service.js';
 import { RefreshTokenStore } from './services/refresh-token-store.js';
 import { SigninService } from './services/signin-service.js';
+import { SignoutService } from './services/signout-service.js';
 import { UsersRepository } from './services/users-repository.js';
 
 export interface BuildServerOptions {
+  refreshService?: RefreshService;
   signinService?: SigninService;
+  signoutService?: SignoutService;
 }
 
 export const buildServer = (
@@ -46,6 +50,22 @@ export const buildServer = (
       logger: app.log,
       refreshTokenStore,
       usersRepository
+    });
+
+  const refreshService =
+    options.refreshService ??
+    new RefreshService({
+      jwtIssuer,
+      logger: app.log,
+      refreshTokenStore,
+      usersRepository
+    });
+
+  const signoutService =
+    options.signoutService ??
+    new SignoutService({
+      logger: app.log,
+      refreshTokenStore
     });
 
   const moduleChecks = [
@@ -101,7 +121,9 @@ export const buildServer = (
     config
   });
   void registerAuthRoutes(app, {
-    signinService
+    refreshService,
+    signinService,
+    signoutService
   });
 
   return app;

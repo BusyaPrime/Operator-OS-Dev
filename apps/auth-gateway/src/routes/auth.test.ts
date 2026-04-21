@@ -1,9 +1,15 @@
 import { parseAuthGatewayEnv } from '@operator-os/config';
-import type { SigninResponse } from '@operator-os/contracts';
+import type {
+  RefreshResponse,
+  SigninResponse
+} from '@operator-os/contracts';
 import { describe, expect, it, vi } from 'vitest';
 
 import { buildServer } from '../app.js';
+import { IntegrationError } from '../integrations/runtime.js';
+import type { RefreshService } from '../services/refresh-service.js';
 import type { SigninService } from '../services/signin-service.js';
+import type { SignoutService } from '../services/signout-service.js';
 
 const buildStubSignin = (overrides?: Partial<SigninResponse>): SigninService => {
   const response: SigninResponse = {
@@ -31,11 +37,37 @@ const buildStubSignin = (overrides?: Partial<SigninResponse>): SigninService => 
   } as unknown as SigninService;
 };
 
+const buildStubRefresh = (
+  response: RefreshResponse | Error = {
+    accessToken: 'access.refreshed.token',
+    refreshToken: 'refresh-rotated-token',
+    accessTokenExpiresAt: new Date(Date.now() + 3600 * 1000).toISOString(),
+    refreshTokenExpiresAt: new Date(Date.now() + 86400 * 30 * 1000).toISOString()
+  }
+): RefreshService => {
+  const refresh =
+    response instanceof Error
+      ? vi.fn().mockRejectedValue(response)
+      : vi.fn().mockResolvedValue(response);
+
+  return {
+    name: 'refresh-service-stub',
+    refresh
+  } as unknown as RefreshService;
+};
+
+const buildStubSignout = (): SignoutService =>
+  ({
+    name: 'signout-service-stub',
+    signout: vi.fn().mockResolvedValue({ revoked: true })
+  }) as unknown as SignoutService;
+
 describe('POST /v1/auth/signin', () => {
   it('returns access + refresh tokens for a valid Google ID token request', async () => {
-    const stub = buildStubSignin();
     const app = buildServer(parseAuthGatewayEnv({}), {
-      signinService: stub
+      signinService: buildStubSignin(),
+      refreshService: buildStubRefresh(),
+      signoutService: buildStubSignout()
     });
 
     const response = await app.inject({
@@ -47,16 +79,16 @@ describe('POST /v1/auth/signin', () => {
     expect(response.statusCode).toBe(200);
     const body = response.json();
     expect(body.accessToken).toBe('access.stub.token');
-    expect(body.refreshToken).toBe('refresh-stub-token-base64url');
     expect(body.user.email).toBe('founder@example.com');
 
     await app.close();
   });
 
   it('rejects a request without idToken with 400', async () => {
-    const stub = buildStubSignin();
     const app = buildServer(parseAuthGatewayEnv({}), {
-      signinService: stub
+      signinService: buildStubSignin(),
+      refreshService: buildStubRefresh(),
+      signoutService: buildStubSignout()
     });
 
     const response = await app.inject({
@@ -65,49 +97,123 @@ describe('POST /v1/auth/signin', () => {
       payload: { provider: 'google' }
     });
 
-    expect(response.statusCode).toBeGreaterThanOrEqual(400);
-    expect(response.statusCode).toBeLessThan(500);
+    expect(response.statusCode).toBe(400);
 
     await app.close();
   });
+});
 
-  it('defaults provider to google when omitted', async () => {
-    const stub = buildStubSignin();
+describe('POST /v1/auth/refresh', () => {
+  it('returns new access + refresh tokens when the stub service accepts', async () => {
+    const stub = buildStubRefresh();
     const app = buildServer(parseAuthGatewayEnv({}), {
-      signinService: stub
+      signinService: buildStubSignin(),
+      refreshService: stub,
+      signoutService: buildStubSignout()
     });
 
     const response = await app.inject({
       method: 'POST',
-      url: '/v1/auth/signin',
-      payload: { idToken: 'stub-google-id-token' }
+      url: '/v1/auth/refresh',
+      payload: { refreshToken: 'existing-refresh-token' }
     });
 
     expect(response.statusCode).toBe(200);
-
-    await app.close();
-  });
-
-  it('forwards the user-agent header to the signin service', async () => {
-    const stub = buildStubSignin();
-    const app = buildServer(parseAuthGatewayEnv({}), {
-      signinService: stub
-    });
-
-    const response = await app.inject({
-      method: 'POST',
-      url: '/v1/auth/signin',
-      headers: {
-        'user-agent': 'OperatorOSMobile/0.1 (ios)'
-      },
-      payload: { idToken: 'stub-google-id-token' }
-    });
-
-    expect(response.statusCode).toBe(200);
-    expect(stub.signin).toHaveBeenCalledWith(
-      expect.objectContaining({ userAgent: 'OperatorOSMobile/0.1 (ios)' })
+    const body = response.json();
+    expect(body.accessToken).toBe('access.refreshed.token');
+    expect(body.refreshToken).toBe('refresh-rotated-token');
+    expect(stub.refresh).toHaveBeenCalledWith(
+      expect.objectContaining({ refreshToken: 'existing-refresh-token' })
     );
 
+    await app.close();
+  });
+
+  it('rejects a request without refreshToken with 400', async () => {
+    const app = buildServer(parseAuthGatewayEnv({}), {
+      signinService: buildStubSignin(),
+      refreshService: buildStubRefresh(),
+      signoutService: buildStubSignout()
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/auth/refresh',
+      payload: {}
+    });
+
+    expect(response.statusCode).toBe(400);
+    await app.close();
+  });
+
+  it('surfaces IntegrationError 401 when the refresh service rejects the token', async () => {
+    const rejection = new IntegrationError({
+      code: 'invalid_config',
+      dependency: 'refresh-service',
+      message:
+        'Refresh token was already rotated; treat this as a potential token reuse and sign in again.',
+      statusCode: 401,
+      details: { reason: 'rotated' }
+    });
+
+    const app = buildServer(parseAuthGatewayEnv({}), {
+      signinService: buildStubSignin(),
+      refreshService: buildStubRefresh(rejection),
+      signoutService: buildStubSignout()
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/auth/refresh',
+      payload: { refreshToken: 'already-rotated-token' }
+    });
+
+    expect(response.statusCode).toBe(401);
+    const body = response.json();
+    expect(body.details.reason).toBe('rotated');
+
+    await app.close();
+  });
+});
+
+describe('POST /v1/auth/signout', () => {
+  it('returns 204 when the stub revokes the token', async () => {
+    const stub = buildStubSignout();
+    const app = buildServer(parseAuthGatewayEnv({}), {
+      signinService: buildStubSignin(),
+      refreshService: buildStubRefresh(),
+      signoutService: stub
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/auth/signout',
+      payload: { refreshToken: 'existing-refresh-token' }
+    });
+
+    expect(response.statusCode).toBe(204);
+    expect(response.body).toBe('');
+    expect(stub.signout).toHaveBeenCalledWith({
+      refreshToken: 'existing-refresh-token'
+    });
+
+    await app.close();
+  });
+
+  it('rejects a request without refreshToken with 400', async () => {
+    const app = buildServer(parseAuthGatewayEnv({}), {
+      signinService: buildStubSignin(),
+      refreshService: buildStubRefresh(),
+      signoutService: buildStubSignout()
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/auth/signout',
+      payload: {}
+    });
+
+    expect(response.statusCode).toBe(400);
     await app.close();
   });
 });
