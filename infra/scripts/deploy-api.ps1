@@ -14,7 +14,7 @@ $ProjectId = "operator-os-dev"
 $Region = "europe-west4"
 $ServiceName = "operator-os-api"
 $Repository = "operator-os-docker"
-$ImageUri = "europe-west4-docker.pkg.dev/$ProjectId/$Repository/$ServiceName:$ImageTag"
+$ImageUri = "europe-west4-docker.pkg.dev/${ProjectId}/${Repository}/${ServiceName}:${ImageTag}"
 
 $EnvVars = @(
   "NODE_ENV=production",
