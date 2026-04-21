@@ -187,3 +187,58 @@ Consequences:
   state, not a failure.
 - When the consumer lands, the change is small: replace the pinned
   `degraded` with a proper status based on consumer health.
+
+## Adopt Master Technical Specification v1.0 As Source Of Truth
+
+Date: 2026-04-22
+Status: accepted
+
+Decision:
+
+- Land `docs/SPEC.md` as the canonical source of truth for all
+  Operator-OS product work: vision, architecture, five architectural
+  laws, backend/desktop/mobile specs, AI router, orchestration,
+  security, observability, cost intelligence, 6-week sprint plan,
+  R1-R50 operational rules.
+- Extract R1-R50 from SPEC Book XV into a standalone `docs/RULES.md`
+  for fast reference.
+- Keep the repo root `CLAUDE.md` scoped to the Claude Code operating
+  harness (language, git workflow, commit style, communication,
+  autonomy boundaries) and have it point at SPEC and RULES for the
+  product standards.
+- Establish an explicit source-of-truth hierarchy:
+  session instruction > SPEC.md > RULES.md > CLAUDE.md > other docs.
+
+Why:
+
+- Through P0.1 the repo accumulated rules in several places: the
+  original `CLAUDE.md` R1-R20, Akmal's later R21-R24 reminders, and
+  the 6-week execution plan with its own R1-R50. Duplication was
+  guaranteed to drift.
+- The sprint plan requires up to five parallel Claude Code sessions
+  (backend, desktop-agent, mobile, infra, launch). Each session
+  needs the same rulebook without pulling in the full narrative.
+- A single canonical SPEC lets future team members, code reviewers,
+  and Claude agents resolve every ambiguity to one document.
+
+Alternatives considered:
+
+- **Monolithic CLAUDE.md.** Rejected: file grows to thousands of
+  lines, unclear scope, every worktree reads everything.
+- **Renumber SPEC rules to avoid overlap with the old R1-R20.**
+  Rejected: the sprint plan already numbers them R1-R50; renumbering
+  creates its own drift risk.
+- **Keep the old R1-R20 verbatim and append R21-R70.** Rejected:
+  same drift problem; new rules already cover the old ones' intent.
+
+Consequences:
+
+- PRs are reviewed against `docs/RULES.md`. CLAUDE.md reviewers look
+  at operating-harness behaviour (language, commit style, git
+  safety), not product standards.
+- Source-spec corrections against the Akmal paste: the Anthropic
+  model list in SPEC § 63 is `Claude Opus 4.7, Sonnet 4.6, Haiku
+  4.5`. Any other factual diffs (GPT-5, Gemini 3, domain names,
+  pricing) are verified build-time when each integration lands.
+- Docs navigation (`docs/README.md`) updated to lead with SPEC and
+  RULES, then living-state docs, then the P0.1 and earlier archive.
