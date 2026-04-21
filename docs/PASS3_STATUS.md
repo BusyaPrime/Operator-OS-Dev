@@ -201,3 +201,96 @@ Root cause:
 4. perform pass-3 live smoke tests for:
    Secret Manager, Firestore, Pub/Sub, Cloud Tasks, Storage, BigQuery
 5. run the first live Vertex request and capture the result in docs
+
+## P0.1 Update (2026-04-22)
+
+Follow-up to the pass 3 checkpoint, completed across three PRs on
+`phase3/live-deploy-and-vertex`:
+
+- **PR #1** (`feat(api): add /internal/tasks/* stub handlers + config env wiring`)
+  - landed Zod-validated stub handlers for `/internal/tasks/commands`,
+    `/internal/tasks/approvals`, `/internal/tasks/exports`.
+  - wired `TASKS_TARGET_BASE_URL=https://operator-os-api-m545sz2isq-ez.a.run.app`
+    into the Cloud Run manifest and the deploy script default.
+- **PR #2** (`chore(docs): initial technical debt registry + .claude ignore`)
+  - seeded `docs/TECH_DEBT.md` with seven starter items.
+  - excluded the Claude Code harness directory from git.
+- **PR #3** (`refactor(api): commands/exports readiness worker-pending`)
+  - pinned `CommandsService.describeReadiness()` and
+    `ExportsService.describeReadiness()` to `degraded` with an explicit
+    worker-pending message, independent of tasks queue state.
+
+After PR #1 landed and deployed (revision `operator-os-api-00004-84h`),
+`/ready` returned HTTP 200 with every check reporting `ok`. That was
+cosmetic: the transport was configured but no worker drained the queue.
+PR #3 restored honest reporting.
+
+### Deployed Readiness Matrix (post-P0.1)
+
+| Check | Status | Notes |
+|---|---|---|
+| config | ok | env parsing passes |
+| auth | ok | Firebase Admin via metadata ADC |
+| firestore | ok | clients initialise; no live smoke write test yet |
+| pubsub | ok | publishers initialise; no live smoke publish yet |
+| tasks | ok | `TASKS_TARGET_BASE_URL` configured; Cloud Tasks can dispatch |
+| storage | ok | bucket mappings configured |
+| bigquery | ok | writer configured; dataset IAM still manual (pass-3 follow-up) |
+| secrets | ok | accessor configured |
+| commands | degraded (honest) | worker consumer not implemented yet |
+| sessions | ok | persistence + fan-out configured |
+| alerts | ok | persistence + fan-out configured |
+| exports | degraded (honest) | worker consumer not implemented yet |
+| vertex | ok | ADC + project/location/model configured; no live inference smoke yet |
+
+Overall status: `degraded` -> HTTP `503`. This is the correct steady
+state until a durable worker is implemented.
+
+### Remaining Pass-3 Follow-ups
+
+Unchanged from the original checkpoint:
+
+- dataset-level `roles/bigquery.dataEditor` on `ops_analytics` still manual.
+- live Vertex inference smoke test still pending.
+- live Firestore / Pub/Sub / Cloud Tasks / Storage / Secret Manager smoke
+  tests still pending as an end-to-end matrix.
+- local Docker build still blocked (WSL is now up, Docker Desktop engine
+  still not starting; see original Docker Status section).
+
+## Post-P0.1 Update (2026-04-22)
+
+P0.1 closed the readiness path in two landings on
+`phase3/live-deploy-and-vertex`:
+
+- **PR #1** (`feat(api): add /internal/tasks/* stub handlers + config env wiring`)
+  added the three stub handlers, set `TASKS_TARGET_BASE_URL` to the
+  production service URL, and pointed the deploy pipeline at the same URL.
+- **PR #3** (`refactor(api): honest readiness for commands and exports`)
+  pinned `CommandsService` / `ExportsService` readiness to `degraded`
+  with a worker-pending message instead of inheriting the now-green
+  tasks queue status.
+
+Deployed revisions:
+
+- Previous: `operator-os-api-00003-rzm` (pass 3 baseline).
+- Post-PR-1: `operator-os-api-00004-84h`
+  (image `phase3-2dee709`, Cloud Build `0799e1d6-4847-4091-bbae-85352ff34f9c`).
+- Post-PR-3: tracked in the Phase E deploy log.
+
+Current `/ready` contract:
+
+- `tasks` = `ok` - env var is wired, stub handlers accept the dispatch.
+- `commands` = `degraded` - "A durable worker consumer is not
+  implemented yet; commands remain in-memory fallback only."
+- `exports` = `degraded` - "Export requests are persisted and
+  enqueued, but a durable worker consumer is not implemented yet."
+- Overall `/ready` stays at HTTP 503 by design until the durable
+  worker lands; this is the honest state, not a regression.
+
+Git identity was corrected during P0.1 from `xodarevakmal@gmail.com`
+to `hujdarovakmal@gmail.com` in the repo-local git config so commits
+author as the BusyaPrime GitHub identity.
+
+Tech debt discovered during P0.1 is registered in
+[TECH_DEBT.md](/D:/Operator-OS-Dev/docs/TECH_DEBT.md) as TD-001
+through TD-008.

@@ -143,3 +143,41 @@ What is still missing:
 - no GitHub-to-Cloud-Build trigger or Developer Connect integration was
   configured or validated in this pass
 - no real push-triggered continuous deployment has been verified yet
+
+## What `/ready` Means After P0.1
+
+After the three P0.1 PRs landed (2026-04-22), `/ready` is the honest
+readiness of the API:
+
+- `/health` is process liveness and returns HTTP `200` when the
+  Fastify process is running.
+- `/ready` returns HTTP `503` with `status: degraded` as long as
+  `commands` or `exports` are degraded. Those two are pinned to
+  `degraded` with the message `"... durable worker consumer is not
+  implemented yet ..."` and will stay that way until a real consumer
+  for the Cloud Tasks queues lands.
+- Every other readiness check (`config`, `auth`, `firestore`, `pubsub`,
+  `tasks`, `storage`, `bigquery`, `secrets`, `sessions`, `alerts`,
+  `vertex`) should report `ok` on the deployed revision.
+
+Monitors and load balancers should treat `503` as the steady-state
+"live but not end-to-end" signal. It is not a crash.
+
+## Known Deploy Script Issue
+
+`infra/scripts/deploy-api.ps1` currently throws
+`InvalidVariableReferenceWithDrive` on Windows PowerShell 5.1 because
+line 17 uses `$ServiceName:$ImageTag` (colon is a PowerShell drive
+separator). See `docs/TECH_DEBT.md#td-008`. Until that fix lands, the
+equivalent deploy is a direct `gcloud builds submit`:
+
+```bash
+gcloud builds submit \
+  --project=operator-os-dev \
+  --service-account=projects/operator-os-dev/serviceAccounts/deploy-bot@operator-os-dev.iam.gserviceaccount.com \
+  --gcs-source-staging-dir=gs://operator-os-dev-artifacts/cloud-build/source \
+  --gcs-log-dir=gs://operator-os-dev-artifacts/cloud-build/logs \
+  --config=infra/cloudbuild/api.cloudbuild.yaml \
+  --substitutions=_IMAGE_TAG=<short-sha>,_DEPLOY=true,_TASKS_TARGET_BASE_URL=https://operator-os-api-m545sz2isq-ez.a.run.app \
+  .
+```
