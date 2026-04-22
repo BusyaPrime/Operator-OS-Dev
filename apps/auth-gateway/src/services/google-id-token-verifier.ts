@@ -34,10 +34,19 @@ const googleAuthLibraryVersion = (() => {
   }
 })();
 
-// Matches ASCII control characters (C0: U+0000..U+001F, DEL: U+007F).
-// Built via RegExp constructor with explicit hex escapes so the source
-// file never carries raw control bytes.
-const controlCharPattern = new RegExp('[\\u0000-\\u001F\\u007F]');
+// Detect ASCII control characters (C0: U+0000..U+001F, DEL: U+007F).
+// Implemented as a charCode scan rather than a regex so (a) the source
+// file never carries raw control bytes and (b) ESLint's no-control-regex
+// rule (which is a real safety net elsewhere in the codebase) stays on.
+const hasAsciiControlChar = (s: string): boolean => {
+  for (let i = 0; i < s.length; i += 1) {
+    const code = s.charCodeAt(i);
+    if (code < 0x20 || code === 0x7f) {
+      return true;
+    }
+  }
+  return false;
+};
 
 const maskClientId = (clientId: string): string => {
   if (clientId.length <= 24) {
@@ -85,7 +94,7 @@ export class GoogleIdTokenVerifier {
         segmentCount: segments.length,
         segmentLengths: segments.map((s) => s.length),
         hasWhitespace: /\s/.test(idToken),
-        hasControlChars: controlCharPattern.test(idToken),
+        hasControlChars: hasAsciiControlChar(idToken),
         nonBase64UrlChars: Array.from(
           new Set(idToken.split('').filter((c) => !/[A-Za-z0-9._\-=]/.test(c)))
         ),
