@@ -1,3 +1,4 @@
+export * from './agent/index.js';
 export * from './ai/index.js';
 export * from './auth.js';
 export * from './auth-gateway.js';
