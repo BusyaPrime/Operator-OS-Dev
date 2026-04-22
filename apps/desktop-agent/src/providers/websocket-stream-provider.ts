@@ -73,7 +73,6 @@ export class WebSocketStreamProvider implements StreamProvider {
 class WebSocketResponseStream implements AIResponseStream {
   readonly taskId: string;
 
-  #config: StreamConfig;
   #options: WebSocketStreamProviderOptions;
   #logger: Logger;
   #ws?: WebSocket;
@@ -88,7 +87,6 @@ class WebSocketResponseStream implements AIResponseStream {
     logger: Logger
   ) {
     this.taskId = config.taskId;
-    this.#config = config;
     this.#options = options;
     this.#logger = logger;
     this.#ready = this.#connect();
