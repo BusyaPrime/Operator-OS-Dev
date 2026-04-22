@@ -1919,10 +1919,24 @@ A background service on user's PC that:
 1. Connects to backend via secure WebSocket
 2. Registers and heartbeats
 3. Accepts commands from backend
-4. Spawns and manages subprocesses (Claude Code, etc.)
-5. Streams output back to backend
-6. Reports completion status
-7. Never does anything user didn't authorize
+4. Hosts `AIAgent` provider plugins (ClaudeCodeAgent in v1, plus
+   any others the user has installed — Codex, Cursor CLI,
+   ChatGPT desktop, Gemini CLI, Ollama, LM Studio, Copilot
+   Workspace, or a custom one) and dispatches tasks through the
+   `AIAgent` interface only. Core code branches on capabilities,
+   never on vendor string.
+5. Streams output back to backend via a `StreamProvider`
+6. Accesses files via a `FileSystemProvider` (local FS for v1;
+   SSH / cloud / sandbox providers in later phases)
+7. Records usage per-vendor via a `CostProvider` so cost
+   tracking, estimation, and cost-optimal routing (§ 68) stay
+   out of the agent core
+8. Reports completion status
+9. Never does anything user didn't authorize
+
+v1 ships with `ClaudeCodeAgent` as the only concrete agent, but
+§ 27.5 (Provider Registry) makes adding the rest a pure
+plugin-install step — no recompile of Desktop Agent core.
 
 ## Tech stack decision
 
@@ -2003,16 +2017,24 @@ Secret (in OS keychain, not filesystem):
 │           │                            │
 │           ▼                            │
 │  ┌────────────────────────────────┐    │
-│  │  Subprocess Executors          │    │
-│  │  - claude-code executor        │    │
-│  │  - codex executor (later)      │    │
-│  │  - shell executor (restricted) │    │
+│  │  AIAgent Provider Registry     │    │
+│  │  (§ 27.5)                      │    │
+│  │  - ClaudeCodeAgent (v1)        │    │
+│  │  - CodexAgent (Phase 2)        │    │
+│  │  - CursorCLIAgent (Phase 2)    │    │
+│  │  - OllamaAgent, ... (plugins)  │    │
+│  │                                │    │
+│  │  Non-agent executors           │    │
 │  │  - git executor                │    │
+│  │  - gh executor                 │    │
+│  │  - npm/pnpm executor           │    │
+│  │  - shell executor (restricted) │    │
 │  └────────┬───────────────────────┘    │
 │           │                            │
 │           ▼                            │
 │  ┌────────────────────────────────┐    │
-│  │  Output Streamer               │    │
+│  │  StreamProvider                │    │
+│  │  (§ 61 interface)              │    │
 │  │  - Chunk output                │    │
 │  │  - Send via WebSocket          │    │
 │  │  - Buffer if disconnected      │    │
@@ -2039,7 +2061,10 @@ Secret (in OS keychain, not filesystem):
 
 ### Command types in v1
 
-1. **claude-code**: Run Claude Code with instruction
+1. **ai-agent-task**: Run an `AIAgent` with an instruction. The
+   router (§ 61) selects the concrete agent by id or by
+   capability; the dispatcher calls `agent.stream(task)` only.
+   v1 ships with `ClaudeCodeAgent` as the only installed agent.
 2. **git**: Run specific git operations (allowlisted commands)
 3. **gh**: Run gh CLI operations (allowlisted)
 4. **npm/pnpm**: Package manager operations (allowlisted)
@@ -2048,9 +2073,13 @@ Secret (in OS keychain, not filesystem):
 ### Allowlist approach for v1
 
 Only commands explicitly approved by user in settings:
-- Default allowlist: claude-code, git, gh, pnpm, npm
+- Default allowlist: `ai-agent-task` (any installed agent), git,
+  gh, pnpm, npm
 - User can add more in settings
 - Each command type has its own executor with specific handling
+- Installing a new agent plugin (§ 27.5) does not widen the
+  command-type allowlist; it only expands which agents
+  `ai-agent-task` may dispatch to
 
 ### Why not arbitrary shell
 
@@ -2058,80 +2087,263 @@ Security. If we allow arbitrary shell, malicious backend could take over PC.
 Even though we trust our backend, defense in depth.
 Ability to run any shell is Enterprise-only or explicit user consent per-command.
 
-### Example executor: claude-code
+### Reference implementation: ClaudeCodeAgent (implements AIAgent)
 
 ```typescript
-class ClaudeCodeExecutor {
-  async execute(cmd: Command): Promise<void> {
-    // 1. Validate
-    if (cmd.type !== "claude-code") throw new Error("Wrong executor");
-    if (!cmd.instruction) throw new Error("Missing instruction");
+import type { AIAgent, Task, OutputChunk, AgentResult, AgentStatus, ResourceMetrics, AgentConfig } from "@operator-os/contracts";
 
-    // 2. Check user quota
-    const quota = await this.checkQuota(cmd.userId);
-    if (quota.exhausted) throw new Error("Quota exhausted");
+export class ClaudeCodeAgent implements AIAgent {
+  readonly id = "anthropic.claude-code";
+  readonly vendor = "anthropic" as const;
+  readonly capabilities = [
+    "code-generation",
+    "code-editing",
+    "multi-file-edit",
+    "tool-use",
+    "long-context",
+    "thinking",
+    "streaming",
+    "cancel",
+  ] as const satisfies ReadonlyArray<Capability>;
 
-    // 3. Prepare working directory
-    const cwd = cmd.workingDir || this.defaultCwd;
-    await this.ensureDirExists(cwd);
+  private cwd!: string;
+  private claudePath!: string;
+  private active = new Map<string, IPty>();
+  private state: AgentStatus["state"] = "idle";
 
-    // 4. Build Claude Code command
-    const claudePath = await this.locateClaudeCode();
-    const args = [
-      "--prompt", cmd.instruction,
-      "--non-interactive",
-      ...(cmd.flags || [])
-    ];
-
-    // 5. Spawn via node-pty for true terminal semantics
-    const pty = nodePty.spawn(claudePath, args, {
-      cwd,
-      env: { ...process.env, ...cmd.env },
-      cols: 120,
-      rows: 40,
-    });
-
-    // 6. Stream output
-    pty.onData((data) => {
-      this.outputStream.send({
-        taskId: cmd.taskId,
-        commandId: cmd.id,
-        stream: "stdout",
-        chunk: data,
-      });
-    });
-
-    // 7. Handle exit
-    pty.onExit(({ exitCode, signal }) => {
-      this.outputStream.send({
-        taskId: cmd.taskId,
-        commandId: cmd.id,
-        type: "complete",
-        exitCode,
-        signal,
-      });
-    });
-
-    // 8. Store PTY for cancellation
-    this.activeProcesses.set(cmd.id, pty);
+  async initialize(config: AgentConfig): Promise<void> {
+    this.state = "initializing";
+    this.cwd = config.workingDirectory ?? process.cwd();
+    this.claudePath = await this.locateClaudeCode();
+    this.state = "ready";
   }
 
-  async cancel(commandId: string): Promise<void> {
-    const pty = this.activeProcesses.get(commandId);
+  async shutdown(): Promise<void> {
+    this.state = "shutting-down";
+    await Promise.all([...this.active.keys()].map((id) => this.cancel(id)));
+    this.state = "idle";
+  }
+
+  async *stream(task: Task): AsyncIterable<OutputChunk> {
+    const pty = nodePty.spawn(
+      this.claudePath,
+      [
+        "--prompt", task.instruction,
+        "--non-interactive",
+        ...((task.flags?.args as string[] | undefined) ?? []),
+      ],
+      { cwd: this.cwd, env: process.env, cols: 120, rows: 40 },
+    );
+    this.active.set(task.id, pty);
+
+    const queue: OutputChunk[] = [];
+    let done = false;
+    let exitCode = 0;
+
+    pty.onData((data) => {
+      queue.push({ taskId: task.id, stream: "stdout", data, at: new Date().toISOString() });
+    });
+    pty.onExit(({ exitCode: code }) => {
+      exitCode = code;
+      done = true;
+    });
+
+    while (!done || queue.length) {
+      if (queue.length) yield queue.shift()!;
+      else await new Promise((r) => setTimeout(r, 25));
+    }
+    this.active.delete(task.id);
+    if (exitCode !== 0) {
+      yield { taskId: task.id, stream: "meta", data: `exit=${exitCode}`, at: new Date().toISOString() };
+    }
+  }
+
+  async execute(task: Task): Promise<AgentResult> {
+    let finalOutput = "";
+    for await (const chunk of this.stream(task)) {
+      if (chunk.stream === "stdout") finalOutput += chunk.data;
+    }
+    return {
+      taskId: task.id,
+      exitCode: 0,
+      finalOutput,
+      usage: await this.reportUsage(task),
+    };
+  }
+
+  async cancel(taskId: string): Promise<void> {
+    const pty = this.active.get(taskId);
     if (!pty) return;
-
-    // Graceful: send SIGINT first
     pty.kill("SIGINT");
-
-    // If still running after 5s, SIGKILL
     setTimeout(() => {
-      if (this.activeProcesses.has(commandId)) {
-        pty.kill("SIGKILL");
-      }
+      if (this.active.has(taskId)) pty.kill("SIGKILL");
     }, 5000);
   }
+
+  status(): AgentStatus { return { state: this.state, runningTasks: this.active.size }; }
+  resourceUsage(): ResourceMetrics {
+    return {
+      cpuPercent: 0,         // populated by ResourceMonitor (§ 37)
+      memoryMB: 0,
+      openFileHandles: 0,
+      activeSubprocesses: this.active.size,
+    };
+  }
+
+  private async locateClaudeCode(): Promise<string> { /* platform-specific */ return "claude"; }
+  private async reportUsage(task: Task): Promise<UsageEvent> { /* reads Claude Code session usage */ return null as never; }
 }
 ```
+
+Key points about this reference implementation:
+
+- Implements `AIAgent` from `@operator-os/contracts`. No part of
+  Desktop Agent core imports `ClaudeCodeAgent` directly — it is
+  loaded by the provider registry (§ 27.5) and handed back
+  through the interface.
+- Quota, subprocess management, streaming, cancellation, and
+  resource reporting live inside the agent. Callers see only the
+  interface methods.
+- `capabilities` is declared once; callers that need "does this
+  agent support vision" read `agent.capabilities.includes("vision")`,
+  never `agent.vendor === "anthropic"`.
+- The same shape is followed by `CodexAgent`, `CursorCLIAgent`,
+  `OllamaAgent`, etc. — see § 62-66.7.
+
+## § 27.5 Provider Registry
+
+The Desktop Agent owns a **provider registry**: a runtime record
+of which `AIAgent` implementations are installed, which is
+currently enabled, and what each one advertises as its
+capabilities, pricing, and file-system / stream requirements.
+
+### Installation model
+
+Concrete agents are plugins. The user installs them individually:
+
+```
+operator-agent install claude-code           # pre-installed in v1
+operator-agent install codex                 # Phase 2
+operator-agent install cursor                # Phase 2
+operator-agent install chatgpt-desktop       # Phase 2
+operator-agent install gemini                # Phase 2
+operator-agent install ollama                # Phase 2
+operator-agent install lm-studio             # Phase 2
+operator-agent install copilot-workspace     # Phase 3
+operator-agent install <custom-npm-package>  # open standard
+```
+
+Each plugin is distributed as one of:
+
+- A scoped npm package under `@operator-os-agents/*` (most
+  agents).
+- A signed binary in a known release channel (for agents whose
+  native surface does not map well to Node, e.g. Ollama).
+
+Installation is a three-step dance:
+
+1. The CLI resolves the plugin to a tarball or binary and
+   verifies its publisher signature (required; the registry
+   refuses unsigned plugins outside developer mode).
+2. The tarball is unpacked into
+   `~/.operator-os/providers/<plugin-id>/` with read-only perms.
+3. The plugin's manifest is merged into
+   `~/.operator-os/providers/registry.json`, which the running
+   Desktop Agent process re-reads on SIGHUP.
+
+### Provider manifest
+
+Every plugin ships a `provider.manifest.json`:
+
+```json
+{
+  "id": "anthropic.claude-code",
+  "vendor": "anthropic",
+  "displayName": "Claude Code",
+  "version": "1.0.0",
+  "entry": "./dist/index.js",
+  "capabilities": [
+    "code-generation", "code-editing", "multi-file-edit",
+    "tool-use", "long-context", "thinking", "streaming", "cancel"
+  ],
+  "requires": {
+    "binary": "claude",
+    "minVersion": "1.0.0",
+    "filesystem": ["local"],
+    "stream": ["memory", "websocket"]
+  },
+  "pricing": "@operator-os-agents/claude-code/pricing",
+  "permissions": {
+    "network": ["api.anthropic.com"],
+    "filesystem": ["$WORKSPACE"],
+    "spawnBinaries": ["claude"]
+  },
+  "signature": "<base64 ed25519 sig over the manifest>"
+}
+```
+
+Fields beyond `id` / `version` / `entry`:
+
+- `capabilities` must match what the agent's `capabilities` field
+  advertises at runtime; the registry rejects plugins whose
+  runtime capabilities diverge from their manifest.
+- `requires` gates loading: if the declared binary is missing, or
+  the installed FileSystemProvider / StreamProvider types are not
+  among `requires.filesystem` / `requires.stream`, the registry
+  marks the provider as "installed, not available" and surfaces
+  that to the mobile app.
+- `permissions` defines the sandboxing rules — the plugin can
+  spawn only the listed binaries, write only under the declared
+  filesystem roots, and connect out only to the declared hosts.
+  Enforced via the local executor (§ 30) and a firewall hook
+  where the OS exposes one.
+
+### Lifecycle
+
+```
+installed -> validated -> available -> enabled -> busy
+     |            |            |           |         |
+     v            v            v           v         v
+  rejected   unavailable   disabled   disabled   crashed
+```
+
+- **installed**: tarball on disk, manifest parsed.
+- **validated**: signature ok, manifest schema ok, binary present.
+- **available**: `initialize()` returned without error;
+  `status().state === "ready"`.
+- **enabled**: user has the provider turned on in settings.
+- **busy**: at least one task running.
+- **disabled** / **unavailable**: user turned off, or a
+  `requires` check failed.
+- **crashed**: three consecutive task failures attributed to the
+  agent itself; the registry auto-disables and surfaces an alert.
+
+The registry exposes the current lifecycle state via the local
+HTTP API (§ 27 architecture) so the mobile app can show
+"Claude Code: available", "Codex: disabled", "Ollama: not
+installed" without the backend polling the desktop.
+
+### Dispatch
+
+When the backend dispatches an `ai-agent-task`:
+
+1. If the task specifies `agentId`, the registry looks it up and
+   rejects the task if not in `available` + `enabled`.
+2. If the task specifies only `requiredCapabilities`, the router
+   (§ 61) picks the cheapest enabled agent whose capabilities
+   cover the requirement. Pricing comes from the agent's
+   `CostProvider`.
+3. The registry returns a live `AIAgent` handle; the dispatcher
+   calls `stream(task)` and forwards chunks through the
+   configured `StreamProvider`.
+
+### Developer-mode override
+
+For local development, `OPERATOR_AGENT_DEVMODE=1` disables
+signature verification and allows loading a plugin from a local
+path. The mobile app shows a persistent warning banner while any
+dev-mode provider is loaded, because these plugins bypass the
+security checks listed above. LAW #4 (Security-First).
 
 ## Heartbeat protocol
 
