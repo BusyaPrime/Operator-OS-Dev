@@ -390,22 +390,50 @@ Implementation implications:
 
 ## LAW #3 — Multi-AI Agnostic
 
-No vendor lock-in. User's work is portable across AI providers.
+No vendor lock-in. Operator-OS is a Universal AI Control Platform,
+not a Claude Code remote. Claude Code is the Phase 1 MVP proof; the
+product controls any AI agent the founder chooses to run.
 
 Concretely:
-  • Claude, GPT, Gemini, local models — all interchangeable
-  • User can switch providers mid-task
-  • Context is stored in our format, translatable to any provider
-  • Pricing displayed in real-time across providers
+  • Claude (Claude Code CLI, Claude chat), OpenAI (Codex CLI, GPT
+    chat, ChatGPT desktop), Google (Gemini CLI), Cursor CLI,
+    Copilot Workspace, local models (Ollama, LM Studio), and future
+    AI tools — all interchangeable, all first-class
+  • User can switch agents mid-task and mid-session
+  • Context is stored in our format, translatable to any agent
+  • Pricing and usage displayed in real-time per vendor
   • No "this only works with Claude" features
+  • Every architectural decision must pass the test: "Will this
+    still work when Codex lands in 2 weeks, without a rewrite?"
 
 Contrast: Cursor locks you into their AI backend. We don't.
 
-Implementation implications:
-  • Provider Interface (§ 62) with identical capabilities surface
-  • Context format provider-agnostic
-  • Routing engine (§ 67) decides best provider per task
-  • User can override routing at any time
+Implementation implications — this law is implemented via **four
+provider-agnostic interfaces** that all agent-aware code must go
+through. Concrete agent classes (e.g. `ClaudeCodeAgent`) are never
+referenced from Desktop Agent core, the backend command dispatcher,
+the mobile UI, or the conductor; they are loaded via a provider
+registry at runtime.
+
+  • `AIAgent` — any AI coding/task agent. Lifecycle
+    (`initialize`, `shutdown`), execution (`execute`, `stream`,
+    `cancel`), state (`status`, `resourceUsage`). Every concrete
+    agent — `ClaudeCodeAgent`, `CodexAgent`, `CursorCLIAgent`,
+    `OllamaAgent`, etc. — implements this.
+  • `FileSystemProvider` — any file access. Abstracts over local
+    FS, SSH remote, cloud workspace, sandboxed containers. Agents
+    never call `fs.readFile` directly.
+  • `StreamProvider` — any output streaming transport (subprocess
+    PTY, SSE, WebSocket, queue fan-out). Decouples "where output
+    comes from" from "how the UI consumes it".
+  • `CostProvider` — vendor-specific usage + pricing surface.
+    Records usage events, estimates task cost, exposes current
+    pricing tables. One implementation per vendor.
+
+See § 61 for the full interface specifications, § 27.5 for the
+provider registry on Desktop Agent, and § 62-66.7 for the concrete
+agent implementations that ship with v1 and that are planned for
+later phases.
 
 ## LAW #4 — Security-First
 
