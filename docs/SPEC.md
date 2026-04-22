@@ -87,16 +87,21 @@
 § 60. Apple Watch & Wear OS companion (future)
 
 ## BOOK VI — AI PROVIDER ABSTRACTION
-§ 61. Multi-AI Router Architecture
-§ 62. Provider Interface Specification
-§ 63. Claude Integration (Anthropic API)
-§ 64. OpenAI Integration (GPT-5, Codex)
-§ 65. Gemini Integration (Google AI)
-§ 66. Local Model Support (Ollama, LM Studio)
-§ 67. Task-to-Model Routing Logic
-§ 68. Cost-Optimal Routing
-§ 69. Fallback Chains
-§ 70. Context Transfer Between Models
+§ 61.   Multi-AI Router Architecture (4 interfaces: AIAgent,
+        FileSystemProvider, StreamProvider, CostProvider)
+§ 62.   Provider Interface Specification
+§ 63.   Claude Integration (ClaudeCodeAgent, ClaudeChatAgent)
+§ 64.   OpenAI Integration (CodexAgent, GPTChatAgent,
+        ChatGPTDesktopAgent)
+§ 65.   Gemini Integration (GeminiCLIAgent)
+§ 66.   Local Model Support (OllamaAgent, LMStudioAgent)
+§ 66.5. Cursor CLI Agent (CursorCLIAgent)
+§ 66.6. Copilot Workspace Agent (CopilotWorkspaceAgent)
+§ 66.7. Custom Agent — open standard for third-party AIAgent plugins
+§ 67.   Task-to-Model Routing Logic
+§ 68.   Cost-Optimal Routing
+§ 69.   Fallback Chains
+§ 70.   Context Transfer Between Models
 
 ## BOOK VII — AGENT ORCHESTRATION ENGINE
 § 71. The Conductor Service (master orchestrator)
@@ -3643,31 +3648,268 @@ Default rules apply in order:
 5. If "quality-first" flag → use best capable
 6. Default: balanced (moderate quality, moderate cost)
 
-## Specific provider integrations
+═══════════════════════════════════════════════════════════════════════════════
 
-### Anthropic (Claude)
-- Models: Claude Opus 4.7, Sonnet 4.6, Haiku 4.5
-- Auth: API key or OAuth
-- Special: supports thinking mode, code execution tool
-- Rate limit: per-account
+§ 62. PROVIDER INTERFACE SPECIFICATION
 
-### OpenAI
-- Models: GPT-5, GPT-5-Codex, GPT-5-mini
-- Auth: API key
-- Special: function calling, assistants API
-- Rate limit: per-key
+The four provider-agnostic interfaces are normatively defined in
+§ 61 (AIAgent, FileSystemProvider, StreamProvider, CostProvider).
+Every concrete agent described in § 63-66.7 implements `AIAgent`.
+A concrete agent may also ship its own `CostProvider`
+implementation if its vendor's pricing surface is not covered by
+a generic vendor-level `CostProvider` (Anthropic / OpenAI /
+Google each get one).
 
-### Google AI
-- Models: Gemini 3 Pro, Gemini 3 Flash, Nano Banana Pro (images)
-- Auth: API key or ADC
-- Special: 1M context, native image generation
-- Rate limit: per-project
+Per-agent sections below follow a fixed template:
 
-### Local (Ollama, LM Studio) — future
-- Models: Llama 3, Mistral, etc.
-- Auth: none (localhost)
-- Special: zero cost, privacy-first
-- Speed depends on user's hardware
+- **id** — stable registry id (matches `AIAgent.id`)
+- **vendor** — matches `AIAgent.vendor`
+- **capabilities** — subset of the `Capability` union from § 61
+- **invocation** — how the agent is spawned or contacted
+- **auth** — credential shape
+- **pricing** — which CostProvider covers it
+- **status** — shipped in v1 / Phase 2 / Phase 3 / future
+- **notes** — agent-specific caveats
+
+═══════════════════════════════════════════════════════════════════════════════
+
+§ 63. CLAUDE INTEGRATION (Anthropic)
+
+Anthropic's Claude is accessed via two agent shapes.
+
+### § 63.1 ClaudeCodeAgent
+
+- **id**: `anthropic.claude-code`
+- **vendor**: `anthropic`
+- **capabilities**: `code-generation`, `code-editing`,
+  `multi-file-edit`, `tool-use`, `long-context`, `thinking`,
+  `streaming`, `cancel`
+- **invocation**: spawns the `claude` CLI binary via `node-pty`
+  in the task's working directory (see reference implementation
+  in § 27)
+- **auth**: the CLI uses the locally installed Claude Code
+  session; Operator-OS does not hold an Anthropic API key for
+  this agent
+- **pricing**: `AnthropicCostProvider` — reads session usage
+  reported by Claude Code on task completion, maps to Opus /
+  Sonnet / Haiku pricing tables (see § 101)
+- **status**: shipped in v1 as the only installed agent
+- **notes**: Claude Code runs non-interactively (`--prompt`,
+  `--non-interactive`); streaming is via PTY stdout; cancellation
+  uses SIGINT with a 5s fallback to SIGKILL. Thinking mode and
+  the code-execution tool are exposed via task flags; capability
+  flags make these discoverable without branching on vendor.
+
+### § 63.2 ClaudeChatAgent
+
+- **id**: `anthropic.claude-chat`
+- **vendor**: `anthropic`
+- **capabilities**: `chat`, `tool-use`, `vision`, `long-context`,
+  `thinking`, `streaming`, `cancel`
+- **invocation**: Anthropic Messages API via the official SDK
+- **auth**: Anthropic API key in Secret Manager
+  (`anthropic-api-key`)
+- **pricing**: `AnthropicCostProvider` — priced from the API
+  response's `usage` field
+- **status**: Phase 2+
+- **notes**: wraps raw LLM calls; useful for mobile chat-style
+  interactions (§ 47 Task Composer, § 55 Notifications reply)
+  that do not need a full coding agent. Models: Opus 4.7, Sonnet
+  4.6, Haiku 4.5.
+
+═══════════════════════════════════════════════════════════════════════════════
+
+§ 64. OPENAI INTEGRATION
+
+Three agent shapes cover OpenAI's product surface.
+
+### § 64.1 CodexAgent
+
+- **id**: `openai.codex`
+- **vendor**: `openai`
+- **capabilities**: `code-generation`, `code-editing`,
+  `multi-file-edit`, `tool-use`, `sandbox`, `streaming`, `cancel`
+- **invocation**: spawns the Codex CLI (`codex` or
+  `openai-codex`) via `node-pty`
+- **auth**: local Codex session or `OPENAI_API_KEY`
+- **pricing**: `OpenAICostProvider` priced against GPT-5-Codex
+- **status**: Phase 2
+- **notes**: fills the same role as ClaudeCodeAgent on the
+  OpenAI stack. Sandbox capability is advertised because Codex
+  can run generated code in an isolated container.
+
+### § 64.2 GPTChatAgent
+
+- **id**: `openai.gpt-chat`
+- **vendor**: `openai`
+- **capabilities**: `chat`, `tool-use`, `vision`, `streaming`,
+  `cancel`
+- **invocation**: OpenAI Responses API via the official SDK
+- **auth**: `OPENAI_API_KEY` in Secret Manager
+- **pricing**: `OpenAICostProvider`
+- **status**: Phase 2
+- **notes**: wraps GPT-5 and GPT-5-mini for chat-style tasks.
+
+### § 64.3 ChatGPTDesktopAgent
+
+- **id**: `openai.chatgpt-desktop`
+- **vendor**: `openai`
+- **capabilities**: `chat`, `code-editing`, `file-write`,
+  `tool-use`, `vision`, `streaming`
+- **invocation**: attaches to the locally running ChatGPT
+  desktop app via its automation surface (Mac: accessibility API
+  + URL scheme, Windows: named-pipe IPC once the app exposes one)
+- **auth**: none — the app is already signed in as the user
+- **pricing**: `OpenAICostProvider` (best-effort; desktop app
+  usage is not always itemised, so cost is marked `estimated:
+  true`)
+- **status**: Phase 3
+- **notes**: ChatGPT desktop's automation surface is the
+  narrowest of any agent here; the implementation will feature-
+  detect and degrade capabilities rather than refuse to load.
+
+═══════════════════════════════════════════════════════════════════════════════
+
+§ 65. GEMINI INTEGRATION (Google)
+
+### § 65.1 GeminiCLIAgent
+
+- **id**: `google.gemini-cli`
+- **vendor**: `google`
+- **capabilities**: `code-generation`, `code-editing`,
+  `multi-file-edit`, `tool-use`, `vision`, `long-context`,
+  `streaming`, `cancel`
+- **invocation**: spawns the `gemini` CLI via `node-pty`
+- **auth**: local Gemini session, or Google API key, or ADC
+- **pricing**: `GoogleCostProvider` — priced against Gemini 3
+  Pro / Flash per request
+- **status**: Phase 2
+- **notes**: `long-context` capability is strictly stronger than
+  the other agents (up to 1M tokens), so the router can select
+  GeminiCLIAgent specifically for long-context tasks. Nano Banana
+  Pro image generation is behind a separate capability flag that
+  GeminiCLIAgent does not advertise; use a dedicated image agent
+  when that lands.
+
+═══════════════════════════════════════════════════════════════════════════════
+
+§ 66. LOCAL MODEL SUPPORT
+
+Two agent shapes cover local models.
+
+### § 66.1 OllamaAgent
+
+- **id**: `local.ollama`
+- **vendor**: `local`
+- **capabilities**: `code-generation`, `chat`, `streaming`,
+  `cancel`, `offline`
+- **invocation**: HTTP calls to the Ollama server at
+  `http://127.0.0.1:11434`
+- **auth**: none — localhost only
+- **pricing**: `LocalCostProvider` — reports `$0.00` for every
+  event but still records token counts so the UI can show
+  compute volume and rough electricity cost
+- **status**: Phase 2
+- **notes**: `offline` capability means the router can prefer
+  this agent when the device is offline (§ 58 Offline Mode).
+  Model set depends on what the user has pulled (Llama 3,
+  Mistral, DeepSeek, etc.).
+
+### § 66.2 LMStudioAgent
+
+- **id**: `local.lm-studio`
+- **vendor**: `local`
+- **capabilities**: `code-generation`, `chat`, `streaming`,
+  `cancel`, `offline`
+- **invocation**: HTTP calls to LM Studio's OpenAI-compatible
+  local server
+- **auth**: none — localhost only
+- **pricing**: `LocalCostProvider`
+- **status**: Phase 2
+- **notes**: same shape as OllamaAgent; separate
+  implementation because the local server ports, model
+  listing, and error shapes differ enough that sharing a class
+  hurts clarity.
+
+═══════════════════════════════════════════════════════════════════════════════
+
+§ 66.5. CURSOR CLI AGENT
+
+### § 66.5.1 CursorCLIAgent
+
+- **id**: `cursor.cli`
+- **vendor**: `cursor`
+- **capabilities**: `code-generation`, `code-editing`,
+  `multi-file-edit`, `tool-use`, `streaming`, `cancel`
+- **invocation**: spawns the Cursor CLI (`cursor-agent` or the
+  repository-scoped `cursor` binary) via `node-pty`
+- **auth**: local Cursor session (Cursor's own auth — Operator-OS
+  does not hold a Cursor API key)
+- **pricing**: `CursorCostProvider` — priced against Cursor's
+  subscription model (seat-based, reports usage-vs-quota rather
+  than per-token cost; the provider sets `totalUsd: 0` and
+  populates `assumptions` with the remaining quota)
+- **status**: Phase 2
+- **notes**: Cursor CLI is the first third-party agent where
+  billing is not per-token; the CostProvider abstraction is
+  exactly what makes this agent fit without warping the router.
+  Cursor supports its own internal AI backend as well as routing
+  to Anthropic / OpenAI; from Operator-OS's perspective that is
+  opaque and lives behind Cursor's own interface.
+
+═══════════════════════════════════════════════════════════════════════════════
+
+§ 66.6. COPILOT WORKSPACE AGENT
+
+### § 66.6.1 CopilotWorkspaceAgent
+
+- **id**: `github.copilot-workspace`
+- **vendor**: `github`
+- **capabilities**: `code-generation`, `code-editing`,
+  `multi-file-edit`, `streaming`
+- **invocation**: GitHub Copilot Workspace REST API (scoped to a
+  repository); this agent does not spawn a subprocess
+- **auth**: GitHub token with Copilot Workspace scope, stored in
+  Secret Manager (`github-copilot-token`) and scoped per user
+- **pricing**: `GitHubCostProvider` — Copilot billing is
+  subscription-based per seat; provider reports `totalUsd: 0`
+  and includes plan / quota info in `assumptions`
+- **status**: Phase 3
+- **notes**: the only fully-remote agent in the roster; it does
+  not run on the user's PC, so `FileSystemProvider` backing for
+  this agent is a GitHub-repo-scoped cloud provider rather than
+  local. Task cancellation is best-effort — depends on the
+  Copilot Workspace API supporting it at the time of
+  implementation.
+
+═══════════════════════════════════════════════════════════════════════════════
+
+§ 66.7. CUSTOM AGENT (OPEN STANDARD)
+
+### § 66.7.1 CustomAgent
+
+- **id**: user-chosen, must start with `custom.`
+- **vendor**: `custom`
+- **capabilities**: declared in the plugin manifest; the
+  registry requires at least one capability from the `Capability`
+  union and rejects unknown values
+- **invocation**: whatever the plugin's entry module exports —
+  the plugin must export a class that implements `AIAgent`
+- **auth**: plugin-defined, but credentials must be referenced
+  through Secret Manager keys declared in the manifest's
+  `permissions` block; no raw strings in the manifest
+- **pricing**: plugin-provided `CostProvider` implementation, or
+  the plugin may opt-in to `ZeroCostProvider` for local / free
+  agents
+- **status**: supported from v1 (the registry is the surface,
+  not a specific agent)
+- **notes**: this section formalises the *open standard* for
+  third-party agents. Anyone can publish `@operator-os-agents/<x>`
+  implementing `AIAgent` + shipping a signed
+  `provider.manifest.json`; the registry (§ 27.5) will load it
+  alongside first-party agents. CustomAgent is how Operator-OS
+  remains Universal — the architecture supports agents that do
+  not yet exist today.
 
 ═══════════════════════════════════════════════════════════════════════════════
 ═══════════════════════════════════════════════════════════════════════════════
