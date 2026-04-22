@@ -58,7 +58,7 @@ jobs:
         run: |
           gcloud builds submit \
             --config=infra/cloudbuild/api.cloudbuild.yaml \
-            --substitutions=_IMAGE_TAG=phase3-${GITHUB_SHA:0:7} \
+            --substitutions=_IMAGE_TAG=phase3-${GITHUB_SHA:0:7},_DEPLOY=true \
             --project=${{ secrets.GCP_PROJECT_ID }} \
             --service-account=projects/${{ secrets.GCP_PROJECT_ID }}/serviceAccounts/${{ secrets.GCP_SERVICE_ACCOUNT }} \
             --gcs-source-staging-dir=gs://operator-os-dev-artifacts/cloud-build/source \
@@ -85,7 +85,7 @@ jobs:
         run: |
           gcloud builds submit \
             --config=infra/cloudbuild/auth-gateway.cloudbuild.yaml \
-            --substitutions=_IMAGE_TAG=phase3-${GITHUB_SHA:0:7} \
+            --substitutions=_IMAGE_TAG=phase3-${GITHUB_SHA:0:7},_DEPLOY=true \
             --project=${{ secrets.GCP_PROJECT_ID }} \
             --service-account=projects/${{ secrets.GCP_PROJECT_ID }}/serviceAccounts/${{ secrets.GCP_SERVICE_ACCOUNT }} \
             --gcs-source-staging-dir=gs://operator-os-dev-artifacts/cloud-build/source \
