@@ -3164,41 +3164,262 @@ Different tasks benefit from different models:
 └─────────────────────────────────────────┘
 ```
 
-## Provider interface (TypeScript)
+## Core interfaces (TypeScript)
+
+Per LAW #3 and the Universal AI Control Platform ADR (2026-04-23),
+**four provider-agnostic interfaces** form the contract that every
+agent-aware piece of the system must go through. Concrete agent
+classes (e.g. `ClaudeCodeAgent`) are never imported directly from
+Desktop Agent core, the backend command dispatcher, the mobile UI,
+or the conductor. They are registered at runtime via the provider
+registry (§ 27.5) and accessed only through these interfaces.
+
+### AIAgent
+
+Any AI coding or task agent — Claude Code CLI, Codex CLI, Cursor
+CLI, ChatGPT desktop, Gemini CLI, Ollama, LM Studio, Copilot
+Workspace, future tools. One implementation per concrete agent.
 
 ```typescript
-interface AIProvider {
-  id: string;                      // "anthropic-claude-opus-4-7"
-  name: string;                    // "Claude Opus 4.7"
-  vendor: "anthropic" | "openai" | "google" | "local";
+type AIVendor =
+  | "anthropic"
+  | "openai"
+  | "google"
+  | "cursor"
+  | "github"
+  | "local"
+  | "custom";
 
-  capabilities: {
-    contextWindow: number;         // tokens
-    supportsTools: boolean;
-    supportsVision: boolean;
-    supportsCode: boolean;
-    supportsStreaming: boolean;
-    maxOutputTokens: number;
-  };
+type Capability =
+  | "code-generation"
+  | "code-editing"
+  | "chat"
+  | "tool-use"
+  | "vision"
+  | "long-context"       // >= 200K tokens
+  | "thinking"           // explicit reasoning mode
+  | "sandbox"            // isolated code execution
+  | "file-write"
+  | "multi-file-edit"
+  | "streaming"
+  | "cancel"
+  | "offline";           // no network required
 
-  pricing: {
-    inputPerMillion: number;       // USD
-    outputPerMillion: number;
-    cacheHitDiscount: number;     // percentage
-  };
+interface AgentConfig {
+  agentId: string;                  // stable registry id
+  workingDirectory?: string;
+  env?: Record<string, string>;
+  capabilityOverrides?: Partial<Record<Capability, boolean>>;
+}
 
-  availability: {
-    regions: string[];
-    status: "available" | "degraded" | "unavailable";
-    latencyP50Ms: number;
-  };
+interface Task {
+  id: string;
+  instruction: string;
+  filesInScope?: string[];
+  timeoutMs?: number;
+  budgetUsd?: number;
+  flags?: Record<string, unknown>;
+}
 
-  // Methods
-  complete(request: CompletionRequest): Promise<CompletionResponse>;
-  stream(request: CompletionRequest): AsyncIterable<CompletionChunk>;
-  estimateCost(request: CompletionRequest): number;
+interface AgentResult {
+  taskId: string;
+  exitCode: number;
+  finalOutput: string;
+  artifacts?: { path: string; sha256: string }[];
+  usage: UsageEvent;
+}
+
+interface OutputChunk {
+  taskId: string;
+  stream: "stdout" | "stderr" | "meta";
+  data: string | Uint8Array;
+  at: string;              // ISO timestamp
+}
+
+interface AgentStatus {
+  state: "idle" | "initializing" | "ready" | "busy" | "shutting-down" | "error";
+  runningTasks: number;
+  lastError?: { code: string; message: string; at: string };
+}
+
+interface ResourceMetrics {
+  cpuPercent: number;
+  memoryMB: number;
+  openFileHandles: number;
+  activeSubprocesses: number;
+}
+
+interface AIAgent {
+  readonly id: string;
+  readonly vendor: AIVendor;
+  readonly capabilities: Capability[];
+
+  // Lifecycle
+  initialize(config: AgentConfig): Promise<void>;
+  shutdown(): Promise<void>;
+
+  // Execution
+  execute(task: Task): Promise<AgentResult>;
+  stream(task: Task): AsyncIterable<OutputChunk>;
+  cancel(taskId: string): Promise<void>;
+
+  // State
+  status(): AgentStatus;
+  resourceUsage(): ResourceMetrics;
 }
 ```
+
+Notes:
+
+- Agents are responsible for their own subprocess management,
+  token counting, and vendor-API handshakes. Callers never see
+  `node-pty`, `anthropic` SDK, or raw HTTP.
+- Capability branching (e.g. "does this agent support vision?")
+  reads `agent.capabilities`. Core code must not branch on
+  `agent.vendor` — that is for logging only.
+- `execute` is the non-streaming convenience over `stream`;
+  implementations typically build `execute` on top of `stream`.
+
+### FileSystemProvider
+
+Abstracts over local FS, SSH remote, cloud workspace, and
+sandboxed containers. Agents and the command dispatcher never call
+`fs.readFile` directly.
+
+```typescript
+type FSProviderType = "local" | "ssh" | "cloud" | "sandbox" | "other";
+
+interface FileInfo {
+  path: string;
+  kind: "file" | "dir" | "symlink";
+  sizeBytes: number;
+  modifiedAt: string;        // ISO timestamp
+  mode?: number;             // POSIX mode bits, if applicable
+}
+
+interface FileChange {
+  path: string;
+  kind: "created" | "modified" | "deleted" | "renamed";
+  to?: string;               // for rename
+  at: string;
+}
+
+type FileChangeHandler = (change: FileChange) => void;
+type Unsubscribe = () => void;
+
+interface FileSystemProvider {
+  readonly type: FSProviderType;
+  readonly rootPath: string;
+
+  read(path: string): Promise<Uint8Array>;
+  write(path: string, data: Uint8Array): Promise<void>;
+  list(path: string): Promise<FileInfo[]>;
+  exists(path: string): Promise<boolean>;
+  remove(path: string): Promise<void>;
+  watch(path: string, handler: FileChangeHandler): Unsubscribe;
+}
+```
+
+Notes:
+
+- Every path is provider-relative to `rootPath`. Absolute paths
+  outside `rootPath` are rejected.
+- `write` must be atomic (write-temp + rename) for local and
+  sandbox providers. Cloud providers may relax to last-write-wins
+  if the backend is eventually consistent; this must be declared
+  in the provider's capabilities.
+- `watch` is best-effort on every backend; callers must still
+  refetch on reconnect.
+
+### StreamProvider
+
+Decouples "where output comes from" (subprocess PTY, SSE, WS,
+queue fan-out) from "how the UI and the backend consume it". A
+stream is a named, append-only sequence of `OutputChunk`s with
+one publisher and many subscribers.
+
+```typescript
+interface StreamProvider {
+  readonly type: "memory" | "pubsub" | "websocket" | "sse";
+
+  publish(sourceId: string, chunk: OutputChunk): Promise<void>;
+  subscribe(sourceId: string): AsyncIterable<OutputChunk>;
+  close(sourceId: string): Promise<void>;
+  lastSequenceId(sourceId: string): Promise<string | null>;
+}
+```
+
+Notes:
+
+- `sourceId` is typically `taskId`, but can be any namespaced
+  identifier (e.g. heartbeat stream per device).
+- Implementations must preserve chunk order and be replay-safe up
+  to an implementation-defined buffer window (at least "since
+  `lastSequenceId`"); the desktop agent's reconnect logic
+  (§ 36) depends on this.
+
+### CostProvider
+
+Records usage events and exposes pricing. One implementation per
+vendor, so that pricing tables and cost-optimal routing (§ 68)
+stay out of the agent and router core.
+
+```typescript
+interface UsageEvent {
+  taskId: string;
+  agentId: string;
+  vendor: AIVendor;
+  model: string;                  // "claude-opus-4-7", "gpt-5", ...
+  inputTokens: number;
+  outputTokens: number;
+  cacheHitTokens?: number;
+  totalUsd: number;
+  at: string;
+}
+
+interface PricingInfo {
+  vendor: AIVendor;
+  model: string;
+  inputPerMillionUsd: number;
+  outputPerMillionUsd: number;
+  cacheHitDiscountPct?: number;
+  fetchedAt: string;
+}
+
+interface CostEstimate {
+  taskId: string;
+  vendor: AIVendor;
+  model: string;
+  lowUsd: number;
+  highUsd: number;
+  assumptions: string;
+}
+
+interface CostProvider {
+  readonly vendor: AIVendor;
+
+  recordUsage(event: UsageEvent): Promise<void>;
+  estimate(task: Task): Promise<CostEstimate>;
+  getPricing(model: string): PricingInfo;
+}
+```
+
+Notes:
+
+- All cost math, pricing-table freshness, and per-model
+  discounts live in the CostProvider. The router (§ 68) asks for
+  estimates; it does not compute them.
+- `recordUsage` should be idempotent on `taskId + model`.
+
+### Legacy LLM-completion shape
+
+Historically SPEC defined a single `AIProvider` interface focused
+on LLM completions. That shape is now the inner API used by
+`AIAgent` implementations that wrap raw model calls (e.g. a
+future `ClaudeChatAgent`). It is no longer the public contract;
+core code must go through `AIAgent`, not `AIProvider`. The legacy
+shape is retained internally in `packages/ai/llm` and is not
+re-exported from `@operator-os/contracts`.
 
 ## Routing rules (configurable)
 
