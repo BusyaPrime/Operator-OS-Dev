@@ -26,9 +26,12 @@ export const registerAuthRoutes = async (
 ) => {
   app.post('/v1/auth/signin', async (request) => {
     const body = signinRequestSchema.parse(request.body);
+    // Pass request.log so diagnostic entries in SigninService +
+    // GoogleIdTokenVerifier inherit the Fastify reqId correlation.
     const response = await options.signinService.signin({
       idToken: body.idToken,
-      userAgent: readUserAgent(request.headers['user-agent'])
+      userAgent: readUserAgent(request.headers['user-agent']),
+      requestLogger: request.log
     });
     return signinResponseSchema.parse(response);
   });
