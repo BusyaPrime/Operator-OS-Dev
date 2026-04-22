@@ -73,7 +73,11 @@ describe('POST /v1/auth/signin', () => {
     const response = await app.inject({
       method: 'POST',
       url: '/v1/auth/signin',
-      payload: { provider: 'google', idToken: 'stub-google-id-token' }
+      payload: {
+        provider: 'google',
+        idToken:
+          'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJzdHViLXN1YmplY3QifQ.stub-signature'
+      }
     });
 
     expect(response.statusCode).toBe(200);
