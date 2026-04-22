@@ -19,10 +19,14 @@ $Repository = "operator-os-docker"
 $ImageName = "auth-gateway"
 $ImageUri = "europe-west4-docker.pkg.dev/${ProjectId}/${Repository}/${ImageName}:${ImageTag}"
 
+# PORT is reserved by Cloud Run and is injected automatically
+# based on the --port=8081 flag below. Setting PORT via
+# --set-env-vars makes `gcloud run deploy` fail with
+# "spec.template.spec.containers[0].env: The following reserved
+# env names were provided: PORT". See docs/TECH_DEBT.md TD-011.
 $EnvVars = @(
   "NODE_ENV=production",
   "HOST=0.0.0.0",
-  "PORT=8081",
   "LOG_LEVEL=info",
   "GOOGLE_CLOUD_PROJECT=$ProjectId",
   "FIREBASE_PROJECT_ID=$ProjectId",
