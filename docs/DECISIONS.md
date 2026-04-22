@@ -242,3 +242,107 @@ Consequences:
   pricing) are verified build-time when each integration lands.
 - Docs navigation (`docs/README.md`) updated to lead with SPEC and
   RULES, then living-state docs, then the P0.1 and earlier archive.
+- Extended 2026-04-23: Universal AI Control Platform architecture
+  layered on top of SPEC v1.0 — see the next ADR. LAW #3 now resolves
+  to four provider-agnostic interfaces rather than a single
+  `AIProvider` completion shape.
+
+## Adopt Universal AI Control Platform Architecture
+
+Date: 2026-04-23
+Status: accepted
+
+Decision:
+
+- Operator-OS is a Universal AI Control Platform, not a Claude Code
+  remote. Claude Code is the Phase 1 MVP proof; in-scope agents
+  already include Codex, Cursor CLI, ChatGPT desktop, Gemini CLI,
+  Copilot Workspace, local models (Ollama, LM Studio), and future AI
+  tools we do not yet know about.
+- From Day 1 of Desktop Agent implementation, **all** agent
+  execution, file access, output streaming, and cost tracking go
+  through provider-agnostic interfaces. No concrete agent class
+  (e.g. `ClaudeCodeAgent`) may be referenced from Desktop Agent
+  core, the backend command dispatcher, the mobile UI, or the
+  conductor.
+- The four mandatory interfaces are:
+  - `AIAgent` — any AI coding/task agent (lifecycle + execute +
+    stream + cancel + status + resourceUsage)
+  - `FileSystemProvider` — any file access (local FS, SSH, cloud,
+    sandboxed workspace, …)
+  - `StreamProvider` — any output streaming transport (subprocess
+    PTY, SSE, WebSocket, queue fan-out, …)
+  - `CostProvider` — vendor-specific usage + pricing surface
+- `ClaudeCodeAgent` is the first `AIAgent` implementation. Week 2
+  Desktop Agent ships with it as the only concrete agent, but the
+  spec (§ 27) and core code reference the interface, not the class.
+- Concrete agents are installed as plugins via a provider registry
+  (§ 27.5). Users can `operator-agent install claude-code`,
+  `operator-agent install codex`, `operator-agent install ollama`,
+  etc. The set of installed providers is discoverable at runtime.
+
+Why:
+
+- Without this line in the sand now, Week 2 Desktop Agent would
+  hardcode Claude Code specifics (command shape, output parsing,
+  quota API, pricing table) straight into the command dispatcher
+  and the subprocess executor. Phase 2+ multi-AI support would then
+  require a major refactor of code paths that had already shipped
+  to users — exponential debt cost.
+- The five Architectural Laws require this: LAW #3 (Multi-AI
+  Agnostic) is explicit about no vendor lock-in and portable
+  context; implementation proves the law only if the code enforces
+  it. Interfaces are how you enforce it.
+- Test ergonomics: mock providers are trivial to build against
+  narrow interfaces; integration tests can run without real API
+  keys or PTY subprocesses.
+- Open-source / ecosystem path: third parties can contribute
+  providers without touching core (important when new AI tools
+  appear between sprints).
+
+Alternatives considered:
+
+- **Hardcode Claude Code in Week 2, refactor in Phase 2.** Rejected.
+  The refactor touches Desktop Agent core, backend command dispatch,
+  cost tracking, and the conductor — all code paths that are in
+  production by the time Phase 2 starts. Cost of the refactor grows
+  with every feature added on top of the hardcoded surface.
+- **Defer multi-AI to Phase 3.** Rejected. The *architecture* must
+  support multi-AI from Day 1 even if only one concrete agent ships
+  in Phase 1. This is the standard "interface-first, implementation-
+  later" move; it costs little upfront and saves a lot later.
+- **Abstract via configuration instead of interfaces.** Rejected.
+  Config-driven agent dispatch (pick agent by string key, call
+  shell command from config) gives up type safety, makes debugging
+  subprocess failures painful, and makes capability discovery
+  (vision? long context? tool use?) impossible without parsing
+  string docs. Interfaces win on every axis that matters.
+
+Consequences:
+
+- SPEC.md changes (this PR): § 4 LAW #3 expanded to name the four
+  interfaces; § 27 Desktop Agent Mission and architecture diagram
+  reference `AIAgent`, not `ClaudeCodeExecutor`; § 27.5 Provider
+  Registry added; § 61 Multi-AI Router rewritten to lead with the
+  four interfaces; § 62-66 re-framed as agent implementations
+  grouped by vendor; § 66.5-66.7 added for Cursor CLI, Copilot
+  Workspace, and the Custom Agent open standard.
+- Week 2 work now starts from an interface skeleton: `packages/
+  contracts` exports `AIAgent`, `FileSystemProvider`,
+  `StreamProvider`, `CostProvider` type declarations; Desktop Agent
+  imports these and implements `ClaudeCodeAgent` against them.
+- Provider-specific features that genuinely do not generalise
+  (Claude's thinking mode, Gemini's 1M context, Codex's code-
+  interpreter sandbox) are exposed via a `capabilities` flag on the
+  interface. Core code must not branch on vendor string; it must
+  branch on capability.
+- Slight upfront complexity in Week 2 is accepted as the price. If
+  a feature is provably Claude-only for all time (very rare), it
+  may bypass the interface — but only after an ADR justifying it.
+
+References:
+
+- SPEC § 4 LAW #3 Multi-AI Agnostic (expanded this pass)
+- SPEC § 27, § 27.5 Desktop Agent + Provider Registry (updated /
+  added this pass)
+- SPEC § 61-66.7 AI Provider Abstraction (rewritten this pass)
