@@ -1,6 +1,8 @@
 # Operator OS API
 
-Fastify-based control-plane scaffold for Cloud Run.
+Fastify-based control-plane for Cloud Run. Auto-deployed on
+merge to `phase3/live-deploy-and-vertex` via the CD workflow
+landed in PR #20 (WIF-backed, no long-lived credentials).
 
 ## Current Bootstrap Scope
 
