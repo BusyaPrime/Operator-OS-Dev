@@ -85,6 +85,13 @@ export class ClaudeCodeAgent implements AIAgent {
   #activeTask?: ActiveTask;
   #healthChecks: Record<string, 'ok' | 'warn' | 'fail'> = {};
   #lastHeartbeatAt = new Date().toISOString();
+  /**
+   * Promise for the currently-running task's settle chain. Exposed
+   * via `awaitSettled()` so tests (and `stop()`) can deterministically
+   * wait for streams to close and state to return to `idle` instead
+   * of flushing an unknown number of microtasks.
+   */
+  #drivePromise?: Promise<void>;
 
   constructor(options: ClaudeCodeAgentOptions) {
     this.identity = options.identity;
@@ -128,7 +135,9 @@ export class ClaudeCodeAgent implements AIAgent {
   }
 
   async start(): Promise<void> {
-    if (this.#state !== 'offline') return;
+    // Allow retry from `degraded` (e.g. after the user installs
+    // the `claude` binary). Already-running state is a no-op.
+    if (this.#state === 'idle' || this.#state === 'busy') return;
 
     try {
       await this.#spawnFn(this.#binaryPath, ['--version']);
@@ -163,6 +172,9 @@ export class ClaudeCodeAgent implements AIAgent {
   async stop(reason: 'user' | 'shutdown' | 'error'): Promise<void> {
     if (this.#activeTask) {
       await this.cancelTask(this.#activeTask.taskId);
+      // Wait for the cancelled subprocess to settle so close()
+      // has flushed before we flip state to offline.
+      await this.awaitSettled();
     }
     this.#state = 'offline';
     this.#startedAt = undefined;
@@ -222,15 +234,26 @@ export class ClaudeCodeAgent implements AIAgent {
     this.#state = 'busy';
     this.#lastHeartbeatAt = startedAt;
 
-    // Fire-and-forget the resolution handler; it finalises the
-    // stream + activeTask state when the subprocess settles.
-    void this.#driveTask(input, startedAt);
+    // The resolution handler finalises the stream + activeTask
+    // state when the subprocess settles. Hold a reference so
+    // callers (stop, awaitSettled) can deterministically wait.
+    this.#drivePromise = this.#driveTask(input, startedAt);
 
     return {
       taskId: input.taskId,
       status: 'running',
       startedAt
     };
+  }
+
+  /**
+   * Wait until the currently-running task settles (success,
+   * failure, or cancel). Resolves immediately if no task is
+   * running. Primary use is deterministic test synchronisation
+   * and clean shutdown inside `stop()`.
+   */
+  async awaitSettled(): Promise<void> {
+    if (this.#drivePromise) await this.#drivePromise;
   }
 
   async cancelTask(taskId: string): Promise<void> {
