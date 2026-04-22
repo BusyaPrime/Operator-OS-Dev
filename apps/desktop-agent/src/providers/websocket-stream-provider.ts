@@ -132,15 +132,32 @@ class WebSocketResponseStream implements AIResponseStream {
     this.#closed = true;
     this.#logger.debug({ reason }, 'closing stream');
     this.#listeners.clear();
-    if (this.#ws) {
-      try {
-        // Standard close codes: 1000 normal closure, 1001 going
-        // away, 1011 internal error. Map our reason accordingly.
+
+    // Swallow any in-flight connect rejection so it doesn't
+    // surface as an unhandled rejection after close().
+    this.#ready.catch(() => {
+      /* intentional — connect failures on close are noise */
+    });
+
+    if (!this.#ws) return;
+    try {
+      // If the socket is still CONNECTING, close() throws
+      // synchronously in newer `ws` versions. Terminate
+      // immediately instead — cleanly releases the socket.
+      if (
+        this.#ws.readyState === WebSocket.CONNECTING ||
+        this.#ws.readyState === WebSocket.CLOSING ||
+        this.#ws.readyState === WebSocket.CLOSED
+      ) {
+        this.#ws.terminate();
+      } else {
+        // Standard close codes: 1000 normal closure, 1011
+        // internal error. Map our reason accordingly.
         const code = reason === 'error' ? 1011 : 1000;
         this.#ws.close(code, reason);
-      } catch (err) {
-        this.#logger.warn({ err }, 'ws close threw; ignoring');
       }
+    } catch (err) {
+      this.#logger.warn({ err }, 'ws close threw; ignoring');
     }
   }
 
@@ -212,6 +229,16 @@ class WebSocketResponseStream implements AIResponseStream {
       }
 
       this.#ws = ws;
+
+      // Keep a no-op error listener on the ws for its whole
+      // lifetime. Without this, any post-connect error or
+      // unhandled_error event from `ws` becomes an
+      // unhandledPromiseRejection in the node process and
+      // surfaces as a Vitest "Unhandled Errors" failure even
+      // though the streaming logic handled it cleanly.
+      ws.on('error', (err) => {
+        this.#logger.debug({ err }, 'ws error (captured)');
+      });
 
       const timeoutMs = this.#options.connectTimeoutMs ?? 10_000;
       const timeout = setTimeout(() => {
