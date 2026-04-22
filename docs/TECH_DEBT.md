@@ -279,6 +279,17 @@ attach its token.
   wrong-audience OIDC tokens get 401 from the agent guard; non-
   Firebase tokens hitting `/v1/ai/*` currently surface as 502
   upstream_error, which is tracked separately as TD-009.
+- 2026-04-23 (Phase C.2): fully extended. PR #11 (`990ccb4`)
+  added the HS256 `AccessTokenVerifier` fallback so the guard
+  accepts auth-gateway-issued JWTs in addition to Firebase ID
+  tokens. PR #11 code was merged on 2026-04-22 but the
+  `operator-os-api` image stayed on `phase3-b7ad606` for over a
+  day — the deploy gap is now tracked as TD-015. During Phase
+  C.2 the image was rebuilt and deployed as revision
+  `operator-os-api-00007-7q6` (`phase3-ceded57`), at which
+  point verification 5.6 (mobile-side HS256 JWT → api →
+  Vertex AI) returned HTTP 200 end-to-end. TD-005 now closed
+  with real production evidence, not just merged code.
 
 ---
 
@@ -654,3 +665,304 @@ entry documents why.
 - 2026-04-23: failure observed on `auth-gateway:phase3-bd5f113`
   deploy. Fix filed in the same branch. TD closed resolved on
   merge of PR #15.
+
+---
+
+## TD-012: `app.setErrorHandler` masks FastifyError statusCode as 500
+
+Discovered: 2026-04-23 (during Phase C.2 5.5 iteration 1)
+Type: observability
+Priority: P3
+Status: open
+
+### Description
+
+Both `apps/auth-gateway/src/app.ts` and `apps/api/src/app.ts`
+define a Fastify `setErrorHandler` with three branches:
+
+1. `ZodError` → HTTP 400.
+2. `IntegrationError` → respects the integration's statusCode.
+3. **Fallback** → `reply.status(500).send({message:"Internal server error"})`.
+
+The fallback ignores `error.statusCode` even when it is present
+and expresses a real HTTP semantic. Fastify's own
+`FastifyError` (e.g. `FST_ERR_CTP_INVALID_JSON_BODY`,
+statusCode 400) lands in the fallback and becomes a 500, which:
+
+- Misleads clients into thinking the server is broken when the
+  request was malformed.
+- Produces monitoring noise (5xx error rate spikes on client-
+  side mistakes).
+- Violates **LAW #5 Verifiable Honesty** — the response code does
+  not describe the actual failure.
+
+Surfaced during Phase C.2 iteration 1 when PowerShell's `\"`
+escape semantics produced a malformed JSON body. The user
+saw HTTP 500 "Internal server error" and spent time chasing a
+server bug before it turned out to be a 400 client error
+promoted by this handler.
+
+### Risk if unaddressed
+
+Every malformed-body client error surfaces as a 5xx in logs
+and client UIs, eroding the "5xx = our fault" mental model
+that operators rely on during incidents.
+
+### Proposed fix
+
+Three-line change in each `setErrorHandler`, before the
+fallback 500 branch:
+
+```typescript
+if (
+  typeof error.statusCode === 'number' &&
+  error.statusCode >= 400 &&
+  error.statusCode < 500
+) {
+  reply.status(error.statusCode).send({
+    code: error.code ?? 'client_error',
+    message: error.message,
+    requestId: request.id
+  });
+  return;
+}
+```
+
+Apply symmetrically to `api` and `auth-gateway`. Estimated
+fix: ~30 min including a unit test per service (inject an
+error with statusCode 400, assert response shape).
+
+### Related
+
+- Discovered in: Phase C.2 iteration 1 (`docs/sessions/2026-04-23-phase-c2-auth-gateway-deploy.md`).
+- Bundles with TD-009 which describes the same symptom pattern
+  on the `/v1/ai/*` path (api returns 502 where 401 would be
+  more accurate).
+
+### History
+
+- 2026-04-23: filed during Week 1 closure.
+
+---
+
+## TD-013: `auth-gateway` idToken whitespace sanitisation
+
+Discovered: 2026-04-23 (during Phase C.2 5.5 iteration 2)
+Type: security + ergonomics
+Priority: P2
+Status: resolved
+
+### Description
+
+Google ID tokens are strictly base64url `.` base64url `.`
+base64url. No whitespace is ever legal inside a real token.
+In practice, clients that copy tokens out of browser UIs
+(OAuth Playground, sign-in consoles) routinely paste a string
+with embedded line-wrap newlines, trailing whitespace, or
+BOMs. Those contaminated bytes break base64 decoding inside
+`google-auth-library`, which then emits a misleading error
+message (see library bug at
+`node_modules/google-auth-library/build/src/auth/oauth2client.js:715`
+— off-by-one that shows `segments[0]` in the error when the
+failure was on `segments[1]`).
+
+Without a defensive sanitisation layer at the auth-gateway
+boundary, every copy-paste contamination produces a 502 with
+an unhelpful upstream message, and the real cause (client
+encoding) stays hidden.
+
+### Risk if unaddressed
+
+- Every OAuth-Playground-style signin attempt with a
+  text-box-wrapped token fails with a confusing error.
+- Support load: every affected user thinks the service is
+  broken.
+- No attack-surface amplification (these bytes would fail
+  cryptographic verification anyway); purely a UX + LAW #5
+  (Verifiable Honesty) concern.
+
+### Fix (shipped in PR #16)
+
+New `sanitizedJwtSchema` exported from
+`@operator-os/contracts/src/auth-gateway.ts`:
+
+1. Accept non-empty string.
+2. `.trim()` + strip ALL `\s+` whitespace from anywhere.
+3. Refine: result remains non-empty after sanitisation.
+4. Refine: exactly 3 dot-separated segments.
+5. Refine: every character is in the base64url alphabet
+   (`A-Z a-z 0-9 - _`) or the legal padding `=`.
+
+Invalid shapes now return HTTP 400 with a specific Zod
+message from `app.setErrorHandler` rather than falling
+through to 502 with a confusing upstream message.
+
+16 unit tests landed in
+`packages/contracts/src/auth-gateway.test.ts` covering whitespace
+strip (leading, trailing, embedded across all 3 segments),
+wrong segment counts, empty / whitespace-only input, non-JWT
+plain strings, non-base64url chars, JWT-shaped non-Google
+tokens (shape-only validation), and base64-padded tokens.
+
+### Related
+
+- Discovered in: Phase C.2 iteration 2.
+- Resolved in: PR #16 `fix(auth-gateway): sanitize idToken +
+  structured logging for verifier diagnostics`.
+- Applies to: signin endpoint on auth-gateway. Refresh + signout
+  endpoints use different schemas and are not affected.
+
+### History
+
+- 2026-04-23: filed and resolved during the same PR (#16).
+
+---
+
+## TD-014: `api.cloudbuild.yaml` resets IAM allUsers on every deploy
+
+Discovered: 2026-04-23 (during Phase C.2 step 11 api redeploy)
+Type: ops-trap
+Priority: P2
+Status: open
+
+### Description
+
+`infra/cloudbuild/api.cloudbuild.yaml` includes
+`--no-allow-unauthenticated` in its `gcloud run deploy` step.
+Every successful build therefore resets the Cloud Run IAM
+policy back to its default — which excludes the
+`allUsers → roles/run.invoker` binding that
+`operator-os-api` now relies on (see DECISIONS.md
+*operator-os-api: allUsers Invoker + HS256 Verifier Over
+Firebase*).
+
+Observed on the Phase C.2 api redeploy: after the successful
+build, `curl $API/health` returned HTML 401 from Google
+Frontend instead of Fastify JSON 200. Re-applying the binding
+manually restored the expected behaviour.
+
+### Risk if unaddressed
+
+Every future api deploy silently breaks public reachability
+until an operator notices and re-runs
+`gcloud run services add-iam-policy-binding ...`. The gap
+window is minutes to hours; during it, mobile clients see
+HTML 401 (a broken UX) rather than a structured JSON error.
+
+### Proposed fix
+
+Pick one:
+
+A. **Swap the flag to `--allow-unauthenticated`.** Aligns the
+   cloudbuild config with the runtime IAM policy. Simplest
+   diff. Recommended.
+
+B. **Add a post-deploy IAM binding step to the cloudbuild.**
+   Keeps `--no-allow-unauthenticated` as a "safe default" and
+   explicitly grants `allUsers → run.invoker` after deploy.
+   Slightly more steps; slightly more resilient to accidental
+   IAM drift between deploys.
+
+Option A is the recommended fix: it's the smallest surface and
+makes the cloudbuild match the runtime reality that the
+DECISIONS.md ADR committed to. ~10 min including a one-line
+flag swap in `infra/cloudbuild/api.cloudbuild.yaml` and the
+matching `--allow-unauthenticated` in
+`infra/scripts/deploy-api.ps1`.
+
+### Related
+
+- DECISIONS.md ADR *operator-os-api: allUsers Invoker + HS256
+  Verifier Over Firebase*.
+- `docs/sessions/2026-04-23-phase-c2-auth-gateway-deploy.md`
+  Step 11 (api redeploy + IAM re-apply).
+- Bundles with TD-015 (no auto-deploy trigger): a CI addition
+  that auto-redeploys api would hit this trap silently on every
+  green merge if not fixed first.
+
+### History
+
+- 2026-04-23: observed and filed during Week 1 closure.
+
+---
+
+## TD-015: No auto-deploy trigger for `apps/api/**` merges
+
+Discovered: 2026-04-23 (while diagnosing Phase C.2 step 11)
+Type: ops-trap + process
+Priority: P2
+Status: open
+
+### Description
+
+`operator-os-api` has **no CI-driven redeploy** on merges to
+`phase3/live-deploy-and-vertex`. Cloud Build is invoked
+manually by an operator (or Claude Code acting as operator)
+via `gcloud builds submit`. Merges that change `apps/api/**`
+ship their code into the default branch but the running Cloud
+Run service keeps serving the previous image.
+
+**Concrete example observed this week:** PR #11 landed the
+`AccessTokenVerifier` in `apps/api/src/integrations/access-token-verifier.ts`
+and wired it into `FirebaseAuthService` on `2026-04-22`, but
+the `operator-os-api` service continued serving image
+`phase3-b7ad606` (PR #6) for over a day until Phase C.2
+stumbled on the mismatch during verification 5.6.
+
+The same gap exists for `operator-auth-gateway` but was
+masked this week because the only merges that touched
+auth-gateway were explicitly followed by manual deploys as
+part of Phase C.
+
+### Risk if unaddressed
+
+- Merged-but-undeployed code accumulates silently. The gap
+  between "phase3 HEAD" and "production image" grows until
+  it is caught by a symptom.
+- Auditability: `git log` says a change is live on a date
+  when production is actually running an older image. This
+  violates **LAW #5 Verifiable Honesty** at the operational
+  layer.
+- Week 2 Desktop Agent work will add real agent traffic; a
+  merged-but-undeployed api bug will be caught by real user
+  impact rather than by CI.
+
+### Proposed fix
+
+One of:
+
+A. **GitHub Actions workflow** that detects merges to
+   `phase3/live-deploy-and-vertex` affecting
+   `apps/api/**` or `apps/auth-gateway/**` and invokes
+   `gcloud builds submit` with the merge SHA as `_IMAGE_TAG`.
+   Requires a CI-scoped service account with
+   `cloudbuild.builds.editor` (similar to `deploy-bot`'s
+   posture). Most robust.
+
+B. **PR label gate** — add a required label
+   `api-deploy-required` or `auth-gateway-deploy-required`
+   that the merger must remove only after running the
+   deploy. Lighter weight; still human-triggered.
+
+C. **Daily reconciliation job** that diffs deployed image SHA
+   vs phase3 HEAD and alerts if behind. Catches the gap
+   after-the-fact but doesn't prevent it.
+
+A is the cleanest and matches the "continuous deploy"
+mental model the Phase C roadmap already assumed. TD-014
+must be fixed first — otherwise the automated deploy would
+break IAM on every run.
+
+### Related
+
+- `docs/sessions/2026-04-23-phase-c2-auth-gateway-deploy.md`
+  Step 11 (deploy-gap diagnosis).
+- Blocks on TD-014 (IAM reset on deploy).
+- References `infra/cloudbuild/api.cloudbuild.yaml`,
+  `infra/cloudbuild/auth-gateway.cloudbuild.yaml`,
+  `.github/workflows/*`.
+
+### History
+
+- 2026-04-23: filed during Week 1 closure after identifying
+  PR #11 had been undeployed for over 24 hours.

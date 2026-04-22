@@ -346,3 +346,86 @@ References:
 - SPEC § 27, § 27.5 Desktop Agent + Provider Registry (updated /
   added this pass)
 - SPEC § 61-66.7 AI Provider Abstraction (rewritten this pass)
+
+## operator-os-api: allUsers Invoker + HS256 Verifier Over Firebase
+
+Date: 2026-04-23
+Status: accepted
+
+Decision:
+
+- `operator-os-api` IAM policy includes `allUsers → roles/run.invoker`.
+  Cloud Run is no longer the primary auth boundary for this service.
+- Security is enforced at the Fastify middleware layer via
+  `FirebaseAuthService.createRequiredGuard()` for `/v1/ai/*` and
+  `createAgentGuard(agentAudience)` for `/v1/agent/*` (TD-005
+  closure from PR #6 + PR #11).
+- Inbound bearer tokens are verified along three paths in a fixed
+  order: (1) Firebase ID token via `firebase-admin.auth().verifyIdToken`,
+  (2) our auth-gateway-issued HS256 JWT via `jose.jwtVerify` against
+  `AUTH_ACCESS_TOKEN_ISSUER = operator-auth-gateway` and
+  `AUTH_ACCESS_TOKEN_AUDIENCE = operator-os-api`, (3) Google OIDC
+  ID token with audience = service URL (agent routes only). First
+  path to validate wins; missing or all-rejected token → HTTP 401
+  with a JSON error body from our handler.
+
+Why:
+
+- Mobile and web clients hold our HS256 JWT, not a GCP service-
+  account identity. Without `allUsers → run.invoker`, the Cloud
+  Run frontend returns an HTML 401 and the mobile client never
+  reaches our Fastify logic — the response shape is unusable, and
+  the user sees a different (wrong) error than they should.
+- Keeping security in Fastify keeps the policy in code under
+  review rather than distributed across IAM, and gives a single
+  clear error taxonomy for clients.
+- The three-path verifier lets the same service accept (a) Firebase
+  sessions from legacy / bootstrap paths, (b) HS256 tokens from our
+  own auth-gateway, and (c) Google OIDC identity tokens from
+  desktop-agent and Cloud-Tasks service-to-service calls, without
+  branching at the route level.
+
+Alternatives considered:
+
+- **Keep `--no-allow-unauthenticated`, issue GCP service-account
+  OIDC tokens to mobile clients.** Rejected. Requires distributing
+  GCP service-account credentials to every user device — breaks
+  LAW #2 (User Sovereignty) and the Secret-Manager hygiene we've
+  committed to.
+- **Keep Firebase Admin as the sole verifier.** Rejected because
+  auth-gateway issues HS256 JWTs that Firebase Admin cannot verify
+  (`"no 'kid' claim"` — Phase C.2 iteration 3 surfaced exactly
+  this).
+- **Drop Firebase support entirely, HS256-only.** Rejected *for
+  now*. Firebase support stays in the guard as a backwards-
+  compat path for existing Firebase-session code in the mobile
+  scaffold; scheduled for removal as a clean-up PR once mobile is
+  fully migrated to auth-gateway tokens.
+
+Consequences:
+
+- The api is publicly reachable at the Cloud Run layer. Cloud
+  Armor + rate limiting become the defensive layer at the edge —
+  not yet deployed; tracked as a Week 2+ item.
+- Every api deploy currently resets the IAM policy back to
+  `--no-allow-unauthenticated` because `infra/cloudbuild/api.cloudbuild.yaml`
+  carries that flag. This is a known trap — see TD-014 in
+  `docs/TECH_DEBT.md`. Until the cloudbuild is updated, every
+  api deploy must be followed by a manual
+  `gcloud run services add-iam-policy-binding ... --member=allUsers
+  --role=roles/run.invoker`.
+- `operator-os-api` deploy-gap (PR #11 code merged but the image
+  was never rebuilt) was the proximate cause of Phase C.2
+  iteration 3. Tracked as TD-015: there is no CI trigger that
+  automatically rebuilds api on every merge to
+  `phase3/live-deploy-and-vertex` that touches `apps/api/**`.
+  Week 2 closes that gap.
+
+References:
+
+- PR #6: `b7ad606` (TD-005 closure + initial required-auth guards)
+- PR #11: `990ccb4` (HS256 verifier wired into
+  `FirebaseAuthService.createRequiredGuard` + `createAgentGuard`)
+- `docs/sessions/2026-04-23-phase-c2-auth-gateway-deploy.md`
+  (full walk-through of the IAM-reset and deploy-gap discoveries)
+- `docs/TECH_DEBT.md` TD-014 (IAM reset), TD-015 (deploy gap)
