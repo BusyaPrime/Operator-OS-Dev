@@ -1,0 +1,102 @@
+name: CD Deploy
+
+on:
+  push:
+    branches:
+      - phase3/live-deploy-and-vertex
+    paths:
+      - 'apps/api/**'
+      - 'apps/auth-gateway/**'
+      - 'packages/contracts/**'
+      - 'infra/cloudbuild/**'
+      - 'infra/cloud-run/**'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      api_changed: ${{ steps.filter.outputs.api }}
+      auth_gateway_changed: ${{ steps.filter.outputs.auth_gateway }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            api:
+              - 'apps/api/**'
+              - 'packages/contracts/**'
+              - 'infra/cloudbuild/api.cloudbuild.yaml'
+              - 'infra/cloud-run/api.service.yaml'
+            auth_gateway:
+              - 'apps/auth-gateway/**'
+              - 'packages/contracts/**'
+              - 'infra/cloudbuild/auth-gateway.cloudbuild.yaml'
+              - 'infra/cloud-run/auth-gateway.service.yaml'
+
+  deploy-api:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.api_changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Submit Cloud Build
+        run: |
+          gcloud builds submit \
+            --config=infra/cloudbuild/api.cloudbuild.yaml \
+            --substitutions=_IMAGE_TAG=phase3-${GITHUB_SHA:0:7} \
+            --project=${{ secrets.GCP_PROJECT_ID }} \
+            .
+
+  deploy-auth-gateway:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.auth_gateway_changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Submit Cloud Build
+        run: |
+          gcloud builds submit \
+            --config=infra/cloudbuild/auth-gateway.cloudbuild.yaml \
+            --substitutions=_IMAGE_TAG=phase3-${GITHUB_SHA:0:7} \
+            --project=${{ secrets.GCP_PROJECT_ID }} \
+            .
+
+  verify-health:
+    needs: [deploy-api, deploy-auth-gateway]
+    if: always() && (needs.deploy-api.result == 'success' || needs.deploy-auth-gateway.result == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check api health
+        if: needs.deploy-api.result == 'success'
+        run: |
+          curl -sS -f https://operator-os-api-m545sz2isq-ez.a.run.app/health | jq -e '.status == "ok"'
+
+      - name: Check auth-gateway health
+        if: needs.deploy-auth-gateway.result == 'success'
+        run: |
+          curl -sS -f https://operator-auth-gateway-m545sz2isq-ez.a.run.app/health | jq -e '.status == "ok"'
