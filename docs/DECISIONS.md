@@ -429,3 +429,90 @@ References:
 - `docs/sessions/2026-04-23-phase-c2-auth-gateway-deploy.md`
   (full walk-through of the IAM-reset and deploy-gap discoveries)
 - `docs/TECH_DEBT.md` TD-014 (IAM reset), TD-015 (deploy gap)
+
+## Align api Deploy Flags With IAM-Open-With-Fastify-Middleware Reality
+
+Date: 2026-04-24
+Status: accepted
+
+Decision:
+
+- Both `infra/cloudbuild/api.cloudbuild.yaml` (CI deploy path) and
+  `infra/scripts/deploy-api.ps1` (imperative deploy path) now
+  pass `--allow-unauthenticated` to `gcloud run deploy` for
+  `operator-os-api`. This makes the deploy config carry the same
+  IAM intent that the earlier *operator-os-api: allUsers Invoker
+  + HS256 Verifier Over Firebase* ADR committed to.
+- Mechanical consequence: every successful future deploy of the
+  api service preserves the `allUsers → roles/run.invoker`
+  binding rather than silently resetting it.
+
+Why:
+
+- The previous state had the cloudbuild and the deploy script
+  explicitly passing `--no-allow-unauthenticated`, which forces
+  `gcloud run deploy` to replace the service IAM policy with the
+  authenticated-only default on every successful deploy. Observed
+  during Phase C.2 step 11: the api redeploy silently dropped the
+  `allUsers` binding and `/health` started returning HTML 401
+  from Google Frontend until the binding was manually re-applied.
+- Operational manifestation: every future api deploy was a 1-2
+  minute IAM-outage trap. For a single-founder team this is a
+  material reliability issue because an outage during demo / user
+  onboarding would be wrongly attributed to our Fastify layer.
+- LAW #5 (Verifiable Honesty) at the operational layer: the
+  cloudbuild YAML is the canonical statement of "how we deploy";
+  it must reflect the real IAM intent, not a contradictory one.
+
+Alternatives considered:
+
+- **Post-deploy `add-iam-policy-binding` step in the
+  cloudbuild.** Kept `--no-allow-unauthenticated` as a "safe
+  default" and explicitly re-granted `allUsers → run.invoker`
+  after the deploy. Rejected: two-step IAM transitions create a
+  visible outage window, even if short; mis-written step (typo,
+  wrong member) produces a silent-forever-unauthenticated service.
+- **Revert the IAM-open ADR and keep `--no-allow-unauthenticated`.**
+  Would require every mobile / desktop client to authenticate to
+  GCP with a service account identity before reaching our Fastify
+  auth. Breaks LAW #2 (User Sovereignty) and doubles credential
+  distribution surface. Same reasoning as the original ADR —
+  rejected for the same reasons.
+- **Keep cloudbuild `--no-allow-unauthenticated` + have CI
+  workflow re-apply IAM after deploy as a separate step.**
+  Structurally identical to the post-deploy option above but with
+  the step in GitHub Actions rather than Cloud Build. Same race
+  window. Rejected.
+
+Consequences:
+
+- `operator-os-api` is publicly reachable at the Cloud Run
+  frontend. All HTTP-level defense now lives in Fastify: HS256
+  JWT verification, Google OIDC fallback, Firebase ID token
+  legacy path, 401 on unknown tokens, route-specific guards.
+- Unauthenticated calls still consume a minimal amount of
+  compute (body-parsing + middleware overhead) before Fastify's
+  401. Cloud Run `min-instances=0` + `max-instances` cap
+  prevents runaway cost. Cloud Armor + per-user rate limiting
+  are tracked as a Week 2+ security sprint item.
+- DDoS surface at the Cloud Run edge is slightly wider but
+  symmetric with how `operator-auth-gateway` already operates
+  (the auth-gateway IS the auth boundary and has been
+  `--allow-unauthenticated` since Phase C.1).
+- TD-014 is resolved by this PR. Verification will follow once
+  CI auto-deploy (TD-015 / PR #20) lands: one merge to
+  `apps/api/**` on `phase3/live-deploy-and-vertex` should
+  auto-deploy a fresh revision AND keep the IAM policy
+  unchanged. Until TD-015 ships, manual deploy via
+  `deploy-api.ps1` is the verification vehicle.
+
+References:
+
+- Previous ADR: *operator-os-api: allUsers Invoker + HS256
+  Verifier Over Firebase* (2026-04-23) — establishes the
+  "security at Fastify layer" intent that this ADR brings the
+  cloudbuild config into alignment with.
+- `docs/TECH_DEBT.md` TD-014 (filing + resolution).
+- `infra/cloudbuild/auth-gateway.cloudbuild.yaml` (the positive
+  example — had `--allow-unauthenticated` from Phase C.1
+  because auth-gateway is the auth boundary; api now matches).
