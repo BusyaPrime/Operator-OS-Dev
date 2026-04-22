@@ -83,6 +83,9 @@ importers:
       google-auth-library:
         specifier: ^10.6.2
         version: 10.6.2
+      jose:
+        specifier: ^5.10.0
+        version: 5.10.0
       zod:
         specifier: ^4.1.12
         version: 4.3.6

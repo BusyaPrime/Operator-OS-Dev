@@ -15,7 +15,7 @@ describe('required auth on /v1/ai/*', () => {
 
     expect(response.statusCode).toBe(401);
     expect(response.json().message).toMatch(
-      /firebase id token is required/i
+      /firebase id token or an operator-access-token is required/i
     );
 
     await app.close();
@@ -54,7 +54,7 @@ describe('required auth on /v1/agent/*', () => {
 
     expect(response.statusCode).toBe(401);
     expect(response.json().message).toMatch(
-      /firebase id token or a google oidc id token is required/i
+      /firebase id token, operator access token, or google oidc id token is required/i
     );
 
     await app.close();

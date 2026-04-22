@@ -14,6 +14,7 @@ import type {
   FastifyRequest
 } from 'fastify';
 
+import type { AccessTokenVerifier } from './access-token-verifier.js';
 import {
   buildConfiguredCheck,
   buildNotConfiguredCheck,
@@ -47,14 +48,20 @@ const toIsoTimestamp = (value?: number) =>
 export class FirebaseAuthService {
   readonly name = 'auth';
 
+  #accessTokenVerifier?: AccessTokenVerifier;
   #adcStatus = detectApplicationDefaultCredentials();
   #config: ApiEnv;
   #logger: FastifyBaseLogger;
   #oauthClient?: OAuth2Client;
 
-  constructor(config: ApiEnv, logger: FastifyBaseLogger) {
+  constructor(
+    config: ApiEnv,
+    logger: FastifyBaseLogger,
+    accessTokenVerifier?: AccessTokenVerifier
+  ) {
     this.#config = config;
     this.#logger = logger;
+    this.#accessTokenVerifier = accessTokenVerifier;
   }
 
   describeReadiness() {
@@ -223,19 +230,57 @@ export class FirebaseAuthService {
 
   createRequiredGuard() {
     return async (request: FastifyRequest, reply: FastifyReply) => {
-      const session = await this.resolveSession(request.headers.authorization, {
-        strict: true
-      });
+      const token = extractBearerToken(request.headers.authorization);
 
-      if (!session.authenticated || !session.currentUser) {
+      if (!token) {
         reply.code(401);
         return reply.send({
-          message: 'A valid Firebase ID token is required for this route.'
+          message:
+            'A Firebase ID token or an operator-access-token is required for this route.'
         });
       }
 
-      request.authSession = session;
-      request.currentUser = session.currentUser;
+      try {
+        const currentUser = await this.verifyFirebaseIdToken(token);
+        const session = authSessionSchema.parse({
+          authenticated: true,
+          source: 'firebase-id-token',
+          currentUser
+        });
+        request.authSession = session;
+        request.currentUser = currentUser;
+        return;
+      } catch (firebaseError) {
+        this.#logger.debug(
+          { err: firebaseError },
+          'firebase verification failed, trying operator access token'
+        );
+      }
+
+      if (this.#accessTokenVerifier) {
+        try {
+          const currentUser = await this.#accessTokenVerifier.verify(token);
+          const session = authSessionSchema.parse({
+            authenticated: true,
+            source: 'operator-access-token',
+            currentUser
+          });
+          request.authSession = session;
+          request.currentUser = currentUser;
+          return;
+        } catch (accessTokenError) {
+          this.#logger.warn(
+            { err: accessTokenError },
+            'required guard rejected token: neither firebase nor operator access token accepted it'
+          );
+        }
+      }
+
+      reply.code(401);
+      return reply.send({
+        message:
+          'Provided bearer token is neither a valid Firebase ID token nor a valid operator access token.'
+      });
     };
   }
 
@@ -259,7 +304,7 @@ export class FirebaseAuthService {
         reply.code(401);
         return reply.send({
           message:
-            'A Firebase ID token or a Google OIDC ID token is required for this route.'
+            'A Firebase ID token, operator access token, or Google OIDC ID token is required for this route.'
         });
       }
 
@@ -276,8 +321,27 @@ export class FirebaseAuthService {
       } catch (firebaseError) {
         this.#logger.debug(
           { err: firebaseError },
-          'firebase verification failed, trying google OIDC'
+          'firebase verification failed, trying operator access token'
         );
+      }
+
+      if (this.#accessTokenVerifier) {
+        try {
+          const currentUser = await this.#accessTokenVerifier.verify(token);
+          const session = authSessionSchema.parse({
+            authenticated: true,
+            source: 'operator-access-token',
+            currentUser
+          });
+          request.authSession = session;
+          request.currentUser = currentUser;
+          return;
+        } catch (accessTokenError) {
+          this.#logger.debug(
+            { err: accessTokenError },
+            'operator access token verification failed, trying google OIDC'
+          );
+        }
       }
 
       try {
@@ -293,13 +357,13 @@ export class FirebaseAuthService {
       } catch (googleError) {
         this.#logger.warn(
           { err: googleError },
-          'agent guard rejected token: neither firebase nor google OIDC accepted it'
+          'agent guard rejected token: firebase, operator access, and google OIDC all rejected it'
         );
 
         reply.code(401);
         return reply.send({
           message:
-            'Provided bearer token is neither a valid Firebase ID token nor a valid Google OIDC ID token for this service.'
+            'Provided bearer token is not a valid Firebase ID token, operator access token, or Google OIDC ID token for this service.'
         });
       }
     };

@@ -7,6 +7,7 @@ export const operatorRoleSchema = z.enum(['owner', 'admin', 'viewer', 'agent']);
 export const authSourceSchema = z.enum([
   'firebase-id-token',
   'google-id-token',
+  'operator-access-token',
   'bootstrap-fallback',
   'anonymous'
 ]);
