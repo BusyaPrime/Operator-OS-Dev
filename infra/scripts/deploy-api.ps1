@@ -62,6 +62,6 @@ if (-not $Deploy) {
   --image=$ImageUri `
   --platform=managed `
   --service-account="cloudrun-runtime@$ProjectId.iam.gserviceaccount.com" `
-  --no-allow-unauthenticated `
+  --allow-unauthenticated `
   --port=8080 `
   --set-env-vars=$EnvVarsValue
