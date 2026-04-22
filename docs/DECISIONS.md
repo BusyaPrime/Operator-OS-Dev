@@ -1037,3 +1037,99 @@ References:
   navigation-framework choice specifically.
 - `apps/mobile/App.tsx` + `apps/mobile/src/navigation/root-tabs.tsx`
   (existing navigation wiring to extend, not replace).
+
+## Canonical Cloud Build Flag Set For CI And Manual Deploy Parity
+
+Date: 2026-04-24
+Status: accepted
+
+Decision:
+
+- Every `gcloud builds submit` invocation that builds and
+  deploys `operator-os-api` or `operator-os-auth-gateway` —
+  whether from CI (`.github/workflows/cd-deploy.yml`) or from
+  the manual scripts (`infra/scripts/deploy-api.ps1`,
+  `infra/scripts/deploy-auth-gateway.ps1`) — must pass the same
+  three flags:
+  - `--service-account=projects/operator-os-dev/serviceAccounts/deploy-bot@operator-os-dev.iam.gserviceaccount.com`
+  - `--gcs-source-staging-dir=gs://operator-os-dev-artifacts/cloud-build/source`
+  - `--gcs-log-dir=gs://operator-os-dev-artifacts/cloud-build/logs`
+- CI may reference the SA and project via secrets
+  (`${{ secrets.GCP_PROJECT_ID }}`, `${{ secrets.GCP_SERVICE_ACCOUNT }}`);
+  manual scripts reference them as script parameters with the
+  same defaults.
+
+Why:
+
+- The first CD auto-deploy attempt (PR #20 workflow + PR #21
+  smoke trigger) failed at `Submit Cloud Build` with
+  `Permission 'storage.objects.get' denied` attributed to
+  `1016254604177-compute@developer.gserviceaccount.com` — the
+  default Compute Engine SA. Root cause: without
+  `--service-account`, Cloud Build dispatches the source-
+  upload and step-execution under that default SA, which was
+  never granted Storage access to `operator-os-dev-artifacts`
+  (only `deploy-bot` has the binding). The manual scripts
+  have passed the right SA since first use; the CI workflow
+  inadvertently dropped it.
+- Without `--gcs-source-staging-dir`, `gcloud` auto-creates a
+  staging bucket named `<project-id>_cloudbuild` on first use
+  with default-restrictive IAM. The pre-created
+  `operator-os-dev-artifacts` bucket already has the right
+  bindings; using it avoids a dormant second staging bucket
+  with an ambiguous ownership model.
+- Without `--gcs-log-dir`, build logs end up in auto-created
+  ephemeral buckets that the ops runbook in
+  `docs/DEPLOY.md` does not reference. Pinning the log path
+  makes post-mortem log retrieval deterministic.
+- Parity between CI and manual deploys means any ops action
+  that works from one surface works from the other. Reduces
+  cognitive load: "I know how to redeploy api manually, so I
+  know what CI is doing too."
+
+Alternatives considered:
+
+- **Grant the default Compute SA Storage access to the
+  artifacts bucket.** Rejected. Widens the default SA's blast
+  radius and normalizes using it for CI — the exact anti-
+  pattern the `deploy-bot` least-privilege posture exists to
+  prevent.
+- **Use a different staging bucket per environment.**
+  Rejected for now. One bucket per project is sufficient at
+  current scale; adding per-env buckets is unnecessary
+  complexity before there's a second environment to justify
+  it.
+- **Omit `--gcs-log-dir` and let Cloud Build default.**
+  Rejected. Log locations drifting per-run makes incident
+  review slow. Pinning aligns with the "predictable ops
+  surface" LAW #5 posture.
+
+Consequences:
+
+- CI and manual deploys produce indistinguishable builds (same
+  SA, same staging, same log retention). Any future deploy-
+  path divergence surfaces as a policy violation by this ADR
+  rather than a silent drift.
+- When a new service is added (conductor, streamer, etc.), its
+  cloudbuild + CI job must also carry these three flags. A
+  short comment pointing at this ADR in each new
+  `infra/cloudbuild/*.cloudbuild.yaml` file documents the
+  requirement at the call site.
+- The PR #20 CD workflow is amended in PR #22 (same day) to
+  add the missing flags. PR #21 (first smoke test) becomes
+  half-landed — it triggered the CD run but the run failed.
+  A second smoke commit after PR #22 merges completes the
+  verification.
+
+References:
+
+- Failed CD run: GitHub Actions run `24794863892`, both
+  `deploy-api` and `deploy-auth-gateway` jobs failed at
+  `Submit Cloud Build` step.
+- Manual script precedent:
+  `infra/scripts/deploy-api.ps1` lines ~40-49 and
+  `infra/scripts/deploy-auth-gateway.ps1` lines ~45-55 — both
+  have passed the three flags since first use.
+- PR #20 — workflow landing without the flags (the bug).
+- PR #22 — workflow amended to add the flags (this ADR's
+  implementation commit).
