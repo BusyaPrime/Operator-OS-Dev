@@ -2,9 +2,11 @@
 
 Fastify-based control-plane for Cloud Run. Auto-deployed on
 merge to `phase3/live-deploy-and-vertex` via the CD workflow
-landed in PR #20 and refined in PR #22 (WIF-backed auth,
-canonical Cloud Build flag set per DECISIONS.md — see the
-*Canonical Cloud Build Flag Set* ADR).
+(WIF-backed auth with `roles/iam.serviceAccountUser` on
+`deploy-bot` for the GitHub Actions principal; canonical Cloud
+Build flag set per DECISIONS.md — see the *Canonical Cloud
+Build Flag Set* and *Adopt Workload Identity Federation From
+Day 1* ADRs).
 
 ## Current Bootstrap Scope
 
