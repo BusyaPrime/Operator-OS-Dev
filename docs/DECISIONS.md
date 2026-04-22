@@ -1133,3 +1133,240 @@ References:
 - PR #20 — workflow landing without the flags (the bug).
 - PR #22 — workflow amended to add the flags (this ADR's
   implementation commit).
+
+## SPEC §61-66.7 Evolves To Match packages/contracts Implementation
+
+Date: 2026-04-24
+Status: accepted (supersedes nothing; refines the earlier
+  "SPEC §61 Evolves To Match packages/contracts Implementation"
+  ADR by attaching implementation-landed evidence)
+
+Decision:
+
+- `packages/contracts/src/ai/` lands in Week 2 Phase 1.3 (PR
+  for TD-010) as the source of truth for the four Universal AI
+  Platform interfaces: `AIAgent`, `FileSystemProvider`,
+  `StreamProvider`, `CostProvider`.
+- `docs/SPEC.md` §61-66.7 is updated in the same PR so the TS
+  code blocks in the spec match the landed package exactly.
+- The SPEC header version is bumped `1.0 → 1.1` with a
+  provenance line; no other semantic changes land on the
+  narrative.
+- Per-agent entries in §63-66.7 (ClaudeCodeAgent, CodexAgent,
+  CursorCLIAgent, …) retain their literal provider ids and
+  capability lists — those data points remain accurate. Only
+  the structural template in §62 (the headers the per-agent
+  entries follow) is refreshed to name `providerId` instead of
+  `id + vendor`.
+- §27 Desktop Agent `ClaudeCodeAgent` reference implementation
+  is rewritten to implement the v1.1 `AIAgent` shape end-to-end
+  so a reader can see a concrete composition against the new
+  contracts package, not against the PR #13 sketch.
+
+Why (shape rationale):
+
+Implementation practice revealed gaps in the PR #13 sketch that
+the TZ Part 3.3 version repairs:
+
+1. **Flat vs structured identity.** PR #13 AIAgent had flat
+   `id`, `vendor`, `capabilities[]`. v1.1 groups them: stable
+   fields in `identity` (persistent UUID, providerId,
+   providerVersion, displayName, hostname, platform, arch),
+   process-scoped state in `runtime` (pid, startedAt,
+   uptimeSeconds), declarative description in `manifest`. The
+   three triplets separate concerns that the flat model
+   collapsed.
+2. **Provider DI as fields.** v1.1 makes `fs`, `stream`, `cost`
+   readonly fields on `AIAgent`. Concrete agents ship
+   specialised providers (Cursor CLI scoped-sandbox FS, Ollama
+   zero-cost CostProvider, etc.) and the registry decides
+   which at construction time. PR #13 had no DI surface — the
+   agent carried capability flags but not the providers it used.
+3. **Execution model: polling `AIAgentTaskHandle`.** v1.1 returns
+   a task handle with `status` transitions
+   (pending/running/completed/failed/cancelled). PR #13 used
+   `execute(task): Promise<AgentResult>` + a separate
+   `stream(task): AsyncIterable<OutputChunk>`. Polling handles
+   + a separate `StreamProvider` is a cleaner factorisation
+   for long-running tasks; streaming is a concern owned by the
+   StreamProvider, not hard-coded into the agent.
+4. **`stop(reason)` enum.** v1.1 makes the stop reason
+   explicit: `"user" | "shutdown" | "error"`. Distinct code
+   paths (auto-update vs user quit vs crashloop handling) are
+   visible at the call site. PR #13's `shutdown()` lost that.
+5. **Narrowed Capability union.** v1.1 uses `AgentCapability`
+   (narrow union) directly rather than `Capability[]`. Callers
+   get exhaustiveness checks in switch statements on
+   capabilities.
+6. **FileSystemProviderScope.** v1.1 puts scope (`allowedRoots`,
+   `readOnly`, size caps) on the provider explicitly, with
+   `isPathAllowed` + `assertPathAllowed` as first-class methods.
+   PR #13 had `rootPath` implicit and no size-cap surface.
+7. **Discriminated-union `StreamEvent`.** v1.1 stream transports
+   a discriminated union (token / delta / tool-call / progress
+   / error / completion) rather than `OutputChunk`s with
+   `stream: "stdout" | "stderr" | "meta"`. The new shape lets
+   the backend and mobile UI do exhaustive switches with
+   compile-time safety.
+8. **Cost estimate / enforce / record split.** v1.1 separates
+   `estimateCost(request)` (used before task dispatch by the
+   router for cost-optimal routing), `enforceBudget(userId,
+   estimatedCostUsd)` (throws `BudgetExceededError` if the ask
+   would blow the budget), and `recordUsage(record)` (after
+   task completion, idempotent on taskId+model). PR #13 had
+   only `recordUsage` + `estimate` + `getPricing`, no budget
+   enforcement surface.
+
+Source-of-truth hierarchy (unchanged from earlier):
+session instruction > SPEC > RULES > CLAUDE.md > other docs.
+A live TZ / session instruction can evolve the SPEC, as this
+ADR records.
+
+Alternatives considered:
+
+- **Implement to PR #13 shape and accept drift.** Rejected
+  earlier (in the same-day "SPEC §61 Evolves" ADR) and rejected
+  again: drift violates LAW #5 at the doc layer and creates
+  two contracts of record where consumers must guess which is
+  authoritative.
+- **Keep v1.0 SPEC visible and overlay v1.1 in a separate
+  document.** Rejected. Doubles the maintenance surface; a
+  future editor would have to remember to cross-update both.
+  Single source of truth wins.
+- **Full rewrite of SPEC §61-66.7 + §27 including the prose.**
+  Rejected as scope creep. The v1.0 prose is well-written; only
+  the TS code blocks and the immediate explanatory sentences
+  (field names) needed to change.
+
+Consequences:
+
+- PR landing the contracts package also carries ~480 lines of
+  SPEC edit (insert + delete, not pure insert). The diff is
+  larger than a typical docs PR but delivers a single coherent
+  evolution.
+- Future agents (CodexAgent, CursorCLIAgent, OllamaAgent,
+  GeminiCLIAgent, LMStudioAgent, ChatGPTDesktopAgent,
+  CopilotWorkspaceAgent, CustomAgent) implement the v1.1 shape
+  directly — no reconciliation step, no second migration pass.
+- The six `.test.ts` files under
+  `packages/contracts/src/ai/__tests__/` are the compile-time
+  enforcement mechanism for the SPEC. Any attempt to drift the
+  contracts package away from SPEC (or vice versa) surfaces as
+  a CI failure. See the sibling ADR "Type-Level Tests Are The
+  Contract Enforcement Mechanism For packages/contracts".
+
+References:
+
+- Earlier same-day ADR *SPEC §61 Evolves To Match
+  packages/contracts Implementation* (intent-only; this ADR
+  adds landed-implementation evidence).
+- Week 2 TZ Phase 1.3 Part 3.3 (target shapes source).
+- `packages/contracts/src/ai/ai-agent.ts` + sibling files
+  (source of truth).
+- PR #13 SHA `8fdfbb8` (historical record of the v1.0 shape).
+
+## Type-Level Tests Are The Contract Enforcement Mechanism For packages/contracts
+
+Date: 2026-04-24
+Status: accepted
+
+Decision:
+
+- Every exported interface in `packages/contracts/src/ai/` has
+  a corresponding test file under
+  `packages/contracts/src/ai/__tests__/` with `expectTypeOf`
+  assertions exercising the interface's full shape: every
+  property type, every method signature, every discriminated-
+  union variant, every narrow-union member.
+- Each exported error class gets runtime tests verifying
+  `instanceof`, the stable error `code` string, the `retriable`
+  flag default, the `details` object shape, and the class
+  `name` for ergonomic error-boundary handling.
+- Test file naming: `<interface-module>.test.ts` (not
+  `.test-d.ts`). Vitest's default include glob
+  (`**/*.{test,spec}.?(c|m)[jt]s?(x)`) matches `.test.ts` but
+  not `.test-d.ts`; the `expectTypeOf` assertions run fine from
+  regular `.test.ts` files.
+- Tests live alongside the source (`__tests__/` subdir) rather
+  than in a separate `test/` tree so that moving an interface
+  file is a one-operation refactor.
+
+Why:
+
+- **Compile-time contract enforcement.** Runtime tests cannot
+  catch "a field's type changed from `readonly string[]` to
+  `string[]`", or "a method's return type changed from
+  `Promise<Handle>` to `Handle`", or "the narrow-union
+  `AIAgentState` gained a new variant nobody updated the
+  switch for". Type-level tests do. CI fails before the bad
+  change lands in a consuming package.
+- **No runtime cost.** `expectTypeOf` produces zero JavaScript
+  output. The assertions run at `tsc` time via type narrowing.
+  Test runtime is ms.
+- **Drift detection for SPEC.** The SPEC §61-66.7 TS code
+  blocks are expected to match
+  `packages/contracts/src/ai/*.ts`. If a maintainer changes
+  one side without the other, the `.test.ts` files around the
+  changed interface stop compiling and CI catches the drift.
+- **Discoverability.** A new contributor reading
+  `ai-agent.test.ts` sees the full contract shape in one file
+  of assertions — better onboarding than reading 20 scattered
+  usage sites.
+
+Coverage target: 100% property coverage on every exported
+interface — every property and method signature gets at least
+one assertion. Discriminated unions get full-variant coverage
+(all 6 variants of `StreamEvent`, both members of
+`encoding: "utf-8" | "base64"`, all 4 `AIAgentState` states,
+etc.). Error classes: full constructor path coverage including
+default-retriable, `details` shape, `cause` propagation,
+`name`.
+
+Alternatives considered:
+
+- **Use `tsd` instead of vitest `expectTypeOf`.** Rejected. The
+  repo already runs vitest across every workspace; adding a
+  second type-test runner doubles CI time and splits the
+  "where does a test live" mental model. vitest's
+  `expectTypeOf` covers the same surface with zero extra
+  tooling.
+- **Runtime-only testing of interfaces via sample
+  implementations.** Rejected. Interfaces have no runtime
+  representation; the only way to guarantee they mean what they
+  say is compile-time assertion. Runtime mocks testing behaviour
+  is an orthogonal and complementary kind of test — lives in
+  consuming packages (apps/desktop-agent, apps/api), not in
+  `packages/contracts`.
+- **Only test surface on PR review (human eyeballs).**
+  Rejected. Drifts slip in when reviewers aren't watching for
+  them. A CI gate is mechanical and reliable.
+
+Consequences:
+
+- PR landing the AI contracts carries 90 new tests (across 6
+  files) on top of the 23 existing contract tests, bringing
+  `packages/contracts` to 113 tests and the repo total from
+  71 → 161.
+- Every future field addition to an AI interface gets a
+  corresponding `expectTypeOf` line in the associated test
+  file. Convention is owned by whoever touches the interface;
+  reviewers check for it.
+- When TD-010 closes and TD-020 stays wontfix, the pattern
+  extends to any future agent-related interface (e.g. future
+  `AgentRegistry`, `TaskDispatcher` shapes): new interface
+  file `foo.ts` lands with a sibling `__tests__/foo.test.ts`.
+- The pattern is specific to `packages/contracts`. Apps that
+  consume contracts (api, auth-gateway, desktop-agent, mobile)
+  use regular behavioural tests — type-level enforcement
+  belongs upstream at the contract layer where it prevents
+  wrong types from ever reaching consumers.
+
+References:
+
+- `packages/contracts/src/ai/__tests__/` (the 6 test files
+  landed alongside the interfaces).
+- Vitest `expectTypeOf` docs:
+  https://vitest.dev/api/expect-typeof.html
+- Sibling ADR *SPEC §61-66.7 Evolves To Match
+  packages/contracts Implementation* (the evolution this
+  testing convention guards).
