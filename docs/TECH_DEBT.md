@@ -976,3 +976,64 @@ break IAM on every run.
 
 - 2026-04-23: filed during Week 1 closure after identifying
   PR #11 had been undeployed for over 24 hours.
+
+---
+
+## TD-020: Remove `AgentHeartbeatRequestSchemaV0` deprecation alias
+
+Discovered: 2026-04-24 (filed with Week 2 kickoff ADRs)
+Type: maintainability
+Priority: P3
+Status: open
+
+### Description
+
+Week 2 TZ Part 4.4 replaces the existing agent heartbeat schema
+in `@operator-os/contracts` with an agent-centric shape
+(`agentId`, `providerId`, `providerVersion`, `platform`,
+`hostname`, `state`, `uptimeSeconds`, `activeTaskCount`,
+`systemLoad`, `healthChecks`, `timestamp`). Per the 2026-04-24
+ADR *Heartbeat Schema Replacement With V0 Backward-Compat
+Alias* the old shape is preserved as
+`AgentHeartbeatRequestSchemaV0` with a `@deprecated` JSDoc tag
+so existing callers have a migration window.
+
+This entry tracks the eventual removal of the V0 alias so the
+deprecation does not orphan.
+
+### Risk if unaddressed
+
+The deprecation alias accumulates callers over time. Without a
+forcing function for removal, the codebase ends up maintaining
+two schemas indefinitely — the exact outcome the alternative
+"V0 permanent" option was rejected to avoid.
+
+### Proposed fix
+
+Remove the `AgentHeartbeatRequestSchemaV0` export after **either**:
+
+- Two minor version bumps of `@operator-os/contracts`
+  (e.g. `0.3.0` → `0.5.0` if the schema landed in `0.3.0`), **or**
+- The next major version bump (`0.x.x` → `1.0.0`)
+
+whichever comes first. At removal time:
+
+1. Grep the repo for `AgentHeartbeatRequestSchemaV0` usage.
+2. Migrate any remaining callers to `AgentHeartbeatRequestSchema`.
+3. Delete the V0 export from `packages/contracts`.
+4. Close this TD.
+
+### Related
+
+- DECISIONS.md ADR *Heartbeat Schema Replacement With V0
+  Backward-Compat Alias* (2026-04-24).
+- Week 2 TZ Phase 1.4 Part 4.4 (target shape).
+- The PR that lands the schema replacement will carry a
+  cross-reference to this TD so the deprecation window start
+  date is unambiguous.
+
+### History
+
+- 2026-04-24: filed during Week 2 kickoff alongside the
+  replacement-with-alias ADR so the deprecation is tracked,
+  not orphaned.

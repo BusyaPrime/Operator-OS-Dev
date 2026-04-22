@@ -516,3 +516,244 @@ References:
 - `infra/cloudbuild/auth-gateway.cloudbuild.yaml` (the positive
   example — had `--allow-unauthenticated` from Phase C.1
   because auth-gateway is the auth boundary; api now matches).
+
+## Incremental Upgrade Path For apps/desktop-agent And apps/mobile
+
+Date: 2026-04-24
+Status: accepted
+
+Decision:
+
+- Both `apps/desktop-agent` and `apps/mobile` retain their Day 1-3
+  bootstrap code as the starting point for Week 2 work. No wipe,
+  no greenfield rescaffold.
+- Week 2 Phase 1.4 / 1.5 proceeds by incremental adaptation:
+  surgical edits per module, preserving passing tests, migrating
+  file-by-file to the target shape described in the Week 2 TZ
+  (Part 4.1 layout for desktop-agent, Part 5.1 layout for mobile).
+- Before any edit to an existing file, Claude Code reads the
+  current content and flags material conflicts with the TZ design
+  to Akmal; each conflict is resolved (refactor or TZ-adjust)
+  before the edit proceeds.
+
+Why:
+
+- `apps/desktop-agent` already contains 13 TypeScript modules
+  (runtime, heartbeat-loop, command-poller, api-client,
+  safe-command-executor, session-manager, export-manager,
+  device-state, notifier, config, logger, main, index) plus a
+  passing runtime test. `apps/mobile` has a functional Expo RN
+  scaffold with 5 screens (home / devices / sessions / costs /
+  settings), navigation, Zustand store, API client, auth-session
+  service, theme tokens, mocks, and a passing operator-store
+  test. All of that was written through Day 1-3 bootstrap PRs
+  and validated by CI.
+- Discarding that work to start from a TZ-literal blank layout
+  would throw away proven integrations (the existing api-client
+  already talks to operator-os-api, the existing heartbeat-loop
+  already exists with a real cadence) and re-open every
+  regression risk we've already closed.
+- The TZ describes a *target* shape. It was written without
+  knowing about the existing scaffolds (Week 1 closed with the
+  Desktop Agent section deferred, so the TZ author did not have
+  the bootstrap files in context). The correct move is to treat
+  the TZ as a north star, not as a mandate to delete.
+
+Alternatives considered:
+
+- **Greenfield rescaffold (TZ-literal).** Rejected. Deletes ~18
+  files of proven code and 3 passing tests. High regression
+  surface; no benefit that incremental migration cannot also
+  deliver.
+- **Freeze existing code and build TZ scaffold alongside as v2.**
+  Rejected. Would leave `apps/desktop-agent` with two parallel
+  runtime layers, confusing for a new engineer reading the code
+  3 months from now. The incremental path produces one coherent
+  result.
+
+Consequences:
+
+- PR #22 (Desktop Agent) structure differs slightly from TZ Part
+  4.10 deliverables list. Commit boundaries will follow the
+  existing module boundaries rather than the TZ's idealized
+  module layout. The end state still matches TZ Part 4.1 target
+  once all migrations land, but by a gentler path.
+- Every edit to an existing file starts with a read + summary
+  step. Marginal cost, material value: prevents accidental
+  overwrite of bootstrap logic that the TZ author did not see.
+- If any existing file is found to materially conflict with a TZ
+  requirement (e.g. heartbeat payload shape), Claude Code
+  surfaces the conflict to Akmal before the edit rather than
+  resolving unilaterally.
+
+References:
+
+- TZ Week 2 Phase 1 spec, Parts 4 and 5.
+- Bootstrap commits in phase2/integrations-and-runtime and
+  phase3/live-deploy-and-vertex history touching
+  `apps/desktop-agent/**` and `apps/mobile/**` for full context.
+
+## SPEC §61 Evolves To Match packages/contracts Implementation
+
+Date: 2026-04-24
+Status: accepted
+
+Decision:
+
+- `packages/contracts` Week 2 Phase 1.3 (PR #21 for TD-010) lands
+  the Universal AI Platform interfaces in the shape described by
+  the Week 2 TZ Part 3.3, NOT the shape originally committed to
+  `docs/SPEC.md` §61 in PR #13.
+- `docs/SPEC.md` §61-66.7 is updated in the same PR (#21) to
+  reflect the refined shape, with a traceability note
+  *"2026-04-24: SPEC §61 refined to match packages/contracts
+  implementation — see DECISIONS.md for the evolution ADR"*.
+- The original SPEC §61 shape from PR #13 is preserved in git
+  history (nothing lost); no rollback needed.
+
+Why:
+
+- PR #13 SPEC §61 was written in Phase B as a design artefact
+  before any concrete implementation pressure. It defined an
+  `AIAgent` with plain fields (`id`, `vendor`, `capabilities[]`)
+  and method-based streaming (`stream(task): AsyncIterable`).
+  Valid as a first sketch.
+- The Week 2 TZ Part 3.3 evolved the design after implementation
+  practice. Notable improvements:
+  1. Structured `identity` / `runtime` / `manifest` triplets
+     instead of flat fields. Identity stays stable across
+     restarts; runtime carries process-level state; manifest is
+     the declarative contract for registration. Cleanly
+     separated concerns.
+  2. `AIAgent` owns its providers (`fs`, `stream`, `cost` as
+     readonly fields). Dependency inversion at the agent
+     boundary, so each agent can ship its own
+     `FileSystemProvider` / `StreamProvider` / `CostProvider`
+     specialisation (e.g. Cursor CLI's scoped-sandbox fs vs
+     ClaudeCodeAgent's local-fs).
+  3. `stop(reason)` takes an enum reason so auto-update /
+     user-quit / error paths are distinguishable at the call
+     site. `shutdown()` without a reason lost that information.
+  4. `executeTask(input) → TaskHandle` with polling model
+     replaces `execute(task) → AgentResult` + separate
+     `stream(task)`. The task handle carries status transitions
+     and usage, so long-running tasks don't need a parallel
+     streaming API.
+  5. `listCapabilities()` returns a `readonly AgentCapability[]`
+     (narrowed union type) rather than a generic `Capability[]`,
+     unlocking compile-time exhaustiveness checks.
+- The CLAUDE.md source-of-truth hierarchy is:
+  session instruction > SPEC > RULES > CLAUDE. A live TZ
+  instruction therefore outranks a SPEC section, as expected.
+  Updating SPEC keeps the two in sync so future readers don't
+  see a contradiction.
+
+Alternatives considered:
+
+- **Keep SPEC §61 as-is, land contracts in a different shape.**
+  Rejected: creates a documented-vs-implemented drift that
+  violates LAW #5 at the doc layer.
+- **Land contracts in SPEC §61 shape, ignore TZ.** Rejected:
+  TZ is more mature and carries more implementation experience;
+  session instruction outranks SPEC per the hierarchy.
+- **Land contracts now, defer SPEC update to Week 3.**
+  Rejected: the drift would be load-bearing for exactly the
+  period when Desktop Agent implementation is reading SPEC for
+  guidance. Best to land together.
+
+Consequences:
+
+- PR #21 grows by ~200-400 lines of SPEC edits beyond the
+  contracts code itself. One-time cost; worth the consistency.
+- Future agents (CodexAgent, CursorCLIAgent, OllamaAgent etc.)
+  implement the TZ shape directly, no reconciliation step.
+- The TD-010 `contracts` test suite uses the TZ shape (per TZ
+  Part 3.5 type-level tests). Those tests are the authoritative
+  compile-time enforcement; the SPEC becomes the authoritative
+  narrative.
+
+References:
+
+- SPEC §61-66.7 (current, PR #13 shape — to be updated in PR #21).
+- TZ Week 2 Phase 1.3 Part 3.3 (target shape — to be landed in
+  packages/contracts via PR #21).
+- PR #13 merge SHA `8fdfbb8` for historical tracking of original
+  shape.
+
+## Heartbeat Schema Replacement With V0 Backward-Compat Alias
+
+Date: 2026-04-24
+Status: accepted
+
+Decision:
+
+- The agent heartbeat payload schema in `@operator-os/contracts`
+  is replaced with the shape described in Week 2 TZ Part 4.4.
+  Field set: `agentId`, `providerId`, `providerVersion`,
+  `platform`, `hostname`, `state`, `uptimeSeconds`,
+  `activeTaskCount`, `systemLoad`, `healthChecks`, `timestamp`.
+- The existing heartbeat schema is preserved as
+  `AgentHeartbeatRequestSchemaV0` with a `@deprecated` JSDoc tag
+  so callers that have not yet migrated get a compile-time
+  warning.
+- The canonical name `AgentHeartbeatRequestSchema` points at
+  the new shape. All callsites are migrated in the same PR that
+  lands the new schema (grep-driven refactor).
+- If the existing schema carries fields the TZ design does not
+  list, those fields are preserved as *optional* in the new
+  schema. No silent data loss; the superset wins.
+- TD-020 (new) tracks the removal of the V0 alias after two
+  minor versions or at the next contracts-package major bump,
+  whichever comes first. The deprecation is not permanent.
+
+Why:
+
+- The existing schema was written during Day 1-3 bootstrap when
+  the client of `/v1/agent/heartbeat` was loosely modelled as a
+  "device", not as a concrete agent with capabilities. The TZ
+  design formalises the agent-centric model (providerId,
+  providerVersion, activeTaskCount) that matches the actual
+  Desktop Agent runtime.
+- A straight replacement without an alias would break any
+  external caller that has already built against the existing
+  schema (mobile scaffold or test code). A deprecation window
+  costs almost nothing (a re-export + JSDoc line) and buys
+  migration time.
+- LAW #5 again: the schema evolution should be visible in
+  contracts so downstream compile errors guide callers to the
+  new shape, rather than runtime mismatch surprises.
+
+Alternatives considered:
+
+- **Straight replacement with no alias.** Rejected. Breaks any
+  caller who committed against the old schema on
+  `phase3/live-deploy-and-vertex` tip.
+- **Add new schema under a different name (no canonical
+  reassignment).** Rejected. Leaves two equivalent-looking
+  schemas, confusing for readers and for Zod validation
+  boundaries.
+- **Version both schemas forever (V0 permanent).** Rejected.
+  Defeats the point of evolving the design; TD-020 closure
+  removes V0 once callers have migrated.
+
+Consequences:
+
+- PR #21 (TD-010) OR a sibling PR carries the schema migration
+  as an atomic commit: rename old → V0 with @deprecated, export
+  new canonical, refactor all callsites.
+- Existing tests that assert heartbeat shape get updated to new
+  fields. Where the old schema had a field the TZ missed, the
+  new schema carries it as optional and a test documents the
+  preservation.
+- TD-020 is filed in `docs/TECH_DEBT.md` immediately alongside
+  the schema change so the V0 deprecation is tracked, not
+  orphaned.
+
+References:
+
+- TZ Week 2 Phase 1.4 Part 4.4 (target heartbeat schema).
+- Existing `AgentHeartbeatRequestSchema` location TBD pending
+  research (see `ls apps/desktop-agent` + contracts grep — will
+  be attached to the research report before PR #21 starts).
+- `docs/TECH_DEBT.md` TD-020 (alias removal tracker — filed with
+  this ADR landing).
