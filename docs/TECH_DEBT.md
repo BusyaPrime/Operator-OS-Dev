@@ -572,3 +572,85 @@ Estimated work: 2-3 hours.
 ### History
 
 - 2026-04-23: filed during Phase C.1 as pre-work for Week 2.
+
+---
+
+## TD-011: Cloud Run reserved environment variable pattern
+
+Discovered: 2026-04-23 (during Phase C.2 step 8 deploy failure)
+Type: tech-gap + documentation
+Priority: P3
+Status: resolved
+
+### Description
+
+Cloud Run reserves a set of environment variable names and
+rejects any deploy that sets them via `--set-env-vars`,
+`--update-env-vars`, or a declarative `env:` block in a
+`gcloud run services replace` manifest. Reserved names (per the
+container contract):
+
+- `PORT` — auto-set to the `--port` value (or 8080 default).
+- `K_SERVICE` — Cloud Run service name.
+- `K_REVISION` — revision name.
+- `K_CONFIGURATION` — configuration name.
+
+Upstream reference:
+https://cloud.google.com/run/docs/container-contract#env-vars
+
+Phase C.2 step 8 triggered this exact error:
+
+```
+ERROR: (gcloud.run.deploy) spec.template.spec.containers[0].env:
+  The following reserved env names were provided: PORT.
+  These values are automatically set by the system.
+```
+
+because `infra/cloudbuild/auth-gateway.cloudbuild.yaml`,
+`infra/scripts/deploy-auth-gateway.ps1`, and
+`infra/cloud-run/auth-gateway.service.yaml` all listed
+`PORT=8081` alongside `--port=8081`. The control flag is the
+right knob; the env var is injected automatically from it.
+
+### Risk if unaddressed
+
+Every new Cloud Run service we add (conductor, streamer,
+notifications, cost-tracker, audit-logger, ai-router, export-
+worker, command-worker) is at risk of copying the same pattern
+from `auth-gateway.*` or `api.*` infra files and hitting the
+same deploy failure on first push. Each one costs a retry
+round-trip (~5 minutes) and a branch + PR if the first deploy
+is autonomous.
+
+### Fix (applied in this PR)
+
+- Removed `PORT` from `--set-env-vars` in
+  `infra/cloudbuild/auth-gateway.cloudbuild.yaml` (c1 of PR #15).
+- Removed `PORT` from `$EnvVars` in
+  `infra/scripts/deploy-auth-gateway.ps1` (c2).
+- Removed the `PORT` env entry from
+  `infra/cloud-run/auth-gateway.service.yaml` (c3).
+- Added comment blocks in all three files explaining why `PORT`
+  is absent and pointing at the Cloud Run container-contract
+  reserved-env-vars page, so the rule is visible where the next
+  engineer would be tempted to add it back.
+
+`api.cloudbuild.yaml`, `api.service.yaml`, and `deploy-api.ps1`
+do NOT contain the `PORT` env — they always did it right and
+are the positive examples for new service scaffolding. This
+entry documents why.
+
+### Related
+
+- Discovered in: Phase C.2 step 8 (2026-04-23).
+- Resolved in: PR #15 `fix(auth-gateway): remove reserved PORT
+  env var`.
+- Applies to: every future Cloud Run service spec. `docs/DEPLOY.md`
+  should gain a "Cloud Run reserved env vars" subsection when it
+  is next touched (Week 1 closure PR is the natural place).
+
+### History
+
+- 2026-04-23: failure observed on `auth-gateway:phase3-bd5f113`
+  deploy. Fix filed in the same branch. TD closed resolved on
+  merge of PR #15.
