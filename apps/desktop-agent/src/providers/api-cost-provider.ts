@@ -76,9 +76,15 @@ export class ApiCostProvider implements CostProvider {
   }
 
   async checkBudget(userId: string): Promise<BudgetStatus> {
+    // Anchor the period in UTC so timezone-dependent tests and
+    // log consumers agree on boundaries regardless of runtime.
     const now = new Date();
-    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-    const nextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+    const monthStart = new Date(
+      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)
+    );
+    const nextMonth = new Date(
+      Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1)
+    );
     return {
       userId,
       plan: 'custom',
