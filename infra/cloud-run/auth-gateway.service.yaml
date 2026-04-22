@@ -1,0 +1,83 @@
+# Cloud Run service manifest for operator-auth-gateway.
+#
+# This file is a TEMPLATE. The `image:` field uses a ${IMAGE_TAG}
+# placeholder which must be rendered before the manifest is applied.
+# CLAUDE.md rule R9 forbids `:latest` in production; resolve the
+# template with a concrete git-SHA-derived tag.
+#
+# Typical rendering (bash):
+#     IMAGE_TAG=phase3-<short-sha> envsubst < infra/cloud-run/auth-gateway.service.yaml \
+#       > /tmp/auth-gateway.service.rendered.yaml
+#     gcloud run services replace /tmp/auth-gateway.service.rendered.yaml \
+#       --region=europe-west4 --project=operator-os-dev
+#
+# The imperative `infra/scripts/deploy-auth-gateway.ps1` path does
+# not apply this manifest directly; it calls `gcloud run deploy`
+# with an explicit `--image=` flag and passes env vars through
+# `--set-env-vars`. This manifest is kept in sync as the canonical
+# declarative shape and env-var reference.
+#
+# Architectural decisions embedded here (see DECISIONS.md and the
+# Phase C plan):
+#   - D-1: dedicated runtime SA `auth-gateway-runtime` (least-
+#     privilege, separate from `cloudrun-runtime` used by
+#     operator-os-api).
+#   - D-2: signing secret is `operator-jwt-secret` shared with
+#     operator-os-api so verification pairs with issuance.
+#   - D-3: `--allow-unauthenticated` equivalent — ingress `all`,
+#     no invoker binding required. This service IS the auth
+#     boundary; /v1/auth/signin must accept requests with no prior
+#     token by definition.
+#   - D-4: region `europe-west4`, port `8081` (matches Dockerfile
+#     EXPOSE and .env.example PORT).
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: operator-auth-gateway
+  annotations:
+    run.googleapis.com/ingress: all
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "0"
+        autoscaling.knative.dev/maxScale: "10"
+    spec:
+      serviceAccountName: auth-gateway-runtime@operator-os-dev.iam.gserviceaccount.com
+      containers:
+        - image: europe-west4-docker.pkg.dev/operator-os-dev/operator-os-docker/auth-gateway:${IMAGE_TAG}
+          ports:
+            - containerPort: 8081
+          env:
+            - name: NODE_ENV
+              value: production
+            - name: HOST
+              value: 0.0.0.0
+            - name: PORT
+              value: "8081"
+            - name: LOG_LEVEL
+              value: info
+            - name: GOOGLE_CLOUD_PROJECT
+              value: operator-os-dev
+            - name: FIREBASE_PROJECT_ID
+              value: operator-os-dev
+            - name: AUTH_GATEWAY_SERVICE_NAME
+              value: operator-auth-gateway
+            - name: AUTH_ACCESS_TOKEN_ISSUER
+              value: operator-auth-gateway
+            - name: AUTH_ACCESS_TOKEN_AUDIENCE
+              value: operator-os-api
+            - name: AUTH_ACCESS_TOKEN_TTL_SECONDS
+              value: "3600"
+            - name: AUTH_REFRESH_TOKEN_TTL_SECONDS
+              value: "2592000"
+            - name: AUTH_JWT_SIGNING_SECRET_NAME
+              value: operator-jwt-secret
+            - name: AUTH_ACCEPTED_GOOGLE_CLIENT_IDS
+              value: "1016254604177-rgvmifpm5sjr009nie8ga9psnoap69pg.apps.googleusercontent.com"
+            - name: FIRESTORE_USERS_COLLECTION
+              value: users
+            - name: FIRESTORE_REFRESH_TOKENS_COLLECTION
+              value: refreshTokens
+            - name: READINESS_STRICT
+              value: "true"
