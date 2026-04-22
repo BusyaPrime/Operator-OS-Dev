@@ -821,9 +821,10 @@ tokens (shape-only validation), and base64-padded tokens.
 ## TD-014: `api.cloudbuild.yaml` resets IAM allUsers on every deploy
 
 Discovered: 2026-04-23 (during Phase C.2 step 11 api redeploy)
+Resolved: 2026-04-24 (PR #19, commits `5ebf0c6` + `bd7d959`)
 Type: ops-trap
 Priority: P2
-Status: open
+Status: resolved
 
 ### Description
 
@@ -883,6 +884,15 @@ matching `--allow-unauthenticated` in
 ### History
 
 - 2026-04-23: observed and filed during Week 1 closure.
+- 2026-04-24 (PR #19, Week 2 Phase 1.1): resolved via Option A.
+  `--no-allow-unauthenticated` replaced with `--allow-unauthenticated`
+  in both `infra/cloudbuild/api.cloudbuild.yaml` and
+  `infra/scripts/deploy-api.ps1`. Deploy flags now align with the
+  IAM-open + Fastify-middleware-auth posture committed in the
+  2026-04-23 ADR. Verification will follow on the first api
+  deploy after CI auto-deploy (TD-015 / PR #20) lands; the fix
+  is independently mergeable and does not require TD-015 to be
+  verified.
 
 ---
 
