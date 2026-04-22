@@ -5,7 +5,7 @@ merge to `phase3/live-deploy-and-vertex` via the CD workflow
 (WIF-backed auth + impersonation of `deploy-bot`; deploy-bot
 self-binding for `roles/iam.serviceAccountUser` unlocks the
 Cloud Build self-actAs check; canonical Cloud Build flag set
-per DECISIONS.md).
+with `_DEPLOY=true` per DECISIONS.md).
 
 ## Current Bootstrap Scope
 
