@@ -899,9 +899,10 @@ matching `--allow-unauthenticated` in
 ## TD-015: No auto-deploy trigger for `apps/api/**` merges
 
 Discovered: 2026-04-23 (while diagnosing Phase C.2 step 11)
+Resolved: 2026-04-24 (PR #20, commit `4645b5a`)
 Type: ops-trap + process
 Priority: P2
-Status: open
+Status: resolved
 
 ### Description
 
@@ -982,9 +983,10 @@ break IAM on every run.
 ## TD-020: Remove `AgentHeartbeatRequestSchemaV0` deprecation alias
 
 Discovered: 2026-04-24 (filed with Week 2 kickoff ADRs)
+Closed: 2026-04-24 (same day, after pre-Phase-1.3 research)
 Type: maintainability
 Priority: P3
-Status: open
+Status: wontfix — not applicable
 
 ### Description
 
@@ -1034,6 +1036,108 @@ whichever comes first. At removal time:
 
 ### History
 
-- 2026-04-24: filed during Week 2 kickoff alongside the
-  replacement-with-alias ADR so the deprecation is tracked,
+- 2026-04-24 (morning): filed during Week 2 kickoff alongside
+  the replacement-with-alias ADR so the deprecation is tracked,
   not orphaned.
+- 2026-04-24 (same day, after pre-Phase-1.3 research): closed
+  as `wontfix — not applicable`. Research revealed that the
+  repo does not carry an existing `AgentHeartbeatRequestSchema`
+  to alias from; the api uses `deviceStateSchema` directly as
+  its heartbeat body and that schema is shared across the
+  operator-state model and messaging contracts (so replacing
+  it would force unrelated consumers to carry agent-process
+  fields). The revised direction — *Agent Heartbeat Schema Is
+  Additive, Not Replacement* (DECISIONS.md, same day) — adds
+  `AgentHeartbeatRequestSchema` as a new sibling and leaves
+  `deviceStateSchema` untouched. With no alias to remove,
+  this TD has no fix to track. See the superseding ADR for
+  the new direction and PR #21 for the additive schema
+  landing.
+
+---
+
+## TD-016: Migrate GitHub Actions GCP auth to Workload Identity Federation
+
+Discovered: 2026-04-23 (filed during Week 1 closure)
+Closed: 2026-04-24 (preempted — migration executed before any
+  JSON key was ever created)
+Type: security-posture
+Priority: P3
+Status: resolved — preempted
+
+### Description
+
+Week 1 closure planned Phase 1.2 (CI auto-deploy for api +
+auth-gateway) to use a long-lived JSON service-account key for
+`deploy-bot@operator-os-dev` stored in a GitHub Secret, with a
+"future TD-016: migrate to Workload Identity Federation" item
+to close later. Classic "land the easy path first, migrate to
+the secure path after" pattern.
+
+### Why it never shipped
+
+Before Phase 1.2 opened, Akmal attempted
+`gcloud iam service-accounts keys create` against
+`deploy-bot@operator-os-dev` and received
+`FAILED_PRECONDITION: Key creation is not allowed on this
+service account. Violation: constraints/iam.disableServiceAccountKeyCreation`
+— an org-level policy blocking all long-lived JSON key
+creation.
+
+Two paths forward: (a) waive the org policy to allow JSON keys,
+(b) adopt WIF directly. Path (b) executes the TD-016 migration
+**before** the JSON-key path ever landed, so there's nothing
+to migrate from.
+
+### Resolution (pre-emptive)
+
+Akmal set up on the Google side (via `gcloud` on their worker):
+
+- Enabled `iamcredentials.googleapis.com` + `sts.googleapis.com`.
+- Created global Workload Identity Pool `github-actions-pool`.
+- Created OIDC provider `github-actions-provider` with issuer
+  `https://token.actions.githubusercontent.com`, attribute
+  mapping (sub, actor, repository, repository_owner), attribute
+  condition `assertion.repository_owner == 'BusyaPrime'`.
+- Bound `deploy-bot@operator-os-dev` with
+  `roles/iam.workloadIdentityUser` for principalSet
+  `attribute.repository/BusyaPrime/Operator-OS-Dev`.
+- Created GitHub repo secrets `GCP_PROJECT_ID`,
+  `GCP_WORKLOAD_IDENTITY_PROVIDER`, `GCP_SERVICE_ACCOUNT`. None
+  carry credentials; only the provider resource path and the
+  SA email.
+
+`.github/workflows/cd-deploy.yml` (landed via PR #20 /
+commit `4645b5a`) uses `google-github-actions/auth@v2` with
+these inputs and requires `permissions: id-token: write` so
+each workflow run mints a short-lived federated token.
+
+### Consequences captured
+
+- No JSON service-account key exists in the project. The
+  ops risk tracked by TD-016 is gone rather than shifted.
+- If a second repo ever needs to deploy to the same GCP
+  project, the ops move is "add its repo to the pool's
+  principalSet", not "provision another JSON key".
+- Audit trail via Cloud Audit Logs includes the full GitHub
+  OIDC assertion (workflow name, run id, repository, actor,
+  ref) for every token exchange — strictly better than the
+  opaque "whoever had the JSON key" view.
+
+### Related
+
+- DECISIONS.md ADR *Adopt Workload Identity Federation From
+  Day 1 (TD-016 Preempted)* (2026-04-24).
+- PR #20 (this TD's sibling work — lands the workflow).
+- TD-015 (auto-deploy) — resolved alongside TD-016 in the
+  same PR.
+
+### History
+
+- 2026-04-23: filed during Week 1 closure as a future
+  migration item after adopting the simpler JSON-key path for
+  Phase 1.2.
+- 2026-04-24: closed as resolved-preempted after
+  `constraints/iam.disableServiceAccountKeyCreation` blocked
+  key creation. WIF adopted directly; the migration never had
+  to happen.
