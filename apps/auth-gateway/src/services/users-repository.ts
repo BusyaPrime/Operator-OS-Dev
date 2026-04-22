@@ -173,7 +173,18 @@ export class UsersRepository {
 
   #getFirestore() {
     this.#firestore ??= new Firestore({
-      projectId: this.#config.GOOGLE_CLOUD_PROJECT
+      projectId: this.#config.GOOGLE_CLOUD_PROJECT,
+      // Google ID tokens from refresh-grant flows (and some initial
+      // signin flows too — e.g. when the user denied the `profile`
+      // scope) omit optional identity claims like `name`,
+      // `given_name`, `family_name`, `picture`. The verifier emits
+      // `undefined` for missing claims. Firestore rejects documents
+      // containing undefined values with "Value for argument 'data'
+      // is not a valid Firestore document." Enabling this flag makes
+      // Firestore drop undefined fields instead of throwing — the
+      // correct behaviour for our upsert, where a missing claim
+      // should mean "leave the existing field alone / do not set".
+      ignoreUndefinedProperties: true
     });
     return this.#firestore;
   }

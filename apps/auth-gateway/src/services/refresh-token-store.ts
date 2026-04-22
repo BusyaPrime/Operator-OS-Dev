@@ -223,7 +223,12 @@ export class RefreshTokenStore {
 
   #getFirestore() {
     this.#firestore ??= new Firestore({
-      projectId: this.#config.GOOGLE_CLOUD_PROJECT
+      projectId: this.#config.GOOGLE_CLOUD_PROJECT,
+      // Kept symmetric with users-repository so every Firestore
+      // client used by auth-gateway has identical write semantics.
+      // See users-repository.ts for the full rationale behind
+      // ignoring undefined properties on upsert.
+      ignoreUndefinedProperties: true
     });
     return this.#firestore;
   }
