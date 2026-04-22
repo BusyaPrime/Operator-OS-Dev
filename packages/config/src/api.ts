@@ -43,6 +43,19 @@ export const apiEnvSchema = z.object({
   EXPORTS_QUEUE: z.string().min(1).default('exports'),
   TASKS_TARGET_BASE_URL: optionalUrlFromString(),
   AGENT_AUDIENCE: optionalUrlFromString(),
+  AUTH_ACCESS_TOKEN_ISSUER: z
+    .string()
+    .min(1)
+    .default('operator-auth-gateway'),
+  AUTH_ACCESS_TOKEN_AUDIENCE: z
+    .string()
+    .min(1)
+    .default('operator-os-api'),
+  AUTH_JWT_SIGNING_SECRET_NAME: z
+    .string()
+    .min(1)
+    .default('operator-jwt-secret'),
+  AUTH_JWT_SIGNING_SECRET_LITERAL: z.string().optional(),
   AGENT_EVENTS_TOPIC: z.string().min(1).default('agent-events'),
   BUDGET_EVENTS_TOPIC: z.string().min(1).default('budget-events'),
   OPERATOR_ALERTS_TOPIC: z.string().min(1).default('operator-alerts'),

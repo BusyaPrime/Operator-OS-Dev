@@ -1,6 +1,8 @@
 import Fastify from 'fastify';
 import type { ApiEnv } from '@operator-os/config';
 
+import { AccessTokenSecretLoader } from './integrations/signing-secret.js';
+import { AccessTokenVerifier } from './integrations/access-token-verifier.js';
 import { BigQueryAnalyticsWriter } from './integrations/bigquery.js';
 import { FirebaseAuthService } from './integrations/auth.js';
 import { FirestoreOperatorRepository } from './integrations/firestore.js';
@@ -48,7 +50,13 @@ export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) =>
       location: config.VERTEX_LOCATION,
       model: config.VERTEX_MODEL
     });
-  const authService = new FirebaseAuthService(config, app.log);
+  const accessTokenSecretLoader = new AccessTokenSecretLoader(config, app.log);
+  const accessTokenVerifier = new AccessTokenVerifier(
+    config,
+    app.log,
+    accessTokenSecretLoader
+  );
+  const authService = new FirebaseAuthService(config, app.log, accessTokenVerifier);
   const firestoreRepository = new FirestoreOperatorRepository(config, app.log);
   const pubSubPublisher = new PubSubPublisher(config, app.log);
   const tasksQueue = new TasksQueueClient(config, app.log);
