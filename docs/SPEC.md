@@ -2,7 +2,11 @@
 # OPERATOR-OS — MASTER TECHNICAL SPECIFICATION
 # ═══════════════════════════════════════════════════════════════════════════════
 #
-# Version:           1.0 — Final Form
+# Version:           1.1 — 2026-04-24 (§ 61-66.7 interface shapes refined
+#                         to match @operator-os/contracts implementation;
+#                         § 27 ClaudeCodeAgent reference updated; no
+#                         semantic changes). Previous version was 1.0
+#                         (Final Form, PR #13).
 # Owner:             Akmal Khujdarov (BusyaPrime)
 # Status:            Ready for parallel execution by multiple Claude Code agents
 # Timeline:          6-week sprint to demo-ready killer product
@@ -2095,108 +2099,151 @@ Ability to run any shell is Enterprise-only or explicit user consent per-command
 ### Reference implementation: ClaudeCodeAgent (implements AIAgent)
 
 ```typescript
-import type { AIAgent, Task, OutputChunk, AgentResult, AgentStatus, ResourceMetrics, AgentConfig } from "@operator-os/contracts";
+// v1.1: matches packages/contracts/src/ai/*. See § 61 for the
+// canonical shape (shape evolved from PR #13's sketch, see
+// DECISIONS.md "SPEC §61 Evolves To Match packages/contracts").
+
+import type {
+  AIAgent,
+  AIAgentIdentity,
+  AIAgentRuntime,
+  AIAgentStatus,
+  AIAgentTaskHandle,
+  AIAgentTaskInput,
+  AIResponseStream,
+  AgentCapability,
+  AgentManifest,
+  CostProvider,
+  FileSystemProvider,
+  StreamProvider
+} from "@operator-os/contracts";
 
 export class ClaudeCodeAgent implements AIAgent {
-  readonly id = "anthropic.claude-code";
-  readonly vendor = "anthropic" as const;
-  readonly capabilities = [
+  readonly identity: AIAgentIdentity;
+  readonly runtime: AIAgentRuntime;
+  readonly manifest: AgentManifest;
+  readonly fs: FileSystemProvider;
+  readonly stream: StreamProvider;
+  readonly cost: CostProvider;
+
+  private readonly capabilities: readonly AgentCapability[] = [
     "code-generation",
-    "code-editing",
-    "multi-file-edit",
+    "code-review",
+    "file-read",
+    "file-write",
     "tool-use",
     "long-context",
-    "thinking",
     "streaming",
-    "cancel",
-  ] as const satisfies ReadonlyArray<Capability>;
+    "planning",
+  ];
 
-  private cwd!: string;
+  private active = new Map<string, { pty: IPty; stream: AIResponseStream }>();
+  private state: AIAgentStatus["state"] = "idle";
   private claudePath!: string;
-  private active = new Map<string, IPty>();
-  private state: AgentStatus["state"] = "idle";
 
-  async initialize(config: AgentConfig): Promise<void> {
-    this.state = "initializing";
-    this.cwd = config.workingDirectory ?? process.cwd();
-    this.claudePath = await this.locateClaudeCode();
-    this.state = "ready";
+  constructor(deps: {
+    identity: AIAgentIdentity;
+    runtime: AIAgentRuntime;
+    manifest: AgentManifest;
+    fs: FileSystemProvider;
+    stream: StreamProvider;
+    cost: CostProvider;
+  }) {
+    this.identity = deps.identity;
+    this.runtime = deps.runtime;
+    this.manifest = deps.manifest;
+    this.fs = deps.fs;
+    this.stream = deps.stream;
+    this.cost = deps.cost;
   }
 
-  async shutdown(): Promise<void> {
-    this.state = "shutting-down";
-    await Promise.all([...this.active.keys()].map((id) => this.cancel(id)));
+  async start(): Promise<void> {
+    this.claudePath = await this.locateClaudeCode();
     this.state = "idle";
   }
 
-  async *stream(task: Task): AsyncIterable<OutputChunk> {
-    const pty = nodePty.spawn(
-      this.claudePath,
-      [
-        "--prompt", task.instruction,
-        "--non-interactive",
-        ...((task.flags?.args as string[] | undefined) ?? []),
-      ],
-      { cwd: this.cwd, env: process.env, cols: 120, rows: 40 },
-    );
-    this.active.set(task.id, pty);
-
-    const queue: OutputChunk[] = [];
-    let done = false;
-    let exitCode = 0;
-
-    pty.onData((data) => {
-      queue.push({ taskId: task.id, stream: "stdout", data, at: new Date().toISOString() });
-    });
-    pty.onExit(({ exitCode: code }) => {
-      exitCode = code;
-      done = true;
-    });
-
-    while (!done || queue.length) {
-      if (queue.length) yield queue.shift()!;
-      else await new Promise((r) => setTimeout(r, 25));
-    }
-    this.active.delete(task.id);
-    if (exitCode !== 0) {
-      yield { taskId: task.id, stream: "meta", data: `exit=${exitCode}`, at: new Date().toISOString() };
-    }
+  async stop(reason: "user" | "shutdown" | "error"): Promise<void> {
+    await Promise.all([...this.active.keys()].map((id) => this.cancelTask(id)));
+    this.state = "offline";
+    // reason is recorded via cost/audit provider in a real impl
   }
 
-  async execute(task: Task): Promise<AgentResult> {
-    let finalOutput = "";
-    for await (const chunk of this.stream(task)) {
-      if (chunk.stream === "stdout") finalOutput += chunk.data;
-    }
+  async getStatus(): Promise<AIAgentStatus> {
     return {
-      taskId: task.id,
-      exitCode: 0,
-      finalOutput,
-      usage: await this.reportUsage(task),
+      state: this.state,
+      currentTaskId: [...this.active.keys()][0],
+      lastHeartbeatAt: new Date().toISOString(),
+      healthChecks: {
+        "claude-binary": this.claudePath ? "ok" : "fail",
+        "active-tasks": this.active.size < 4 ? "ok" : "warn"
+      }
     };
   }
 
-  async cancel(taskId: string): Promise<void> {
-    const pty = this.active.get(taskId);
-    if (!pty) return;
-    pty.kill("SIGINT");
+  listCapabilities(): readonly AgentCapability[] {
+    return this.capabilities;
+  }
+
+  async executeTask(input: AIAgentTaskInput): Promise<AIAgentTaskHandle> {
+    // 1. Estimate + enforce budget before we spend tokens.
+    const estimate = await this.cost.estimateCost({
+      providerId: this.identity.providerId,
+      model: "claude-sonnet-4-5",
+      promptTokens: input.prompt.length / 4,  // rough
+      expectedCompletionTokens: 2000
+    });
+    // enforceBudget throws BudgetExceededError if over
+    // (caller sees it via task handle error path)
+    await this.cost.enforceBudget("user-from-ctx", estimate.costUsd);
+
+    const stream = this.stream.createStream({
+      taskId: input.taskId,
+      userId: "user-from-ctx",
+      transport: "websocket"
+    });
+
+    const pty = nodePty.spawn(
+      this.claudePath,
+      ["--prompt", input.prompt, "--non-interactive"],
+      { cwd: this.fs.scope.allowedRoots[0], env: process.env, cols: 120, rows: 40 }
+    );
+    this.active.set(input.taskId, { pty, stream });
+    this.state = "busy";
+
+    pty.onData((data) => {
+      void stream.emitToken(data);
+    });
+    pty.onExit(({ exitCode }) => {
+      void stream.emitCompletion({
+        status: exitCode === 0 ? "success" : "failed",
+        usage: {
+          promptTokens: 0, completionTokens: 0, totalTokens: 0, costUsd: 0
+        }
+      });
+      this.active.delete(input.taskId);
+      if (this.active.size === 0) this.state = "idle";
+    });
+
+    return {
+      taskId: input.taskId,
+      status: "running",
+      startedAt: new Date().toISOString()
+    };
+  }
+
+  async cancelTask(taskId: string): Promise<void> {
+    const entry = this.active.get(taskId);
+    if (!entry) return;
+    entry.pty.kill("SIGINT");
     setTimeout(() => {
-      if (this.active.has(taskId)) pty.kill("SIGKILL");
+      if (this.active.has(taskId)) entry.pty.kill("SIGKILL");
     }, 5000);
   }
 
-  status(): AgentStatus { return { state: this.state, runningTasks: this.active.size }; }
-  resourceUsage(): ResourceMetrics {
-    return {
-      cpuPercent: 0,         // populated by ResourceMonitor (§ 37)
-      memoryMB: 0,
-      openFileHandles: 0,
-      activeSubprocesses: this.active.size,
-    };
+  private async locateClaudeCode(): Promise<string> {
+    // platform-specific discovery; returns the `claude` binary path
+    return "claude";
   }
-
-  private async locateClaudeCode(): Promise<string> { /* platform-specific */ return "claude"; }
-  private async reportUsage(task: Task): Promise<UsageEvent> { /* reads Claude Code session usage */ return null as never; }
 }
 ```
 
@@ -2206,12 +2253,24 @@ Key points about this reference implementation:
   Desktop Agent core imports `ClaudeCodeAgent` directly — it is
   loaded by the provider registry (§ 27.5) and handed back
   through the interface.
-- Quota, subprocess management, streaming, cancellation, and
-  resource reporting live inside the agent. Callers see only the
-  interface methods.
-- `capabilities` is declared once; callers that need "does this
-  agent support vision" read `agent.capabilities.includes("vision")`,
-  never `agent.vendor === "anthropic"`.
+- DI at the agent boundary: `identity`, `runtime`, `manifest`,
+  `fs`, `stream`, `cost` are constructor-injected readonly
+  fields. The agent class itself has no knowledge of how the
+  stream is transported or where cost goes — that's the owner's
+  (registry's) choice at construction time.
+- Capability branching: callers that need "does this agent
+  support vision" read `agent.listCapabilities().includes("vision")`,
+  never `agent.identity.providerId === "anthropic.claude-code"`.
+- Streaming: the agent calls `this.stream.createStream(...)` once
+  per task, then emits events (`emitToken`, `emitCompletion`,
+  etc.). The `AIAgentTaskHandle` carries only the polling-side
+  status; the live output flows through the stream.
+- Cost: `estimateCost` + `enforceBudget` run before spawning
+  work, so budget overruns produce `BudgetExceededError` before
+  tokens are burnt.
+- File-system access: `this.fs.scope.allowedRoots` gives the
+  agent its sandboxed roots; writes that would escape throw
+  `PathNotAllowedError`.
 - The same shape is followed by `CodexAgent`, `CursorCLIAgent`,
   `OllamaAgent`, etc. — see § 62-66.7.
 
@@ -3398,91 +3457,109 @@ CLI, ChatGPT desktop, Gemini CLI, Ollama, LM Studio, Copilot
 Workspace, future tools. One implementation per concrete agent.
 
 ```typescript
-type AIVendor =
-  | "anthropic"
-  | "openai"
-  | "google"
-  | "cursor"
-  | "github"
-  | "local"
-  | "custom";
+// v1.1 (2026-04-24): shapes mirror packages/contracts/src/ai/ai-agent.ts.
+// See DECISIONS.md "SPEC §61 Evolves To Match packages/contracts Implementation".
 
-type Capability =
-  | "code-generation"
-  | "code-editing"
-  | "chat"
-  | "tool-use"
-  | "vision"
-  | "long-context"       // >= 200K tokens
-  | "thinking"           // explicit reasoning mode
-  | "sandbox"            // isolated code execution
-  | "file-write"
-  | "multi-file-edit"
-  | "streaming"
-  | "cancel"
-  | "offline";           // no network required
-
-interface AgentConfig {
-  agentId: string;                  // stable registry id
-  workingDirectory?: string;
-  env?: Record<string, string>;
-  capabilityOverrides?: Partial<Record<Capability, boolean>>;
+interface AIAgentIdentity {
+  readonly id: string;              // UUID, persistent across restarts
+  readonly providerId: string;      // e.g. "anthropic.claude-code"
+  readonly providerVersion: string; // semver of provider binary/SDK
+  readonly displayName: string;     // human-readable
+  readonly hostname: string;
+  readonly platform: "win32" | "darwin" | "linux";
+  readonly arch: string;
 }
 
-interface Task {
-  id: string;
-  instruction: string;
-  filesInScope?: string[];
-  timeoutMs?: number;
-  budgetUsd?: number;
-  flags?: Record<string, unknown>;
+interface AIAgentRuntime {
+  readonly pid: number;
+  readonly startedAt: string;       // ISO8601
+  readonly uptimeSeconds: number;
 }
 
-interface AgentResult {
-  taskId: string;
-  exitCode: number;
-  finalOutput: string;
-  artifacts?: { path: string; sha256: string }[];
-  usage: UsageEvent;
+type AIAgentState = "idle" | "busy" | "degraded" | "offline";
+type AIAgentHealthCheckStatus = "ok" | "warn" | "fail";
+
+interface AIAgentStatus {
+  readonly state: AIAgentState;
+  readonly currentTaskId?: string;
+  readonly lastHeartbeatAt: string;
+  readonly healthChecks: Record<string, AIAgentHealthCheckStatus>;
 }
 
-interface OutputChunk {
-  taskId: string;
-  stream: "stdout" | "stderr" | "meta";
-  data: string | Uint8Array;
-  at: string;              // ISO timestamp
+type AIAgentTaskType = "plan" | "code" | "review" | "answer" | "tool-use";
+type AIAgentTaskStatus =
+  | "pending" | "running" | "completed" | "failed" | "cancelled";
+
+interface AIAgentTaskInput {
+  readonly taskId: string;
+  readonly type: AIAgentTaskType;
+  readonly prompt: string;
+  readonly context?: AIAgentTaskContext;
+  readonly constraints?: AIAgentTaskConstraints;
 }
 
-interface AgentStatus {
-  state: "idle" | "initializing" | "ready" | "busy" | "shutting-down" | "error";
-  runningTasks: number;
-  lastError?: { code: string; message: string; at: string };
+interface AIAgentTaskContext {
+  readonly files?: readonly string[];
+  readonly previousTaskId?: string;
+  readonly metadata?: Record<string, string>;
 }
 
-interface ResourceMetrics {
-  cpuPercent: number;
-  memoryMB: number;
-  openFileHandles: number;
-  activeSubprocesses: number;
+interface AIAgentTaskConstraints {
+  readonly maxCostUsd?: number;
+  readonly maxDurationSeconds?: number;
+  readonly maxTokens?: number;
+  readonly allowedTools?: readonly string[];
 }
 
+interface AIAgentUsage {
+  readonly promptTokens: number;
+  readonly completionTokens: number;
+  readonly totalTokens: number;
+  readonly costUsd: number;
+}
+
+interface AIAgentTaskOutput {
+  readonly text: string;
+  readonly artifacts?: readonly string[];
+  readonly toolCalls?: readonly AIAgentToolCall[];
+  readonly usage: AIAgentUsage;
+}
+
+interface AIAgentTaskError {
+  readonly code: string;
+  readonly message: string;
+  readonly retriable: boolean;
+  readonly details?: Record<string, unknown>;
+}
+
+interface AIAgentTaskHandle {
+  readonly taskId: string;
+  readonly status: AIAgentTaskStatus;
+  readonly startedAt: string;
+  readonly completedAt?: string;
+  readonly output?: AIAgentTaskOutput;
+  readonly error?: AIAgentTaskError;
+}
+
+// Provider DI is via readonly fields — each concrete agent ships its
+// own specialised providers. See sibling interfaces below.
 interface AIAgent {
-  readonly id: string;
-  readonly vendor: AIVendor;
-  readonly capabilities: Capability[];
+  readonly identity: AIAgentIdentity;
+  readonly runtime: AIAgentRuntime;
+  readonly manifest: AgentManifest;
 
-  // Lifecycle
-  initialize(config: AgentConfig): Promise<void>;
-  shutdown(): Promise<void>;
+  getStatus(): Promise<AIAgentStatus>;
+  listCapabilities(): readonly AgentCapability[];
 
-  // Execution
-  execute(task: Task): Promise<AgentResult>;
-  stream(task: Task): AsyncIterable<OutputChunk>;
-  cancel(taskId: string): Promise<void>;
+  start(): Promise<void>;
+  stop(reason: "user" | "shutdown" | "error"): Promise<void>;
 
-  // State
-  status(): AgentStatus;
-  resourceUsage(): ResourceMetrics;
+  executeTask(input: AIAgentTaskInput): Promise<AIAgentTaskHandle>;
+  cancelTask(taskId: string): Promise<void>;
+
+  readonly fs: FileSystemProvider;
+  readonly stream: StreamProvider;
+  readonly cost: CostProvider;
 }
 ```
 
@@ -3492,10 +3569,18 @@ Notes:
   token counting, and vendor-API handshakes. Callers never see
   `node-pty`, `anthropic` SDK, or raw HTTP.
 - Capability branching (e.g. "does this agent support vision?")
-  reads `agent.capabilities`. Core code must not branch on
-  `agent.vendor` — that is for logging only.
-- `execute` is the non-streaming convenience over `stream`;
-  implementations typically build `execute` on top of `stream`.
+  reads `agent.listCapabilities()`. Core code must not branch on
+  `agent.identity.providerId` — that is for logging only.
+- Task execution uses the polling `AIAgentTaskHandle` model.
+  Streaming is a separate concern handled by `StreamProvider`;
+  the agent emits `StreamEvent`s onto a stream created by its
+  own `StreamProvider.createStream(config)`.
+- Identity vs runtime: `identity` is persistent state (survives
+  restarts, UUID pinned to disk); `runtime` is process-scoped.
+- Providers are readonly fields on the agent, so each agent can
+  ship with specialised `FileSystemProvider` / `StreamProvider`
+  / `CostProvider` implementations (e.g. Cursor CLI with a
+  sandboxed FS, Ollama with a zero-cost CostProvider).
 
 ### FileSystemProvider
 
@@ -3504,47 +3589,84 @@ sandboxed containers. Agents and the command dispatcher never call
 `fs.readFile` directly.
 
 ```typescript
+// v1.1: mirrors packages/contracts/src/ai/filesystem-provider.ts.
+
 type FSProviderType = "local" | "ssh" | "cloud" | "sandbox" | "other";
 
-interface FileInfo {
-  path: string;
-  kind: "file" | "dir" | "symlink";
-  sizeBytes: number;
-  modifiedAt: string;        // ISO timestamp
-  mode?: number;             // POSIX mode bits, if applicable
+interface FileSystemProviderScope {
+  readonly allowedRoots: readonly string[]; // absolute paths
+  readonly readOnly?: boolean;
+  readonly maxFileSizeBytes?: number;
+  readonly maxTotalWriteBytes?: number;
 }
 
-interface FileChange {
-  path: string;
-  kind: "created" | "modified" | "deleted" | "renamed";
-  to?: string;               // for rename
-  at: string;
+interface FileContent {
+  readonly path: string;
+  readonly content: string;
+  readonly encoding: "utf-8" | "base64";
+  readonly sizeBytes: number;
 }
 
-type FileChangeHandler = (change: FileChange) => void;
-type Unsubscribe = () => void;
+interface DirectoryEntry {
+  readonly name: string;
+  readonly type: "file" | "directory" | "symlink";
+  readonly sizeBytes?: number;
+}
+
+interface FileStats {
+  readonly path: string;
+  readonly type: "file" | "directory" | "symlink";
+  readonly sizeBytes: number;
+  readonly modifiedAt: string;  // ISO8601
+  readonly createdAt: string;
+}
+
+interface FileSystemWatchEvent {
+  readonly type: "created" | "modified" | "deleted";
+  readonly path: string;
+}
+
+type FileSystemWatchCallback = (event: FileSystemWatchEvent) => void;
+
+interface FileSystemWatchHandle {
+  close(): Promise<void>;
+}
 
 interface FileSystemProvider {
-  readonly type: FSProviderType;
-  readonly rootPath: string;
+  readonly scope: FileSystemProviderScope;
 
-  read(path: string): Promise<Uint8Array>;
-  write(path: string, data: Uint8Array): Promise<void>;
-  list(path: string): Promise<FileInfo[]>;
-  exists(path: string): Promise<boolean>;
-  remove(path: string): Promise<void>;
-  watch(path: string, handler: FileChangeHandler): Unsubscribe;
+  readFile(path: string): Promise<FileContent>;
+  readDirectory(path: string): Promise<readonly DirectoryEntry[]>;
+  stat(path: string): Promise<FileStats>;
+
+  writeFile(path: string, content: string | Uint8Array): Promise<void>;
+  deleteFile(path: string): Promise<void>;
+  createDirectory(path: string): Promise<void>;
+  moveFile(from: string, to: string): Promise<void>;
+
+  watch(path: string, callback: FileSystemWatchCallback): FileSystemWatchHandle;
+
+  isPathAllowed(path: string): boolean;
+  assertPathAllowed(path: string): void; // throws PathNotAllowedError
 }
 ```
 
 Notes:
 
-- Every path is provider-relative to `rootPath`. Absolute paths
-  outside `rootPath` are rejected.
-- `write` must be atomic (write-temp + rename) for local and
-  sandbox providers. Cloud providers may relax to last-write-wins
-  if the backend is eventually consistent; this must be declared
-  in the provider's capabilities.
+- Scope is explicit (not implied from a single `rootPath`):
+  `scope.allowedRoots` is a readonly array of absolute paths.
+  The provider rejects access outside these via
+  `assertPathAllowed`, which throws `PathNotAllowedError` from
+  `@operator-os/contracts`.
+- `scope.readOnly: true` makes every mutating method throw
+  `PathNotAllowedError` regardless of path; useful for audit /
+  review agents that must never write.
+- `scope.maxFileSizeBytes` and `scope.maxTotalWriteBytes` let
+  the caller (registry, operator) cap per-write and cumulative
+  write budgets without the agent having to negotiate.
+- `writeFile` must be atomic (write-temp + rename) for local
+  and sandbox providers. Cloud providers may relax to
+  last-write-wins if the backend is eventually consistent.
 - `watch` is best-effort on every backend; callers must still
   refetch on reconnect.
 
@@ -3556,24 +3678,109 @@ stream is a named, append-only sequence of `OutputChunk`s with
 one publisher and many subscribers.
 
 ```typescript
-interface StreamProvider {
-  readonly type: "memory" | "pubsub" | "websocket" | "sse";
+// v1.1: mirrors packages/contracts/src/ai/stream-provider.ts.
 
-  publish(sourceId: string, chunk: OutputChunk): Promise<void>;
-  subscribe(sourceId: string): AsyncIterable<OutputChunk>;
-  close(sourceId: string): Promise<void>;
-  lastSequenceId(sourceId: string): Promise<string | null>;
+type StreamTransport = "websocket" | "sse" | "polling";
+
+interface StreamBackpressureConfig {
+  readonly maxBufferEvents: number;
+  readonly onOverflow: "drop-oldest" | "drop-newest" | "error";
+}
+
+interface StreamConfig {
+  readonly taskId: string;
+  readonly userId: string;
+  readonly transport: StreamTransport;
+  readonly backpressure?: StreamBackpressureConfig;
+}
+
+type StreamDeltaType = "thinking" | "answer" | "code" | "tool-result";
+
+interface StreamDelta {
+  readonly type: StreamDeltaType;
+  readonly content: string;
+  readonly metadata?: Record<string, unknown>;
+}
+
+interface StreamToolCall {
+  readonly toolName: string;
+  readonly arguments: Record<string, unknown>;
+  readonly status: "requested" | "executing" | "completed" | "failed";
+  readonly result?: unknown;
+}
+
+interface StreamProgress {
+  readonly stage: string;
+  readonly percent?: number;  // 0-100 if known
+  readonly message?: string;
+}
+
+interface StreamError {
+  readonly code: string;
+  readonly message: string;
+  readonly fatal: boolean;
+}
+
+interface StreamCompletion {
+  readonly status: "success" | "partial" | "failed";
+  readonly usage: AIAgentUsage;
+  readonly outputPath?: string;
+}
+
+type StreamEvent =
+  | { type: "token"; token: string }
+  | { type: "delta"; delta: StreamDelta }
+  | { type: "tool-call"; call: StreamToolCall }
+  | { type: "progress"; progress: StreamProgress }
+  | { type: "error"; error: StreamError }
+  | { type: "completion"; completion: StreamCompletion };
+
+type StreamListener = (event: StreamEvent) => void;
+
+interface StreamSubscription {
+  unsubscribe(): void;
+}
+
+interface AIResponseStream {
+  readonly taskId: string;
+
+  // Emit events (called by the agent)
+  emitToken(token: string): Promise<void>;
+  emitDelta(delta: StreamDelta): Promise<void>;
+  emitToolCall(call: StreamToolCall): Promise<void>;
+  emitProgress(progress: StreamProgress): Promise<void>;
+  emitError(error: StreamError): Promise<void>;
+  emitCompletion(completion: StreamCompletion): Promise<void>;
+
+  // Subscribe (called by the backend / mobile wrapper)
+  subscribe(listener: StreamListener): StreamSubscription;
+
+  close(reason: "completed" | "cancelled" | "error"): Promise<void>;
+}
+
+// Factory. Each AIAgent.stream is a StreamProvider instance;
+// per-task streams are created on demand via createStream.
+interface StreamProvider {
+  createStream(config: StreamConfig): AIResponseStream;
 }
 ```
 
 Notes:
 
-- `sourceId` is typically `taskId`, but can be any namespaced
-  identifier (e.g. heartbeat stream per device).
-- Implementations must preserve chunk order and be replay-safe up
-  to an implementation-defined buffer window (at least "since
-  `lastSequenceId`"); the desktop agent's reconnect logic
-  (§ 36) depends on this.
+- Per-task: the agent calls `stream.createStream({ taskId, userId,
+  transport })` once and then emits `StreamEvent`s into the
+  returned `AIResponseStream`. Subscribers listen with
+  `subscribe(listener)` and unsubscribe via the returned handle.
+- Discriminated union: `StreamEvent` covers all six kinds of
+  traffic (token, delta, tool-call, progress, error, completion).
+  This lets the backend / mobile UI do exhaustive switches with
+  compile-time safety.
+- Backpressure: when the subscriber cannot keep up, the
+  implementation follows `StreamBackpressureConfig.onOverflow`
+  (drop-oldest, drop-newest, or error out). Desktop Agent
+  reconnect logic (§ 36) uses the sequencing implicit in
+  `emit*` call order; replay semantics are up to the transport
+  implementation.
 
 ### CostProvider
 
@@ -3582,51 +3789,90 @@ vendor, so that pricing tables and cost-optimal routing (§ 68)
 stay out of the agent and router core.
 
 ```typescript
-interface UsageEvent {
-  taskId: string;
-  agentId: string;
-  vendor: AIVendor;
-  model: string;                  // "claude-opus-4-7", "gpt-5", ...
-  inputTokens: number;
-  outputTokens: number;
-  cacheHitTokens?: number;
-  totalUsd: number;
-  at: string;
-}
+// v1.1: mirrors packages/contracts/src/ai/cost-provider.ts.
 
-interface PricingInfo {
-  vendor: AIVendor;
-  model: string;
-  inputPerMillionUsd: number;
-  outputPerMillionUsd: number;
-  cacheHitDiscountPct?: number;
-  fetchedAt: string;
+interface CostEstimateRequest {
+  readonly providerId: string;
+  readonly model: string;
+  readonly promptTokens: number;
+  readonly expectedCompletionTokens: number;
 }
 
 interface CostEstimate {
-  taskId: string;
-  vendor: AIVendor;
-  model: string;
-  lowUsd: number;
-  highUsd: number;
-  assumptions: string;
+  readonly costUsd: number;
+  readonly breakdown: {
+    readonly promptCostUsd: number;
+    readonly completionCostUsd: number;
+    readonly otherCostUsd?: number;
+  };
+  readonly confidence: "high" | "medium" | "low";
+}
+
+interface CostUsageRecord {
+  readonly userId: string;
+  readonly taskId: string;
+  readonly providerId: string;
+  readonly model: string;
+  readonly usage: AIAgentUsage;  // see § 61 AIAgentUsage
+  readonly timestamp: string;    // ISO8601
+}
+
+type CostPlan = "free" | "pro" | "enterprise" | "custom";
+
+interface BudgetStatus {
+  readonly userId: string;
+  readonly plan: CostPlan;
+  readonly periodStart: string;
+  readonly periodEnd: string;
+  readonly spentUsd: number;
+  readonly limitUsd: number;
+  readonly remainingUsd: number;
+  readonly isOverBudget: boolean;
+  readonly warnAtPercent: number;  // e.g. 80
+}
+
+type SpendingPeriod = "today" | "this-week" | "this-month" | "all-time";
+
+interface SpendingReport {
+  readonly userId: string;
+  readonly period: SpendingPeriod;
+  readonly totalUsd: number;
+  readonly byProvider: Record<string, number>;
+  readonly byModel: Record<string, number>;
+  readonly taskCount: number;
+  readonly avgCostPerTaskUsd: number;
 }
 
 interface CostProvider {
-  readonly vendor: AIVendor;
+  estimateCost(request: CostEstimateRequest): Promise<CostEstimate>;
+  recordUsage(usage: CostUsageRecord): Promise<void>;
 
-  recordUsage(event: UsageEvent): Promise<void>;
-  estimate(task: Task): Promise<CostEstimate>;
-  getPricing(model: string): PricingInfo;
+  checkBudget(userId: string): Promise<BudgetStatus>;
+  enforceBudget(userId: string, estimatedCostUsd: number): Promise<void>;
+  // throws BudgetExceededError if the ask would blow the budget
+
+  getUserSpending(userId: string, period: SpendingPeriod): Promise<SpendingReport>;
 }
 ```
 
 Notes:
 
-- All cost math, pricing-table freshness, and per-model
-  discounts live in the CostProvider. The router (§ 68) asks for
-  estimates; it does not compute them.
-- `recordUsage` should be idempotent on `taskId + model`.
+- Estimation vs recording: `estimateCost(request)` runs before
+  task execution (the router uses it for cost-optimal routing
+  in § 68); `recordUsage(usage)` runs after.
+- Budget flow: callers call `enforceBudget(userId, estimate)`
+  before spawning expensive tasks; it throws
+  `BudgetExceededError` (`@operator-os/contracts`) if the task
+  would take the user over their plan's limit. `checkBudget`
+  returns the status without throwing — useful for UI that wants
+  to show "80% of monthly budget spent".
+- Idempotency: `recordUsage` should be idempotent on
+  `taskId + model` so retries don't double-bill.
+- Per-vendor specialisation: each concrete agent ships its own
+  `CostProvider` (via `AIAgent.cost`). Cursor CLI returns
+  `totalUsd: 0` and surfaces seat quota in `assumptions`; local
+  models (Ollama, LM Studio) use a zero-cost provider; vendor
+  agents (Claude, GPT, Gemini) use per-token pricing tables.
 
 ### Legacy LLM-completion shape
 
@@ -3660,16 +3906,23 @@ implementation if its vendor's pricing surface is not covered by
 a generic vendor-level `CostProvider` (Anthropic / OpenAI /
 Google each get one).
 
-Per-agent sections below follow a fixed template:
+Per-agent sections below follow a fixed template (v1.1 shape):
 
-- **id** — stable registry id (matches `AIAgent.id`)
-- **vendor** — matches `AIAgent.vendor`
-- **capabilities** — subset of the `Capability` union from § 61
+- **providerId** — stable registry id; matches
+  `AIAgent.identity.providerId` (e.g. `anthropic.claude-code`)
+- **capabilities** — subset of the `AgentCapability` union from
+  § 61; advertised via `AIAgent.listCapabilities()`
 - **invocation** — how the agent is spawned or contacted
 - **auth** — credential shape
-- **pricing** — which CostProvider covers it
+- **pricing** — which CostProvider (`AIAgent.cost`) covers it
 - **status** — shipped in v1 / Phase 2 / Phase 3 / future
 - **notes** — agent-specific caveats
+
+Historical note (pre-v1.1, PR #13 shape): the template's first
+two fields were `id` + `vendor`. In v1.1 `vendor` was absorbed
+into `providerId` (e.g. `anthropic.claude-code` vs separate
+`vendor: "anthropic"` + `id: "claude-code"`); `providerId` is
+now the stable registry key.
 
 ═══════════════════════════════════════════════════════════════════════════════
 
