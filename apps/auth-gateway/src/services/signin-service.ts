@@ -12,6 +12,7 @@ import type { UsersRepository } from './users-repository.js';
 export interface SigninInput {
   idToken: string;
   userAgent?: string;
+  requestLogger?: FastifyBaseLogger;
 }
 
 /**
@@ -42,7 +43,11 @@ export class SigninService {
   }
 
   async signin(input: SigninInput): Promise<SigninResponse> {
-    const identity = await this.#googleVerifier.verify(input.idToken);
+    const logger = input.requestLogger ?? this.#logger;
+    const identity = await this.#googleVerifier.verify(
+      input.idToken,
+      logger
+    );
 
     const user = await this.#usersRepository.upsertByGoogleSubject({
       googleSubject: identity.subject,
@@ -58,7 +63,7 @@ export class SigninService {
       userAgent: input.userAgent
     });
 
-    this.#logger.info(
+    logger.info(
       {
         userId: user.id,
         googleSubject: identity.subject,

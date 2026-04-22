@@ -18,9 +18,44 @@ export const operatorUserSchema = z.object({
   lastSeenAt: isoTimestampSchema.optional()
 });
 
+/**
+ * Google ID tokens are compact JWTs: three base64url segments
+ * (`header.payload.signature`) separated by a literal `.`. The
+ * base64url alphabet is `A-Z a-z 0-9 - _`. No whitespace, no padding
+ * `=`, no other characters are ever legal inside a real token.
+ *
+ * Clients that copy tokens out of browser UIs (OAuth Playground,
+ * sign-in consoles) routinely end up pasting a string with embedded
+ * line-wrap newlines, trailing whitespace, or BOMs. Those are never
+ * valid JWT characters but we sanitise defensively rather than
+ * failing downstream inside google-auth-library with a misleading
+ * error (see TD-013).
+ *
+ * We strip **all** whitespace before validation. `\t`, `\n`, `\r`,
+ * zero-width characters in the `\s` class, etc. are all removed.
+ * Then we require exactly three base64url segments joined by `.`.
+ */
+const jwtShape = /^[A-Za-z0-9_\-=]+\.[A-Za-z0-9_\-=]+\.[A-Za-z0-9_\-=]+$/;
+
+export const sanitizedJwtSchema = z
+  .string()
+  .min(1, { message: 'idToken is required' })
+  .transform((value) => value.trim().replace(/\s+/g, ''))
+  .refine((value) => value.length > 0, {
+    message: 'idToken was empty after whitespace sanitisation'
+  })
+  .refine((value) => value.split('.').length === 3, {
+    message:
+      'idToken must have exactly three dot-separated segments (header.payload.signature)'
+  })
+  .refine((value) => jwtShape.test(value), {
+    message:
+      'idToken segments must use base64url characters (A-Z, a-z, 0-9, -, _) only'
+  });
+
 export const signinRequestSchema = z.object({
   provider: z.literal('google').default('google'),
-  idToken: z.string().min(1)
+  idToken: sanitizedJwtSchema
 });
 
 export const accessTokenPayloadSchema = z.object({
