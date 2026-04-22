@@ -9,6 +9,7 @@
     "@operator-os/config": "workspace:*",
     "@operator-os/contracts": "workspace:*",
     "dotenv": "^17.2.3",
+    "execa": "^9.0.0",
     "pino": "^10.1.0",
     "ws": "^8.20.0"
   },
