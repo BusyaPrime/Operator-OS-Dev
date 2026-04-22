@@ -48,7 +48,7 @@ steps:
           --image="europe-west4-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:${_IMAGE_TAG}" \
           --platform=managed \
           --service-account="cloudrun-runtime@${PROJECT_ID}.iam.gserviceaccount.com" \
-          --no-allow-unauthenticated \
+          --allow-unauthenticated \
           --port=8080 \
           --set-env-vars="NODE_ENV=production,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},GOOGLE_CLOUD_REGION=${_GOOGLE_CLOUD_REGION},FIREBASE_PROJECT_ID=${_FIREBASE_PROJECT_ID},VERTEX_LOCATION=${_VERTEX_LOCATION},VERTEX_MODEL=${_VERTEX_MODEL},BIGQUERY_DATASET=${_BIGQUERY_DATASET},CLOUD_TASKS_LOCATION=${_CLOUD_TASKS_LOCATION},TASKS_TARGET_BASE_URL=${_TASKS_TARGET_BASE_URL}"
 
