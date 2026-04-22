@@ -1370,3 +1370,161 @@ References:
 - Sibling ADR *SPEC §61-66.7 Evolves To Match
   packages/contracts Implementation* (the evolution this
   testing convention guards).
+
+## Desktop Agent Phase 1.4 Uses Incremental Migration, Not Rewrite
+
+Decided: 2026-04-24 (Week 2 Phase 1.4, Gate 1.4.B approval)
+
+Decision:
+
+- Land Universal AI agents, providers, registry, and additive
+  heartbeat **alongside** the existing 13 files under
+  `apps/desktop-agent/src/` rather than in a parallel
+  `apps/desktop-agent-next/` tree that swaps in at the end.
+
+Why:
+
+- The existing runtime (HeartbeatLoop, CommandPoller,
+  SessionManager, ExportManager, SafeCommandExecutor, Notifier)
+  already talks to the api on production endpoints that mobile
+  + api expect to continue working. A greenfield rewrite means
+  every one of those integration points becomes a fresh
+  integration bug at cutover time.
+- A parallel package would also need its own ci + deploy
+  plumbing (Docker build, signing, worker pool wiring) just
+  to run an in-progress refactor. That's meaningful cost for
+  no user-visible benefit during phase 1.4.
+- The new layer is **additive**: AgentRegistry + agents +
+  AgentHeartbeatLoop bolt onto `DesktopRuntime` through new
+  constructor branches and new getters. The device-state
+  heartbeat keeps posting to the legacy endpoint; the
+  agent-centric heartbeat posts to a new endpoint (TD-024)
+  that doesn't yet exist, so backoff is the worst that
+  happens until the api side lands.
+- Testing is easier with the incremental path: 11 existing
+  test files kept passing across every commit (c1..c14),
+  which means a bisect against any regression shows exactly
+  which addition caused it. A big-bang switch hides that.
+
+Alternatives considered:
+
+- **Parallel `apps/desktop-agent-next/` tree with cutover PR.**
+  Rejected on cost + risk grounds described above.
+- **Rip-and-replace: delete `HeartbeatLoop`, wire the new
+  `AgentHeartbeatLoop` to post both schemas to the same
+  endpoint.** Rejected — the mobile + api expectations are
+  already frozen around the device-state shape. Deferring a
+  schema consolidation until the api grows an
+  `/v1/agent/heartbeat/agent` endpoint and both sides handle
+  both shapes keeps the migration boring.
+- **Code freeze on the existing runtime until Phase 1.5.**
+  Rejected — it blocks shipping agent work for zero benefit
+  and makes the cutover PR huge.
+
+Consequences:
+
+- The repository now contains two live heartbeat loops that
+  serve different shapes. Documented in the "Agent Heartbeat
+  Schema Is Additive" ADR (older dated entry). The
+  concurrency is bounded: once TD-024 closes and mobile +
+  api converge on a single shape, the older loop retires
+  (tracked as TD-024's completion criterion).
+- `DesktopRuntime` grew a phase-1.4-specific section with
+  three new fields (`#agentRegistry`, `#agents`,
+  `#agentHeartbeatLoop`) and two new exposed getters
+  (`agents`, `agentRegistry`). The incremental approach
+  accepts that the class is temporarily larger in exchange
+  for simpler diffs at each step.
+- 11 additional test files (provider triad + registry pair +
+  claude-code-agent + heartbeat + runtime-bootstrap) sit
+  side-by-side with the legacy `runtime.test.ts`. The legacy
+  test stays in place until the modules it covers retire.
+
+References:
+
+- `apps/desktop-agent/src/runtime.ts` — the concrete wiring.
+- Sibling ADR *Agent Heartbeat Schema Is Additive, Not
+  Replacement* (2026-04-24) — the same rationale applied to
+  the heartbeat wire format specifically.
+
+## Desktop Agent Validates Heartbeat Payloads At Runtime
+
+Decided: 2026-04-24 (Week 2 Phase 1.4, Gate 1.4.B approval)
+
+Decision:
+
+- Parse every outbound `AgentHeartbeatRequest` body through
+  `agentHeartbeatRequestSchema` before it is posted, and every
+  inbound response body through `agentHeartbeatResponseSchema`
+  before it is acted on.
+
+Why:
+
+- The heartbeat body is assembled from `AIAgent.getStatus()` +
+  identity + runtime state. Any of those sources can drift
+  (a future `providerVersion` change, a new health-check key,
+  a typo in a field rename) and a drift shows up at the api
+  as a generic 400. Catching drift at the producer means
+  better log context and a local stack trace.
+- The heartbeat endpoint doesn't exist yet (TD-024); during
+  the interim, the loop is particularly sensitive to gateway
+  proxies returning HTML error pages. Zod-parsing the inbound
+  body rejects "200 with an HTML page that looks like a login
+  redirect" — which would otherwise be a false-positive
+  success — and counts it as a failure, so the backoff +
+  degraded-state machinery still protects the agent.
+- Runtime validation is the repo's existing pattern at every
+  I/O boundary (`apps/api` uses Zod on every body + query,
+  `packages/contracts` colocates Zod schemas with type
+  exports). The desktop agent is currently the one place
+  where outbound bodies leave without a parse step; this
+  closes that gap for the new heartbeat path specifically.
+- Cost is negligible: the heartbeat body has eight fields,
+  posted at most once per `HEARTBEAT_INTERVAL_MS` per
+  registered agent. No hot path is affected.
+
+Alternatives considered:
+
+- **Trust TypeScript types and skip the parse.** Rejected —
+  types are erased at runtime, and the failure mode when a
+  drift slips is "server returns 400 with no useful context".
+  The amount of time saved by skipping the parse is dwarfed
+  by the debugging time saved when drift is caught locally.
+- **Parse outbound only; trust inbound.** Rejected — the
+  inbound path carries server-issued commands
+  (`pause`/`resume`/`shutdown`/`update-config`). Acting on
+  an unvalidated command shape is a trust-boundary violation;
+  even while those commands are logged-only in phase 1.4,
+  the validation guard lands now so removing it later is a
+  visible change, not a silent one.
+- **Parse only in dev / log a warning in prod.** Rejected —
+  the failure mode (agent acts on a malformed server command
+  and self-destructs) is too consequential to gate on a build
+  flag. The cost of production parsing is zero in practice.
+
+Consequences:
+
+- `AgentHeartbeatLoop.#emitFor` throws on malformed
+  out-or-inbound bodies, which the outer `try/catch` folds
+  into the standard failure path (backoff + threshold
+  transitions). No special-case code was added — the same
+  threshold logic that handles a 500 handles a drift.
+- A new health-check key added to `AIAgent.getStatus()`
+  flows through the heartbeat automatically as long as it
+  fits the `healthChecks: Record<string, 'ok'|'warn'|'fail'>`
+  shape. If a future agent needs to report a new status
+  value (e.g. `'unknown'`), the schema enum and both ends
+  update together — caught in PR review by a failing test.
+- Tests exercise the drift path explicitly ("counts a
+  malformed response body as a failure"), so the guard is
+  load-bearing rather than cosmetic.
+
+References:
+
+- `apps/desktop-agent/src/heartbeat/agent-heartbeat-loop.ts`
+  — the two `schema.parse(...)` call sites.
+- `packages/contracts/src/agent/heartbeat.ts` — the schemas
+  being applied.
+- Sibling ADR *Agent Heartbeat Schema Is Additive, Not
+  Replacement* (2026-04-24) — explains why the loop exists
+  at all.
