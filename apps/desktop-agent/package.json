@@ -9,7 +9,9 @@
     "@operator-os/config": "workspace:*",
     "@operator-os/contracts": "workspace:*",
     "dotenv": "^17.2.3",
-    "pino": "^10.1.0"
+    "execa": "^9.0.0",
+    "pino": "^10.1.0",
+    "ws": "^8.20.0"
   },
   "scripts": {
     "build": "pnpm exec tsc -p tsconfig.json",
@@ -18,5 +20,8 @@
     "start": "node dist/main.js",
     "test": "pnpm exec vitest run",
     "typecheck": "pnpm exec tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.1"
   }
 }

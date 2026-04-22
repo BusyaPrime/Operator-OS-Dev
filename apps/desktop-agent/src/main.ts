@@ -33,4 +33,7 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   });
 }
 
-runtime.start();
+void runtime.start().catch((err) => {
+  logger.error({ err }, 'desktop runtime failed to start');
+  process.exit(1);
+});

@@ -1268,3 +1268,213 @@ waits for an EOF that sometimes doesn't arrive promptly.
 - 2026-04-24: filed after observing the second occurrence on
   smoke test 5. Functional deploys are working; this TD is
   about the GitHub Actions workflow signal quality only.
+
+## TD-022: api `/v1/cost/*` endpoints not implemented
+
+Discovered: 2026-04-24 (Week 2 Phase 1.4 commit c6)
+Type: missing-feature
+Priority: P2
+Status: open
+
+### Description
+
+`apps/desktop-agent/src/providers/api-cost-provider.ts` (the
+`CostProvider` implementation shipped with every `AIAgent`)
+expects the api to expose cost-related endpoints:
+
+- `GET /v1/cost/estimate` — pre-task cost estimate.
+- `POST /v1/cost/usage` — record actual token + cost usage.
+- `GET /v1/cost/budget/:userId` — per-user budget status.
+- `POST /v1/cost/enforce` — throw BudgetExceededError if over.
+- `GET /v1/cost/spending/:userId` — aggregated reports.
+
+None of these exist on the api today. `ApiCostProvider` ships
+a stub set per Decision 1 (2026-04-24): estimate returns zero
+with `confidence='low'`; recordUsage logs only; checkBudget
+returns `MAX_SAFE_INTEGER` limit; enforceBudget no-ops;
+getUserSpending throws `AIAgentError('COST_ENDPOINT_UNAVAILABLE')`
+because a zeroed spending report would misrepresent to a UI.
+
+### Risk if unaddressed
+
+- Budget enforcement is a no-op. Any agent run that would have
+  been rejected on cost grounds executes instead. For local
+  dev + the internal operator that's acceptable; for any
+  external user, it is not.
+- Cost telemetry is lost. Every task's token counts live only
+  in the desktop agent's pino log and cannot be aggregated
+  into billing or usage dashboards.
+- When mobile ships a spending view, it will fail with
+  `COST_ENDPOINT_UNAVAILABLE` until these endpoints land.
+  That's the designed fail-loudly posture (intentionally not
+  a stub), but it means the feature is blocked on the api.
+
+### Proposed fix
+
+1. Add the endpoints to `apps/api/src/routes/ai/cost.ts`
+   (new file), backed by a Firestore `costUsage` collection
+   + a `userBudgets` doc per user.
+2. Replace stub branches in `ApiCostProvider` with real
+   `fetch`-based calls. Outbound Zod-parse per project
+   pattern; response Zod-parse too.
+3. Wire a small pricing table keyed by `providerId` + `model`.
+   Anthropic + OpenAI public pricing for seed data.
+4. Delete the `AIAgentError('COST_ENDPOINT_UNAVAILABLE')`
+   throw in `getUserSpending`; its existence was a deliberate
+   failing door to this TD.
+
+### Related
+
+- `apps/desktop-agent/src/providers/api-cost-provider.ts` —
+  the stub (search "TD-022" for every branch that will change).
+- `packages/contracts/src/ai/cost-provider.ts` — the
+  interface the real endpoints must honour.
+- Phase 1.4 Decision 1 (2026-04-24) — records why stubs
+  were chosen over "fail loud everywhere".
+
+### History
+
+- 2026-04-24: filed when the stub provider landed in c6 of
+  Phase 1.4. Scope of the fix is not trivial (schema,
+  Firestore model, pricing table) — scheduled for a later
+  phase that focuses on billing observability.
+
+## TD-023: Evaluate node-pty for raw-terminal agent streaming
+
+Discovered: 2026-04-24 (Week 2 Phase 1.4 design)
+Type: research
+Priority: P3
+Status: open
+
+### Description
+
+`ClaudeCodeAgent` (phase 1.4) drives the `claude` CLI via
+`execa` with `--output-format json`. That gives a single
+final JSON document per task; streaming tokens to the UI
+depends on `--output-format stream-json`, which emits JSONL
+but still through stdout pipes.
+
+For two classes of agent we don't yet support, `execa`
+isn't sufficient:
+
+- **Truly interactive CLIs** (e.g. any CLI that wants a TTY
+  to render colour / progress bars correctly; anything
+  expecting terminal resize events).
+- **Agents that need pseudoterminal fidelity** — if in the
+  future an agent spawns a REPL-style flow that depends on
+  terminal-attached behaviour.
+
+`node-pty` is the standard answer for both. It is also a
+native build (node-gyp), which means non-trivial packaging
+decisions for the desktop agent's eventual signed installers.
+
+### Risk if unaddressed
+
+- Claude Code specifically works with execa + stream-json,
+  so there is no immediate blocker. Deferring is fine.
+- Future agent adapters (Cursor CLI, Gemini CLI) may surface
+  pty-only behaviours when tested end-to-end. Without a
+  decision on node-pty, each integration would re-debate the
+  same question.
+
+### Proposed fix
+
+1. Spike: wire up `node-pty` in a branch, run Claude Code
+   stream-json through it, compare CPU + latency to the
+   execa path.
+2. Decide whether to ship `node-pty` by default, make it
+   opt-in per-agent via a manifest hint, or skip entirely
+   until a real blocker surfaces.
+3. If shipping, document the signed-installer implications
+   in `docs/DEPLOY.md` (native binding → per-platform
+   prebuilt binaries).
+
+### Related
+
+- `apps/desktop-agent/src/agents/claude-code-agent/claude-code-agent.ts`
+  — currently uses execa.
+- `packages/contracts/src/ai/stream-provider.ts` — the
+  interface pty output would still flow through.
+
+### History
+
+- 2026-04-24: filed during Phase 1.4 research, deferred
+  because execa path is sufficient for the first
+  first-party agent.
+
+## TD-024: api `/v1/agent/heartbeat/agent` endpoint missing
+
+Discovered: 2026-04-24 (Week 2 Phase 1.4 commit c12)
+Type: missing-feature
+Priority: P2
+Status: open
+
+### Description
+
+The Desktop Agent's new `AgentHeartbeatLoop` (Phase 1.4)
+posts additive per-agent heartbeats to
+`POST /v1/agent/heartbeat/agent`. The endpoint does not
+exist on `apps/api`. Today, the loop will hit the api, get
+back a 404, count that as a failure, and exponentially back
+off. The agent continues to operate — the existing
+device-state heartbeat (`POST /v1/agent/heartbeat`) is
+unaffected (see the *Agent Heartbeat Schema Is Additive,
+Not Replacement* ADR, 2026-04-24).
+
+The additive approach means this TD is purely about
+enabling agent-centric observability (active task count,
+per-check health, provider version telemetry) — not about
+rescuing a broken production path.
+
+### Risk if unaddressed
+
+- Agent-centric observability stays dark. Admins cannot
+  see, from the api side, whether an agent is idle / busy
+  / degraded / offline — only device-level liveness.
+- `registry.notifyStateChanged('degraded')` events fire on
+  the desktop agent based on *remote* heartbeat failures,
+  and right now every heartbeat fails, so every agent will
+  eventually be marked degraded by the loop's own counters.
+  The UI we haven't built yet would show that noisy signal.
+  Until the UI lands, the degraded state is inert.
+- Backoff ensures at most ~1 rps per agent across the fleet,
+  so api load is a non-issue. The api log does accumulate
+  steady 404s per agent until this TD closes.
+
+### Proposed fix
+
+1. Add `apps/api/src/routes/ai/heartbeat.ts` with a POST
+   handler for `/v1/agent/heartbeat/agent`.
+2. Body validation: `agentHeartbeatRequestSchema` (already
+   lives in `packages/contracts/src/agent/heartbeat.ts`).
+3. Storage: Firestore `agentHeartbeats` collection keyed by
+   `agentId`, TTL 7 days for raw samples. A rollup doc per
+   `agentId` holds the most-recent sample for quick reads.
+4. Response: `agentHeartbeatResponseSchema` —
+   `pendingTaskIds` empty for now (router integration is
+   later work), `commands` empty.
+5. Auth: once the desktop agent's bearer-token flow is
+   wired, require an auth-gateway HS256 JWT in the header.
+6. When shipped, delete the `TD-024` comments in
+   `apps/desktop-agent/src/heartbeat/agent-heartbeat-loop.ts`
+   and `apps/desktop-agent/src/runtime.ts`.
+
+### Related
+
+- `apps/desktop-agent/src/heartbeat/agent-heartbeat-loop.ts`
+  — the producer.
+- `packages/contracts/src/agent/heartbeat.ts` — the Zod
+  schemas both sides must honour.
+- ADR *Agent Heartbeat Schema Is Additive, Not Replacement*
+  (2026-04-24) — the decision that keeps this TD additive
+  rather than disruptive.
+- Legacy device-state heartbeat (`POST /v1/agent/heartbeat`)
+  continues to serve mobile / UI today; it is NOT what this
+  TD replaces.
+
+### History
+
+- 2026-04-24: filed when the desktop-agent-side loop landed
+  in Phase 1.4 commit c12. api-side implementation is
+  scheduled for the phase that opens agent observability
+  to the mobile UI.
