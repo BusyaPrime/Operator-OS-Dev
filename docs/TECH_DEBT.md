@@ -889,17 +889,24 @@ matching `--allow-unauthenticated` in
   in both `infra/cloudbuild/api.cloudbuild.yaml` and
   `infra/scripts/deploy-api.ps1`. Deploy flags now align with the
   IAM-open + Fastify-middleware-auth posture committed in the
-  2026-04-23 ADR. Verification will follow on the first api
-  deploy after CI auto-deploy (TD-015 / PR #20) lands; the fix
-  is independently mergeable and does not require TD-015 to be
-  verified.
+  2026-04-23 ADR.
+- 2026-04-24 (Week 2 Phase 1.2 smoke 5): **verified in
+  production.** CI-driven deploy via CD workflow
+  `.github/workflows/cd-deploy.yml` (run `24798687205`) landed
+  revision `operator-os-api-00008-pcc` serving at 100% traffic,
+  image `phase3-51ed361`. Post-deploy IAM policy still contained
+  `allUsers → roles/run.invoker` — no manual re-apply needed,
+  no drift. Anonymous `curl $API/health` returns HTTP 200 with
+  `status:"ok"`. The trap is closed: every future deploy through
+  this path preserves the binding atomically.
 
 ---
 
 ## TD-015: No auto-deploy trigger for `apps/api/**` merges
 
 Discovered: 2026-04-23 (while diagnosing Phase C.2 step 11)
-Resolved: 2026-04-24 (PR #20, commit `4645b5a`)
+Resolved: 2026-04-24 (PR #20 initial, PR #22/#26 follow-up fixes,
+  verified live via CD run `24798687205` on 2026-04-24)
 Type: ops-trap + process
 Priority: P2
 Status: resolved
@@ -977,6 +984,18 @@ break IAM on every run.
 
 - 2026-04-23: filed during Week 1 closure after identifying
   PR #11 had been undeployed for over 24 hours.
+- 2026-04-24 (PR #20 + #22 + #26, Week 2 Phase 1.2): resolved.
+  Landed `.github/workflows/cd-deploy.yml` with WIF auth,
+  canonical Cloud Build flags, and `_DEPLOY=true` substitution.
+  Full production verification via CD run `24798687205`: both
+  `operator-os-api-00008-pcc` and `operator-auth-gateway-00004-775`
+  deployed from the merge SHA `phase3-51ed361` with no human
+  hand on `gcloud builds submit`. The "merged but undeployed"
+  class of bug is closed. Follow-up: TD-021 tracks the gcloud
+  build-log streaming hang that kept the GitHub Actions UI
+  `in_progress` even after Cloud Build returned SUCCESS; it
+  does not affect whether deploys actually happen, only the
+  workflow-green signal.
 
 ---
 
@@ -1141,3 +1160,95 @@ each workflow run mints a short-lived federated token.
   `constraints/iam.disableServiceAccountKeyCreation` blocked
   key creation. WIF adopted directly; the migration never had
   to happen.
+- 2026-04-24 (same day, CD run `24798687205`): verified in
+  production. WIF-backed auth chain executed end-to-end with
+  no JSON keys: GitHub OIDC → STS federated token → impersonate
+  `deploy-bot` → `gcloud builds submit --service-account=deploy-bot`
+  → Cloud Build self-actAs via deploy-bot `iam.serviceAccountUser`
+  self-binding → image built + pushed + Cloud Run deployed.
+  The audit path captured the GitHub Actions assertion
+  (workflow, run id, actor, ref) on every token exchange in
+  Cloud Audit Logs, as the ADR predicted.
+
+---
+
+## TD-021: `gcloud builds submit` log-streaming hangs in GitHub Actions runner
+
+Discovered: 2026-04-24 (during Week 2 Phase 1.2 CD smoke runs 4 + 5)
+Type: ops-ergonomics
+Priority: P3
+Status: open
+
+### Description
+
+`gcloud builds submit` streams Cloud Build logs to stdout by
+default. In the GitHub Actions `ubuntu-latest` runner under
+`.github/workflows/cd-deploy.yml`, the streaming tail does not
+terminate cleanly after Cloud Build reports SUCCESS. Observed
+twice in a row on Phase 1.2 smoke tests:
+
+- Run `24796992344` (smoke 4): Cloud Build SUCCESS at
+  `c5f8aca9-73f3-4852-8fd6-0002d81463de` and
+  `63dedee2-2430-45f8-89b2-518a0cf2f466` (build + push only, no
+  deploy — separate bug resolved in PR #26). `gcloud builds
+  submit` in the runner stayed `in_progress` for 40+ minutes
+  after Cloud Build's own completion. Cancelled manually with
+  `gh run cancel`.
+- Run `24798687205` (smoke 5): Cloud Build SUCCESS, Cloud Run
+  revisions `operator-os-api-00008-pcc` and
+  `operator-auth-gateway-00004-775` created and serving, but
+  the `deploy-api` and `deploy-auth-gateway` GitHub Actions
+  jobs stayed `in_progress` past the point of deploy success.
+  `verify-health` never got to run because its `needs:`
+  dependency jobs never reported a `conclusion`. Cancelled
+  manually.
+
+### Risk if unaddressed
+
+- `verify-health` job never runs, so we lose the post-deploy
+  health check signal in CI. Manual verification via
+  `curl $SERVICE/health` works but is not automated.
+- Every CD run shows up as `cancelled` or `in_progress` in the
+  Actions history rather than as a clean green. Fine for one
+  incident; painful for long-running ops hygiene.
+- Intermittent — not every `gcloud builds submit` from GitHub
+  runners hangs, but a material fraction does. Predicting which
+  runs will hang is not possible without more data.
+
+### Probable root cause
+
+Known class of issue with `gcloud builds submit --async=false`
+(the default) against Cloud Build when build logs contain
+non-trivial output and the streaming TCP connection goes
+idle between chunks. The gcloud client-side log reader does
+not reliably detect end-of-build on the streaming path; it
+waits for an EOF that sometimes doesn't arrive promptly.
+
+### Proposed fix (two alternatives)
+
+- **(A) Add `--async` flag to `gcloud builds submit`.** Submit
+  the build and return immediately with the build id. Add a
+  follow-up step `gcloud builds describe <id> --wait` or a
+  polling loop that reads build status directly. Cleaner
+  separation of "submit" from "wait for completion".
+- **(B) Wrap the submit step with a shell timeout.** e.g.
+  `timeout 900 gcloud builds submit ...`; if Cloud Build has
+  already succeeded, the image is built regardless, and the
+  timeout kill is cosmetic. Follow-up step checks Cloud Build
+  status explicitly.
+
+(A) is more robust; (B) is simpler. Either unblocks
+`verify-health` and produces a clean workflow signal.
+
+### Related
+
+- Week 2 Phase 1.2 CD runs `24796992344` + `24798687205`.
+- `.github/workflows/cd-deploy.yml` — the file to change.
+- Does not block Phase 1.3+ because deploys do succeed; this is
+  a CI-ergonomics issue, not a deploy-correctness issue.
+
+### History
+
+- 2026-04-24: filed after observing the second occurrence on
+  smoke test 5. Functional deploys are working; this TD is
+  about the GitHub Actions workflow signal quality only.
