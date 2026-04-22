@@ -1,0 +1,61 @@
+substitutions:
+  _SERVICE_NAME: operator-auth-gateway
+  _REGION: europe-west4
+  _REPOSITORY: operator-os-docker
+  _IMAGE_NAME: auth-gateway
+  _IMAGE_TAG: latest
+  _RUNTIME_SA: auth-gateway-runtime
+  _AUTH_ACCESS_TOKEN_ISSUER: operator-auth-gateway
+  _AUTH_ACCESS_TOKEN_AUDIENCE: operator-os-api
+  _AUTH_ACCESS_TOKEN_TTL_SECONDS: "3600"
+  _AUTH_REFRESH_TOKEN_TTL_SECONDS: "2592000"
+  _AUTH_JWT_SIGNING_SECRET_NAME: operator-jwt-secret
+  _AUTH_ACCEPTED_GOOGLE_CLIENT_IDS: "1016254604177-rgvmifpm5sjr009nie8ga9psnoap69pg.apps.googleusercontent.com"
+  _FIRESTORE_USERS_COLLECTION: users
+  _FIRESTORE_REFRESH_TOKENS_COLLECTION: refreshTokens
+  _READINESS_STRICT: "true"
+  _DEPLOY: "false"
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      [
+        "build",
+        "-f",
+        "apps/auth-gateway/Dockerfile",
+        "-t",
+        "europe-west4-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:${_IMAGE_TAG}",
+        "."
+      ]
+
+  - name: gcr.io/cloud-builders/docker
+    args:
+      [
+        "push",
+        "europe-west4-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:${_IMAGE_TAG}"
+      ]
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        if [[ "${_DEPLOY}" != "true" ]]; then
+          echo "Skipping Cloud Run deploy step because _DEPLOY=${_DEPLOY}."
+          exit 0
+        fi
+
+        gcloud run deploy "${_SERVICE_NAME}" \
+          --project="$PROJECT_ID" \
+          --region="${_REGION}" \
+          --image="europe-west4-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:${_IMAGE_TAG}" \
+          --platform=managed \
+          --service-account="${_RUNTIME_SA}@${PROJECT_ID}.iam.gserviceaccount.com" \
+          --allow-unauthenticated \
+          --port=8081 \
+          --min-instances=0 \
+          --max-instances=10 \
+          --set-env-vars="NODE_ENV=production,HOST=0.0.0.0,PORT=8081,LOG_LEVEL=info,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},FIREBASE_PROJECT_ID=${PROJECT_ID},AUTH_GATEWAY_SERVICE_NAME=${_SERVICE_NAME},AUTH_ACCESS_TOKEN_ISSUER=${_AUTH_ACCESS_TOKEN_ISSUER},AUTH_ACCESS_TOKEN_AUDIENCE=${_AUTH_ACCESS_TOKEN_AUDIENCE},AUTH_ACCESS_TOKEN_TTL_SECONDS=${_AUTH_ACCESS_TOKEN_TTL_SECONDS},AUTH_REFRESH_TOKEN_TTL_SECONDS=${_AUTH_REFRESH_TOKEN_TTL_SECONDS},AUTH_JWT_SIGNING_SECRET_NAME=${_AUTH_JWT_SIGNING_SECRET_NAME},AUTH_ACCEPTED_GOOGLE_CLIENT_IDS=${_AUTH_ACCEPTED_GOOGLE_CLIENT_IDS},FIRESTORE_USERS_COLLECTION=${_FIRESTORE_USERS_COLLECTION},FIRESTORE_REFRESH_TOKENS_COLLECTION=${_FIRESTORE_REFRESH_TOKENS_COLLECTION},READINESS_STRICT=${_READINESS_STRICT}"
+
+images:
+  - europe-west4-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:${_IMAGE_TAG}
