@@ -48,13 +48,19 @@ spec:
         - image: europe-west4-docker.pkg.dev/operator-os-dev/operator-os-docker/auth-gateway:${IMAGE_TAG}
           ports:
             - containerPort: 8081
+          # PORT is reserved by Cloud Run: it is injected
+          # automatically matching containerPort above.
+          # Declaring PORT as an env here causes
+          # `gcloud run services replace` and `gcloud run deploy`
+          # to fail with "The following reserved env names were
+          # provided: PORT". Full list of reserved names:
+          # https://cloud.google.com/run/docs/container-contract#env-vars
+          # and docs/TECH_DEBT.md TD-011.
           env:
             - name: NODE_ENV
               value: production
             - name: HOST
               value: 0.0.0.0
-            - name: PORT
-              value: "8081"
             - name: LOG_LEVEL
               value: info
             - name: GOOGLE_CLOUD_PROJECT
