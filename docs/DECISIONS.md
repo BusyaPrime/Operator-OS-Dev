@@ -757,3 +757,283 @@ References:
   be attached to the research report before PR #21 starts).
 - `docs/TECH_DEBT.md` TD-020 (alias removal tracker — filed with
   this ADR landing).
+
+**Superseded** (2026-04-24): after pre-Phase-1.3 research, the
+existing repo carries no `AgentHeartbeatRequestSchema` — the api
+uses `deviceStateSchema` (a device-centric shape) directly as its
+heartbeat payload, and `deviceStateSchema` is also used in the
+operator-state model and messaging contracts. There is no schema
+to "replace", so the V0-alias framing does not apply. See the
+replacement ADR *Agent Heartbeat Schema Is Additive, Not
+Replacement* (2026-04-24) for the revised direction. TD-020 is
+closed as wontfix — the alias it tracked is not needed.
+
+## Adopt Workload Identity Federation From Day 1 (TD-016 Preempted)
+
+Date: 2026-04-24
+Status: accepted
+
+Decision:
+
+- GitHub Actions authenticates to Google Cloud via Workload
+  Identity Federation (WIF) + OIDC. No long-lived JSON service-
+  account keys are ever created, stored, or rotated.
+- Federation pool: `github-actions-pool` (global).
+- Federation provider: `github-actions-provider`. Issuer:
+  `https://token.actions.githubusercontent.com`. Attribute
+  mapping: `google.subject=assertion.sub`,
+  `attribute.actor=assertion.actor`,
+  `attribute.repository=assertion.repository`,
+  `attribute.repository_owner=assertion.repository_owner`.
+  Attribute condition: `assertion.repository_owner == 'BusyaPrime'`
+  — any non-BusyaPrime fork attempting to exchange a GitHub OIDC
+  token for GCP credentials is rejected at the STS layer.
+- Service account `deploy-bot@operator-os-dev.iam.gserviceaccount.com`
+  has `roles/iam.workloadIdentityUser` for the pool's
+  principalSet `attribute.repository/BusyaPrime/Operator-OS-Dev`.
+- GitHub repo carries three Actions secrets (public by design —
+  none of them are credentials):
+  - `GCP_PROJECT_ID` — the project id string.
+  - `GCP_WORKLOAD_IDENTITY_PROVIDER` — full resource name of the
+    pool provider. Looks like a GCP resource path; exchangeable
+    only when the workflow has the right OIDC attributes.
+  - `GCP_SERVICE_ACCOUNT` — the deploy-bot email to impersonate
+    after the OIDC exchange.
+
+Why:
+
+- `constraints/iam.disableServiceAccountKeyCreation` is set at
+  the organisation level in `operator-os-dev`. Attempting
+  `gcloud iam service-accounts keys create` returns
+  `FAILED_PRECONDITION: Key creation is not allowed on this
+  service account.` Waiving the policy would add a standing
+  exception for every CI workflow.
+- Waiving vs adopting: WIF is Google's 2026 recommended best
+  practice for external CI/CD. No long-lived credentials means
+  no rotation process, no stolen-key incident recovery path, no
+  key in a GitHub Secrets store that a rogue workflow might
+  exfiltrate. The OIDC token minted per-job is short-lived and
+  scoped to the specific GitHub Actions run.
+- Audit trail: every federated token exchange shows up in Cloud
+  Audit Logs with the full GitHub Actions assertion claims
+  (workflow name, repository, actor, ref). Post-hoc forensics
+  are strictly better than "someone had the JSON key".
+- TD-016 was filed in Week 1 closure as the "future WIF
+  migration" item. By adopting WIF from Day 1, TD-016 is closed
+  preemptively with zero migration cost — we never had a JSON
+  key to migrate *from*.
+
+Alternatives considered:
+
+- **Waive the org policy and use JSON keys.** Rejected. Keys
+  have real rotation cost (operator time, possibly downtime),
+  sit in GitHub Secrets forever by default, and are the #1
+  credential-theft class in external CI/CD. The policy exists
+  for exactly this reason.
+- **Self-hosted GitHub runner in GCP with metadata-server auth.**
+  Rejected for scope. Self-hosted runners add an ops burden
+  (VM lifecycle, patching, scaling) that the scope of one
+  founder does not support. WIF on GitHub-hosted runners is
+  the same security posture without the ops cost.
+- **Delay CI auto-deploy, stay manual.** Rejected. TD-015 was
+  filed because manual deploy caused PR #11 to sit undeployed
+  for 24+ hours in Week 1. Keeping deploys manual preserves the
+  exact class of bug that TD-015 was filed to prevent.
+
+Consequences:
+
+- `.github/workflows/cd-deploy.yml` uses
+  `google-github-actions/auth@v2` with
+  `workload_identity_provider` + `service_account` inputs. The
+  previous TZ Part 2.3 reference to `GCP_SA_KEY` is void; no
+  such secret exists in the repo.
+- Future repositories (if a second repo ever needs to deploy to
+  the same GCP project) add an entry to the pool's principalSet
+  rather than provisioning a new SA key. Scales cleanly.
+- The attribute condition `repository_owner == 'BusyaPrime'`
+  means GitHub forks cannot abuse the provider. If a fork is
+  ever created (e.g. for a contributor), either (a) their fork
+  can't run the CD workflow at all, or (b) a new principalSet
+  is added explicitly. Default-deny.
+- TD-016 is closed as *resolved / preempted* rather than as
+  *wontfix*. The migration path it described was executed in
+  advance; the debt never accrued.
+
+References:
+
+- TD-015 closure via PR #20 (this workflow).
+- TD-016 preemptive closure (this ADR + TECH_DEBT.md update).
+- GitHub Actions OIDC docs:
+  https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/about-security-hardening-with-openid-connect
+- Google WIF docs:
+  https://cloud.google.com/iam/docs/workload-identity-federation-with-other-providers
+- `.github/workflows/cd-deploy.yml` (the workflow that uses WIF).
+
+## Agent Heartbeat Schema Is Additive, Not Replacement
+
+Date: 2026-04-24
+Status: accepted (supersedes 2026-04-24 *Heartbeat Schema
+  Replacement With V0 Backward-Compat Alias*)
+
+Decision:
+
+- `@operator-os/contracts` gains a new, agent-centric
+  `AgentHeartbeatRequestSchema` (plus matching
+  `AgentHeartbeatResponseSchema`) in a new file
+  `packages/contracts/src/agent/heartbeat.ts`.
+- `deviceStateSchema` (in `packages/contracts/src/operator.ts`)
+  is **not** touched, not aliased, not deprecated.
+- The two schemas coexist: `deviceStateSchema` remains the
+  device-centric shape used by the operator-state model and
+  mobile dashboard; `AgentHeartbeatRequestSchema` is the new
+  agent-process telemetry shape used by the Desktop Agent
+  runtime.
+
+Why:
+
+- Pre-Phase-1.3 research (direct file reads + grep) confirmed:
+  - No `AgentHeartbeatRequestSchema` exists in the repo today.
+  - The previous ADR (earlier on 2026-04-24) framed the change
+    as a replacement with a V0 alias. With nothing to replace,
+    that framing produced a TD (TD-020) that tracked an alias
+    that wouldn't exist.
+  - `deviceStateSchema` is used by three distinct consumers
+    (operator dashboard, messaging contracts, index.test)
+    outside the heartbeat path. Collapsing it into an agent
+    heartbeat shape would force the operator-state model to
+    carry agent-process fields it doesn't need, or fork the
+    shape anyway.
+- Device state and agent heartbeat are semantically different
+  concerns: device state describes *the mobile client's
+  environment* (battery, network, locale, foreground state),
+  while agent heartbeat describes *an AI worker process's
+  runtime* (active task count, model capability status, system
+  load, provider version). Future agents (desktop worker, edge
+  agent, cloud agent) will each have their own heartbeat
+  shape; device is one of many, not the canonical.
+- Additive design satisfies LAW #5 (Verifiable Honesty) at the
+  contract layer: the name of each schema describes exactly
+  what it models, with no misleading shared surface.
+
+Alternatives considered:
+
+- **Replacement with V0 alias** (the superseded ADR). Rejected
+  because there is nothing to alias *from*; the research
+  revealed the old ADR was based on a false premise.
+- **Unify** into a single HeartbeatSchema with an agent-or-
+  device discriminator. Rejected. Breaks the separation of
+  concerns, forces every consumer to care about fields that
+  belong to a different domain, and creates one large schema
+  with Zod `z.discriminatedUnion` or similar — fine in
+  isolation, bad as a platform-wide convention.
+
+Consequences:
+
+- PR #21 (TD-010 contracts) lands both the four AI Platform
+  interfaces (AIAgent, FileSystemProvider, StreamProvider,
+  CostProvider) and the new agent heartbeat schemas as sibling
+  additions under `packages/contracts/src/agent/` and
+  `packages/contracts/src/ai/`.
+- The existing `POST /v1/agent/heartbeat` endpoint on
+  operator-os-api continues to accept `deviceStateSchema`
+  bodies. A new endpoint or content-negotiation path for the
+  agent-centric shape lands when the Desktop Agent integration
+  test (Week 3 gated on TD-017 api-side WebSocket) is planned.
+  Until then, Desktop Agent internally builds and logs the new
+  shape but wire-sends the DeviceState shape to the existing
+  endpoint — no behavioural change for the api side.
+- TD-020 scope collapses. Original scope (remove V0 alias) does
+  not apply. Entry closed as wontfix with a forward pointer to
+  this ADR.
+
+References:
+
+- Superseded ADR: *Heartbeat Schema Replacement With V0
+  Backward-Compat Alias* (2026-04-24, marked superseded
+  in-place).
+- Week 2 TZ Phase 1.4 Part 4.4 (new schema spec).
+- `packages/contracts/src/operator.ts` (existing
+  `deviceStateSchema` definition at line ~155; unchanged by
+  this ADR).
+
+## Mobile App Stays On @react-navigation v7 (No expo-router Migration)
+
+Date: 2026-04-24
+Status: accepted
+
+Decision:
+
+- `apps/mobile` stays on `@react-navigation/bottom-tabs` v7 +
+  `@react-navigation/native` v7 as its navigation library. The
+  Week 2 TZ Part 5.1 reference to `expo-router` v3 is treated
+  as aspirational only and overridden by this ADR.
+- All Week 2+ mobile features (Google Sign-In gate, auth flow,
+  task screens, agent dashboard) are added **inside** the
+  existing `@react-navigation` hierarchy, not in a new router
+  tree.
+
+Why:
+
+- `apps/mobile` already boots, renders five tabs (home, devices,
+  sessions, costs, settings), carries components + theme
+  tokens + a Zustand store + API client + a passing Vitest
+  suite. All of that was written with `@react-navigation`. A
+  switch to `expo-router` would require rewriting the
+  navigation tree, migrating all screen definitions, and
+  refactoring existing deep links and state wiring.
+- `@react-navigation` v7 is production-proven (Meta, Shopify,
+  DoorDash all ship on it). `expo-router` is newer and gives
+  you file-system routing on top of React Navigation; it's not
+  a different navigation engine, just a thinner convention
+  over the same primitives. There's no user-visible benefit to
+  migrating during a scoping sprint.
+- The TZ was written without visibility into the existing
+  mobile scaffold (the Week 2 TZ author did not read
+  `apps/mobile/App.tsx` or `apps/mobile/src/navigation/` before
+  specifying `expo-router` as the framework). Overriding here
+  is consistent with the earlier ADR *Incremental Upgrade Path
+  For apps/desktop-agent And apps/mobile* — TZ is a north
+  star, not a delete-and-rewrite mandate.
+
+Alternatives considered:
+
+- **Migrate to expo-router (TZ-literal).** Rejected. 2-3 days
+  of navigation refactor for no user benefit. Every screen
+  file moves; every deep link re-validated; every test
+  reconsidered; and the end result is the same 5 tabs with
+  the same 5 screens behind them.
+- **Keep navigation code frozen, spin up expo-router in
+  parallel as v2.** Rejected for the same reasons as the
+  parallel-scaffold option in the incremental-upgrade ADR —
+  two mental models, confusion for future readers, no
+  benefit.
+
+Consequences:
+
+- Week 2 TZ Part 5.1 target structure (`app/(auth)/signin.tsx`
+  etc.) is void. Actual structure uses the existing
+  `src/navigation/root-tabs.tsx` + screen files under
+  `src/screens/`, extended with a sign-in screen and an auth
+  gate.
+- Google Sign-In integration (`@react-native-google-signin/
+  google-signin`) and secure storage
+  (`expo-secure-store`) land as dependencies; the sign-in
+  screen is gated by a top-level `AuthProvider` component that
+  wraps `RootTabs`. Not-authenticated → render sign-in; signed
+  in → render the existing tab navigator.
+- Zustand store pattern is kept (already established for
+  operator-store). New `auth-store` slice lives alongside,
+  following the same conventions.
+- When `expo-router` matures enough to justify migration
+  (e.g. deep file-system routing becomes load-bearing for SEO
+  on a future web build), a dedicated ADR + migration PR
+  revisits this decision. For Week 2 scope, decision stands.
+
+References:
+
+- Week 2 TZ Part 5.1 (treated as aspirational after this ADR).
+- Earlier ADR *Incremental Upgrade Path For apps/desktop-agent
+  And apps/mobile* (2026-04-24) — the same spirit applies to
+  navigation-framework choice specifically.
+- `apps/mobile/App.tsx` + `apps/mobile/src/navigation/root-tabs.tsx`
+  (existing navigation wiring to extend, not replace).
