@@ -504,9 +504,10 @@ Estimated fix: ~1 hour including tests.
 ## TD-010: `packages/contracts` missing Universal AI interfaces
 
 Discovered: 2026-04-23 (during Phase B SPEC update, PR #13)
+Resolved: 2026-04-24 (Week 2 Phase 1.3, PR for TD-010)
 Type: tech-gap
 Priority: P2
-Status: open
+Status: resolved
 
 ### Description
 
@@ -583,6 +584,21 @@ Estimated work: 2-3 hours.
 ### History
 
 - 2026-04-23: filed during Phase C.1 as pre-work for Week 2.
+- 2026-04-24 (Week 2 Phase 1.3, PR for TD-010): resolved. Landed
+  `packages/contracts/src/ai/` with the four canonical interfaces
+  (`AIAgent`, `FileSystemProvider`, `StreamProvider`,
+  `CostProvider`) plus supporting types (`AIAgentIdentity`,
+  `AIAgentRuntime`, `AIAgentStatus`, task types, `AgentManifest`,
+  `AgentCapability`), an error hierarchy (`AIAgentError` base +
+  three subclasses), and 90 new `expectTypeOf` tests under
+  `__tests__/`. SPEC `§ 61-66.7` updated to v1.1 to match the
+  landed shapes; the `§ 27` ClaudeCodeAgent reference
+  implementation was rewritten against v1.1. Two new ADRs record
+  the SPEC evolution + the type-level testing convention.
+  Consumer packages can now
+  `import { AIAgent } from '@operator-os/contracts'`.
+  Week 2 Phase 1.4 (Desktop Agent incremental upgrade) is
+  unblocked.
 
 ---
 
