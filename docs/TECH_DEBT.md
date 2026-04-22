@@ -487,3 +487,88 @@ Estimated fix: ~1 hour including tests.
 ### History
 
 - 2026-04-22: discovered during TD-005 deploy probe.
+
+---
+
+## TD-010: `packages/contracts` missing Universal AI interfaces
+
+Discovered: 2026-04-23 (during Phase B SPEC update, PR #13)
+Type: tech-gap
+Priority: P2
+Status: open
+
+### Description
+
+SPEC § 61 (rewritten in PR #13) references four interfaces as the
+public surface of the Universal AI Control Platform:
+
+- `AIAgent`
+- `FileSystemProvider`
+- `StreamProvider`
+- `CostProvider`
+
+Plus the supporting types: `AIVendor`, `Capability`,
+`AgentConfig`, `Task`, `AgentResult`, `OutputChunk`,
+`AgentStatus`, `ResourceMetrics`, `UsageEvent`, `PricingInfo`,
+`CostEstimate`, `FileInfo`, `FileChange`.
+
+None of these types currently exist in `packages/contracts`. Any
+Week 2 Desktop Agent code that tries to
+`import { AIAgent } from '@operator-os/contracts'` will fail at
+typecheck. The SPEC also states that the legacy `AIProvider`
+completion shape is "no longer re-exported from
+`@operator-os/contracts`", which is technically true only because
+no such export ever existed — but the statement reads as if the
+removal were intentional bookkeeping, and a future reader may
+waste time looking for it.
+
+### Risk if unaddressed
+
+- Week 2 Desktop Agent cannot be implemented against SPEC.
+- The first agent to land will either hardcode Claude-Code-
+  specific types (directly violating LAW #3 and the Universal AI
+  ADR) or reinvent the interfaces locally, guaranteeing drift
+  from SPEC.
+- Refactor cost grows with every file added on top of whatever
+  ad-hoc shape is used, exactly the exponential-debt scenario
+  the ADR was written to prevent.
+- Every hour the contracts package stays empty, the gap between
+  SPEC and code widens and LAW #5 (verifiable honesty) degrades:
+  the spec claims a public surface that does not exist.
+
+### Proposed fix
+
+First atomic commit of the Week 2 Desktop Agent branch:
+
+- `packages/contracts/src/ai-agent.ts` — `AIAgent`, `AIVendor`,
+  `Capability`, `AgentConfig`, `Task`, `AgentResult`,
+  `AgentStatus`, `ResourceMetrics`.
+- `packages/contracts/src/filesystem-provider.ts` —
+  `FileSystemProvider`, `FileInfo`, `FileChange`,
+  `FileChangeHandler`, `Unsubscribe`.
+- `packages/contracts/src/stream-provider.ts` —
+  `StreamProvider`, `OutputChunk` (shared with `ai-agent.ts` via
+  re-export, not duplication).
+- `packages/contracts/src/cost-provider.ts` — `CostProvider`,
+  `UsageEvent`, `PricingInfo`, `CostEstimate`.
+- Re-export all four interfaces (and their supporting types)
+  from `packages/contracts/src/index.ts`.
+- Types-only — no runtime logic, no dependencies beyond
+  TypeScript.
+- Add Vitest type-level tests (`expectTypeOf` from `vitest`) for
+  each interface so drift from SPEC fails CI.
+
+Estimated work: 2-3 hours.
+
+### Related
+
+- Discovered in: PR #13 Phase B (2026-04-23).
+- Blocks: Week 2 Desktop Agent implementation (§ 129 in SPEC).
+- References: SPEC § 61 (interface definitions), SPEC § 62-66.7
+  (agent implementations that will consume the interfaces), SPEC
+  § 27 (Desktop Agent and Provider Registry), DECISIONS.md ADR
+  *Adopt Universal AI Control Platform Architecture* (2026-04-23).
+
+### History
+
+- 2026-04-23: filed during Phase C.1 as pre-work for Week 2.
