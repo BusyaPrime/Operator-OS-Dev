@@ -15,12 +15,14 @@ import { IntegrationError } from './integrations/runtime.js';
 import { registerHealthRoutes } from './routes/health.js';
 import { registerAiRoutes } from './routes/ai.js';
 import { registerAgentRoutes } from './routes/agent.js';
+import { registerCostRoutes } from './routes/cost.js';
 import { registerInternalTasksRoutes } from './routes/internal-tasks.js';
 import { registerOperatorRoutes } from './routes/operator.js';
 import { VertexAIProvider } from './providers/index.js';
 import { buildReadinessResponse } from './readiness.js';
 import { AlertsService } from './services/alerts.js';
 import { CommandsService } from './services/commands.js';
+import { CostService } from './services/cost.js';
 import { ExportsService } from './services/exports.js';
 import { SessionsService } from './services/sessions.js';
 import type { AIProvider } from './types.js';
@@ -101,6 +103,7 @@ export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) =>
     storageService,
     tasksQueue
   });
+  const costService = new CostService();
   const operatorModules = [
     authService,
     firestoreRepository,
@@ -178,6 +181,12 @@ export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) =>
   void registerAiRoutes(app, {
     aiProvider,
     authGuard: authService.createRequiredGuard()
+  });
+  void registerCostRoutes(app, {
+    costService,
+    repository: firestoreRepository,
+    agentGuard: authService.createAgentGuard(agentAudience),
+    userGuard: authService.createRequiredGuard()
   });
   void registerInternalTasksRoutes(app);
 

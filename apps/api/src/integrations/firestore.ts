@@ -4,7 +4,9 @@ import {
   alertSchema,
   analyticsEventSchema,
   agentHeartbeatRequestSchema,
+  costPlanSchema,
   costSnapshotSchema,
+  costUsageRecordSchema,
   deviceStateSchema,
   mutationReceiptSchema,
   operatorStateSchema,
@@ -12,12 +14,15 @@ import {
   type Alert,
   type AgentHeartbeatRequest,
   type AnalyticsEvent,
+  type CostPlan,
   type CostSnapshot,
+  type CostUsageRecord,
   type DeviceState,
   type MutationReceipt,
   type OperatorState,
   type Session
 } from '@operator-os/contracts';
+import { z } from 'zod';
 import type { FastifyBaseLogger } from 'fastify';
 import type { ZodType } from 'zod';
 
@@ -35,6 +40,32 @@ import {
  * scope boundary from the Phase 2 pre-plan.
  */
 const AGENT_HEARTBEATS_COLLECTION = 'agentHeartbeats';
+const COST_RECORDS_COLLECTION = 'costRecords';
+const USER_BUDGETS_COLLECTION = 'userBudgets';
+
+/**
+ * Per-user budget override persisted in the `userBudgets`
+ * collection. Free / pro plans fall through to PLAN_BUDGETS in
+ * services/cost.ts; `custom` / enterprise tiers use this doc
+ * to carry a specific monthly ceiling.
+ */
+export interface UserBudgetRecord {
+  readonly userId: string;
+  readonly plan: CostPlan;
+  readonly monthlyLimitUsd: number;
+  readonly warnAtPercent: number;
+  readonly updatedAt: string;
+  readonly notes?: string;
+}
+
+const userBudgetRecordSchema = z.object({
+  userId: z.string().min(1),
+  plan: costPlanSchema,
+  monthlyLimitUsd: z.number().nonnegative(),
+  warnAtPercent: z.number().min(0).max(100),
+  updatedAt: z.string().datetime(),
+  notes: z.string().optional()
+});
 
 const mergeByKey = <T>(
   baseItems: readonly T[],
@@ -248,6 +279,112 @@ export class FirestoreOperatorRepository {
         receivedAt
       },
       'agent-heartbeat.v2'
+    );
+  }
+
+  // ---------------------------------------------------------------
+  // Cost records + user budgets (Phase 2 / TD-022)
+  //
+  // Each usage record is an append-only row in `costRecords`; doc
+  // id is auto so concurrent writes never collide. User budgets
+  // are a keyed doc per userId in `userBudgets` — read via
+  // getUserBudget(), upserted via setUserBudget() (not wired to a
+  // public route yet; admin UI will use it once TD-025 lands).
+  //
+  // Index hints (manual Firestore setup, documented here so the
+  // code comment carries the list next to the reads that need it):
+  //   (userId, timestamp DESC)                  — status / spending
+  //   (userId, providerId, timestamp DESC)       — per-provider breakdown
+  // ---------------------------------------------------------------
+
+  async recordCostUsage(record: CostUsageRecord): Promise<MutationReceipt> {
+    const parsed = costUsageRecordSchema.parse(record);
+    // Doc id: `{userId}__{taskId}`. Makes POST /v1/cost/record
+    // idempotent per task — a duplicate submit for the same
+    // (userId, taskId) overwrites without creating two rows.
+    const documentId = `${parsed.userId}__${parsed.taskId}`;
+    return this.#persistDocument(
+      COST_RECORDS_COLLECTION,
+      documentId,
+      parsed,
+      'cost.record'
+    );
+  }
+
+  async listCostRecordsForUser(
+    userId: string,
+    range: { start: Date; end: Date }
+  ): Promise<CostUsageRecord[]> {
+    if (!this.#adcStatus.available) {
+      // No Firestore access → empty array; route layer renders a
+      // zeroed report with a `dataSource: bootstrap-fallback`
+      // note.
+      return [];
+    }
+
+    try {
+      const snapshot = await this.#getClient()
+        .collection(COST_RECORDS_COLLECTION)
+        .where('userId', '==', userId)
+        .where('timestamp', '>=', range.start.toISOString())
+        .where('timestamp', '<', range.end.toISOString())
+        .get();
+
+      return snapshot.docs.flatMap((doc) => {
+        const parsed = costUsageRecordSchema.safeParse(doc.data());
+        if (!parsed.success) {
+          this.#logger.warn(
+            {
+              collectionName: COST_RECORDS_COLLECTION,
+              documentId: doc.id,
+              issues: parsed.error.issues
+            },
+            'cost-record document skipped — does not match schema'
+          );
+          return [];
+        }
+        return [parsed.data];
+      });
+    } catch (err) {
+      this.#logger.warn({ err, userId }, 'cost-record read failed');
+      return [];
+    }
+  }
+
+  async getUserBudget(userId: string): Promise<UserBudgetRecord | undefined> {
+    if (!this.#adcStatus.available) return undefined;
+    try {
+      const doc = await this.#getClient()
+        .collection(USER_BUDGETS_COLLECTION)
+        .doc(userId)
+        .get();
+      if (!doc.exists) return undefined;
+      const parsed = userBudgetRecordSchema.safeParse(doc.data());
+      if (!parsed.success) {
+        this.#logger.warn(
+          {
+            collectionName: USER_BUDGETS_COLLECTION,
+            documentId: userId,
+            issues: parsed.error.issues
+          },
+          'user-budget document skipped — does not match schema'
+        );
+        return undefined;
+      }
+      return parsed.data;
+    } catch (err) {
+      this.#logger.warn({ err, userId }, 'user-budget read failed');
+      return undefined;
+    }
+  }
+
+  async setUserBudget(record: UserBudgetRecord): Promise<MutationReceipt> {
+    const parsed = userBudgetRecordSchema.parse(record);
+    return this.#persistDocument(
+      USER_BUDGETS_COLLECTION,
+      parsed.userId,
+      parsed,
+      'user-budget.upsert'
     );
   }
 
