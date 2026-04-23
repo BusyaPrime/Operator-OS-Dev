@@ -1,6 +1,7 @@
 export * from './ai-agent.js';
 export * from './agent-errors.js';
 export * from './agent-manifest.js';
+export * from './agent-manifest-schema.js';
 export * from './capabilities.js';
 export * from './cost-provider.js';
 export * from './filesystem-provider.js';
