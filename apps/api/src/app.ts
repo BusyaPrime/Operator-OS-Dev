@@ -17,9 +17,17 @@ import { registerAiRoutes } from './routes/ai.js';
 import { registerAgentRoutes } from './routes/agent.js';
 import { registerAgentWsRoute } from './routes/agent-ws.js';
 import { registerCostRoutes } from './routes/cost.js';
-import { registerInternalTasksRoutes } from './routes/internal-tasks.js';
+import {
+  registerInternalPubsubRoutes,
+  registerInternalTasksRoutes,
+  type DispatchHandler
+} from './routes/internal-tasks.js';
 import { registerOperatorRoutes } from './routes/operator.js';
 import { registerTaskRoutes } from './routes/tasks.js';
+import {
+  GoogleOidcVerifier,
+  createGoogleOidcGuard
+} from './middleware/google-oidc-verifier.js';
 import { VertexAIProvider } from './providers/index.js';
 import { buildReadinessResponse } from './readiness.js';
 import { createAgentSessionRegistry } from './services/agent-session-registry.js';
@@ -29,6 +37,7 @@ import { CostService } from './services/cost.js';
 import { ExportsService } from './services/exports.js';
 import { createIdempotencyCache } from './services/idempotency-cache.js';
 import { SessionsService } from './services/sessions.js';
+import { TaskDispatchPublisher } from './services/task-dispatch-publisher.js';
 import type { AIProvider } from './types.js';
 
 interface BuildServerOptions {
@@ -214,6 +223,35 @@ export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) =>
     apiBaseUrl: agentAudience
   });
   void registerInternalTasksRoutes(app);
+
+  // Phase 3.2 — Pub/Sub + Cloud Tasks internal routes.
+  // Gated on PUBSUB_PUSH_AUDIENCE so dev/test environments without the
+  // push subscription configured still start cleanly. Real dispatch
+  // callback is composed in c13 (router + Cloud Tasks + WS task-assign);
+  // the stub here acknowledges every message as no-match-no-retry so
+  // routes can register + be unit-tested before the wiring lands.
+  if (config.PUBSUB_PUSH_AUDIENCE) {
+    const taskDispatchPublisher = new TaskDispatchPublisher(config, app.log);
+    const oidcVerifier = new GoogleOidcVerifier({
+      audience: config.PUBSUB_PUSH_AUDIENCE,
+      allowedEmails: new Set([config.CLOUD_RUN_SERVICE_ACCOUNT])
+    });
+    const oidcGuard = createGoogleOidcGuard(oidcVerifier);
+    const stubDispatch: DispatchHandler = async () => ({
+      kind: 'no-match',
+      willRetry: false
+    });
+    void registerInternalPubsubRoutes(app, {
+      oidcGuard,
+      publisher: taskDispatchPublisher,
+      dispatch: stubDispatch
+    });
+  } else {
+    app.log.info(
+      { source: 'buildServer' },
+      'PUBSUB_PUSH_AUDIENCE not set — Phase 3.2 internal pubsub routes not registered'
+    );
+  }
 
   return app;
 };
