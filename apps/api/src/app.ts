@@ -31,6 +31,15 @@ import type { AIProvider } from './types.js';
 
 interface BuildServerOptions {
   aiProvider?: AIProvider;
+  /**
+   * Defaults to `true`. Tests disable it because
+   * @fastify/websocket's `injectWS` helper produces a raw socket
+   * without a `remoteAddress`, which pino's req-serializer reads
+   * through `request.ip` → `proxyaddr` and then crashes during
+   * the pre-upgrade "incoming request" log. Production always
+   * wants it on (Cloud Run terminates TLS upstream).
+   */
+  trustProxy?: boolean;
 }
 
 export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) => {
@@ -42,7 +51,7 @@ export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) =>
         environment: config.NODE_ENV
       }
     },
-    trustProxy: true
+    trustProxy: options.trustProxy ?? true
   });
 
   app.decorateRequest('authSession', undefined);

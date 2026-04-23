@@ -119,15 +119,32 @@ export const registerAgentWsRoute = async (
   const pongTimeoutMs = options.pongTimeoutMs ?? DEFAULTS.pongTimeoutMs;
   const now = options.now ?? (() => Date.now());
 
-  app.get(
-    '/v1/agent/ws',
-    {
-      websocket: true,
-      preValidation: options.agentGuard
-    },
-    (socket, request) => {
-      const logger = request.log.child({ component: 'agent-ws' });
-      const userId = request.authSession?.currentUser?.operatorId ?? 'unknown';
+  // App-scoped logger. Request-scoped child loggers blow up under
+  // @fastify/websocket's injectWS helper because trustProxy's
+  // pino req-serializer reads `request.ip` → `raw.socket.remoteAddress`
+  // which is undefined on an injected upgrade. Server-level logs
+  // lose per-request reqId correlation but gain sessionId, which
+  // is the correlation key that matters for WS.
+  const baseLogger = app.log.child({ component: 'agent-ws' });
+
+  // Register inside an encapsulated scope per the @fastify/websocket
+  // idiom. A top-level `app.get(..., { websocket: true })` in a
+  // crowded buildServer wiring lost its WS-ness in practice — the
+  // handler fired on the plain HTTP path with (request, reply)
+  // instead of (socket, request). Wrapping in `app.register()`
+  // gives the WS route its own hook plane and restores the
+  // documented behaviour.
+  await app.register(async (scope) => {
+    scope.get(
+      '/v1/agent/ws',
+      {
+        websocket: true,
+        preValidation: options.agentGuard
+      },
+      (socket, request) => {
+        const logger = baseLogger;
+        const userId =
+          request.authSession?.currentUser?.operatorId ?? 'unknown';
 
       // Session not yet established — the hello must come first.
       let sessionId: string | undefined;
@@ -320,6 +337,7 @@ export const registerAgentWsRoute = async (
       });
     }
   );
+  });
 
   // Clean shutdown — close every live session with 1001 (going
   // away). Prevents a zombie connection persisting across a
