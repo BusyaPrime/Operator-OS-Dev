@@ -1,14 +1,14 @@
 import { NavigationContainer } from '@react-navigation/native';
 import { StatusBar } from 'expo-status-bar';
 
-import { RootTabs } from './src/navigation/root-tabs';
+import { RootNavigator } from './src/navigation/root-navigator';
 import { navigationTheme } from './src/theme/navigation-theme';
 
 export default function App() {
   return (
     <NavigationContainer theme={navigationTheme}>
       <StatusBar style="light" />
-      <RootTabs />
+      <RootNavigator />
     </NavigationContainer>
   );
 }
