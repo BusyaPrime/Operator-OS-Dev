@@ -1528,3 +1528,179 @@ References:
 - Sibling ADR *Agent Heartbeat Schema Is Additive, Not
   Replacement* (2026-04-24) — explains why the loop exists
   at all.
+
+## Mobile Phase 1.5 Adds Auth Alongside, Does Not Rewrite Navigation
+
+Decided: 2026-04-24 (Week 2 Phase 1.5, Gate 1.5.A approval)
+
+Decision:
+
+- Keep the existing 5-tab bottom navigator, all five screens
+  (Home / Devices / Sessions / Costs / Settings), the
+  `useOperatorStore`, the theme tokens, and every component
+  under `apps/mobile/src/components/**` exactly as they are.
+- Add a root-level native-stack (`RootNavigator`) that swaps
+  between an `AuthLoadingScreen` / `SignInScreen` tree and the
+  existing `RootTabs` tree based on `useAuthStore.status`.
+- Auth-specific state lives in a *parallel* zustand store
+  (`useAuthStore`) — not merged into `useOperatorStore`.
+- Auth-specific services land under `src/services/` alongside
+  the existing `api-client.ts` and `auth-session.ts` — no new
+  top-level folder for auth-related HTTP.
+
+Why:
+
+- The mobile shell had a stable navigation + dashboard pattern
+  (Days 1-3 bootstrap) that mobile + api both expect to keep
+  working. Rewriting the tab shell into an auth-aware
+  architecture would create a migration the api side cannot
+  observe and cannot validate against.
+- A parallel `useAuthStore` stays cleanly loose-coupled. The
+  dashboard store keeps its mock + controlled-fallback
+  semantics; the auth store owns the session state machine.
+  Nothing in either store reads the other's fields — the
+  render layer composes them.
+- Auth services under `src/services/` means the only layering
+  decision is "what do you talk to" (auth-gateway vs main api),
+  not "where does this kind of thing live". Consistent with the
+  already-established pattern.
+- The root native-stack is additive: existing screens get the
+  same props and same store shape. A user who is already
+  authenticated sees zero visual difference from the pre-
+  Phase-1.5 app on launch.
+
+Alternatives considered:
+
+- **Merge auth state into `useOperatorStore`.** Rejected. The
+  dashboard store has a complex controlled-fallback lifecycle;
+  conflating it with session state would make every store
+  update conditional on "are we even signed in", which is a
+  concern the auth-store owns. Parallel stores are the cleaner
+  separation.
+- **Put auth services under a new `src/auth-services/` folder.**
+  Rejected. The existing `src/services/` is small (two files)
+  and the new auth files are the same kind of thing — typed
+  HTTP wrappers with Zod-parsed responses. Splitting would
+  suggest a category difference that does not exist.
+- **Rewrite `RootTabs` to know about auth and render a
+  conditional sign-in modal inside itself.** Rejected. That
+  pushes auth concerns into the tab shell, which currently has
+  no idea what auth even is. Root-level navigation keeps the
+  tab shell ignorant of auth in exactly the same way
+  `NavigationContainer` is.
+
+Consequences:
+
+- `apps/mobile/App.tsx` changed by two lines (swap
+  `RootTabs` → `RootNavigator` import + usage). Every other
+  existing file under `apps/mobile/src/` is untouched.
+- `useAuthStore` + `useOperatorStore` coexist; future code
+  that needs both (e.g. a "show sign-out" Settings tab entry)
+  subscribes to both without ceremony.
+- `RootNavigator` uses React Navigation v7's "registered
+  screens change" behaviour — when `status` flips, the old
+  stack unmounts and the new one mounts fresh. No manual
+  `navigation.reset()` plumbing is needed.
+- When the dashboard API eventually requires a bearer token,
+  `services/api-client.ts` can swap its `fetch` for
+  `createAuthenticatedFetch(deps)` without changing its own
+  surface — the wrapper's type is `typeof fetch`.
+
+References:
+
+- `apps/mobile/App.tsx` — the two-line wiring.
+- `apps/mobile/src/navigation/root-navigator.tsx` — the
+  conditional stack.
+- `apps/mobile/src/state/auth-store.ts` — the parallel store.
+
+## Mobile SignInScreen Tests Target The Extracted Hook, Not Rendered Tree
+
+Decided: 2026-04-24 (Week 2 Phase 1.5, Gate 1.5.C ambiguity
+response — Option B)
+
+Decision:
+
+- Extract `SignInScreen`'s behaviour into a pure `performSignIn`
+  orchestrator (async function) plus a thin `useSignInHandlers`
+  React hook.
+- Extract every error-code → user-copy mapping into
+  `sign-in-copy.ts` (`errorCopy`, `signInErrorFor`).
+- Test `performSignIn` + the copy helpers directly under
+  vitest (11 cases). `SignInScreen.tsx` stays a dumb render
+  shell; its behaviour is covered by the extracted tests, not
+  by a rendered-tree test.
+- Do **not** add `@testing-library/react-native` to the
+  mobile workspace.
+
+Context:
+
+- Phase 1.5 TZ Part 1.7 asked for RN Testing Library tests on
+  `SignInScreen`. Attempting this surfaced a concrete
+  compatibility problem: `@testing-library/react-native`
+  transitively imports `react-native` source, which contains
+  Flow syntax (e.g. `import {typeof X} from '...'`). Vitest's
+  esbuild transform does not strip Flow, so *any* test file
+  that transitively imports `react-native` fails during module
+  resolution with `SyntaxError: Unexpected token 'typeof'`.
+  Zero tests actually run.
+
+Why Option B (extract + test the hook):
+
+- Every branch the rendered test would have covered —
+  happy-path idToken flow, cancelled picker, play-services-
+  unavailable, other GoogleSignInError codes, signInWith…
+  rejection with / without a typed code, "previous error
+  cleared before new attempt" — lives in `performSignIn` as
+  pure orchestration. Moving it out of the component makes
+  it unit-testable under vitest with zero new deps.
+- `sign-in-screen.tsx` reduces to <140 LOC of JSX + styles
+  that are strictly composition (hook output → Pressable +
+  error banner + conditional spinner). The rendering surface
+  is thin enough that a style regression would be caught by
+  manual QA on device; a behaviour regression would surface
+  in the hook tests.
+- No new deps, no new config. Matches the existing mobile
+  pattern — `operator-store.test.ts` tests the store, not
+  consuming screens.
+
+Alternatives considered:
+
+- **(A) Configure vitest to strip Flow syntax.** Rejected.
+  Would need a babel transform chain, `@babel/preset-flow`,
+  and per-file resolver hints — ~1-2 hours of tuning for a
+  fragile result that future React Native version bumps would
+  likely break again. Industry-documented pain point.
+- **(C) Skip `SignInScreen` testing entirely.** Rejected. The
+  sign-in entry point is the one screen where a regression
+  would be most visible to a user and most expensive to
+  recover from. Hook-level coverage is a much better fit than
+  "manual QA only".
+
+Consequences:
+
+- `apps/mobile/src/screens/auth/` contains three source
+  modules: `sign-in-copy.ts` (pure), `use-sign-in-handlers.ts`
+  (orchestrator + hook), `sign-in-screen.tsx` (render shell).
+  11 tests land alongside in `__tests__/`.
+- testIDs (`sign-in-screen`, `sign-in-button`, `error-banner`,
+  `loading-spinner`, `sign-in-config-note`, plus `auth-
+  loading-screen`) are in place so a future E2E layer
+  (Detox/Maestro) can assert against them without another
+  refactor.
+- Two transient dev-deps (`@testing-library/react-native`,
+  `react-test-renderer`) were added during Option A
+  exploration and removed immediately — lockfile is clean.
+- The pattern generalises: any future mobile screen with
+  non-trivial behaviour should extract a testable orchestrator
+  (or custom hook) rather than pull in the RN-testing tool
+  chain. If the RN + vitest + Flow interplay is ever resolved
+  upstream, revisit.
+
+References:
+
+- `apps/mobile/src/screens/auth/sign-in-copy.ts`
+- `apps/mobile/src/screens/auth/use-sign-in-handlers.ts`
+- `apps/mobile/src/screens/auth/__tests__/use-sign-in-handlers.test.ts`
+- Sibling ADR *Mobile Phase 1.5 Adds Auth Alongside…*
+  (2026-04-24) for the broader "keep existing navigation
+  intact" rationale.
