@@ -1703,3 +1703,156 @@ documents for the intended window.
   the schema change + downstream task-result persistence.
   Until then, heartbeats accumulate without harm (1.2 MB /
   week / agent; free tier 1 GB).
+
+## TD-027: Redis-backed idempotency cache for multi-instance api
+
+Discovered: 2026-04-24 (Week 3 Phase 3.1, Gate 3.1.A ADR
+    "Idempotency — In-Memory LRU With Firestore Fallback")
+Type: scalability
+Priority: P3
+Status: open
+Trigger: when `operator-os-api` scales beyond a single Cloud
+    Run instance (likely at >100 concurrent users).
+
+### Description
+
+`apps/api/src/services/idempotency-cache.ts` (Phase 3.1 c4)
+is authoritative within a single Fastify instance. Two api
+replicas don't share cache state, so a concurrent identical
+submit routed to different replicas can briefly pass both
+cache layers and produce two taskIds (last write wins at
+Firestore).
+
+Single-instance deploy today. When horizontal scaling lands,
+the cache needs to move to a shared store (Memorystore /
+Redis) so `(userId, idempotencyKey)` dedup is globally
+authoritative.
+
+### Risk if unaddressed
+
+- Duplicate `taskId`s under concurrent-retry + multi-instance.
+  User-visible symptom: the mobile client's "same idempotency
+  key" retry sometimes returns a new taskId instead of the
+  original. Rare — needs a truly concurrent submit from the
+  same client across two replicas in the same second — but
+  grows with fleet size.
+- Zero risk at current deploy (single instance).
+
+### Proposed fix
+
+1. Add `ioredis` as a direct dependency of `apps/api`.
+2. Reimplement `IdempotencyCache` as a Redis-backed variant
+   keeping the same interface (`lookup` / `remember` / `size`).
+   Dependency inversion — route handlers don't change.
+3. Provision Memorystore (Redis) in the `operator-os-dev`
+   project via a separate infrastructure PR. VPC Connector
+   required for Cloud Run → Memorystore access.
+4. Env additions: `REDIS_HOST`, `REDIS_PORT`. Wire through
+   `packages/config/src/api.ts`.
+5. Transaction pattern: `SET NX EX ttl` for first-write;
+   subsequent reads via `GET` with TTL awareness. Cache
+   holds `{taskId, status, createdAt}` JSON.
+6. Deprecate the in-memory cache OR keep it as an L1 in
+   front of Redis for latency — decide at implementation
+   time based on measured Redis RTT.
+
+### Related
+
+- `apps/api/src/services/idempotency-cache.ts` — current
+  implementation.
+- ADR "Idempotency — In-Memory LRU With Firestore Fallback"
+  (2026-04-24) — records why the current single-instance
+  posture is acceptable MVP and what the migration will
+  need.
+- TD-011 (Cloud Run reserved env var pattern) — Memorystore
+  env vars should follow the same discipline.
+
+### History
+
+- 2026-04-24: filed when Phase 3.1 c4 landed the in-memory
+  LRU cache. Deferred until horizontal scaling is the
+  operating constraint; today we're single-instance by
+  design.
+
+## TD-028: User-initiated task deletion (GDPR right to erasure)
+
+Discovered: 2026-04-24 (Week 3 Phase 3.1, Gate 3.1.A Red
+    Flag #1 privacy posture)
+Type: missing-feature · privacy
+Priority: P2
+Status: open
+Target: Week 4 or sooner if first GDPR request arrives.
+
+### Description
+
+Phase 3.1 lands 30-day automatic task retention via Firestore
+TTL on `tasks.expireAt`. That bounds the privacy blast radius
+nicely, but GDPR Article 17 (right to erasure) requires a
+user-initiated deletion path that operates on demand — not
+just time-bound auto-cleanup. A user asking "delete my task
+with prompt X right now" has no endpoint today.
+
+The 30-day retention policy is a good default; TD-028
+addresses the 0-to-30-day window where the user wants their
+data gone immediately.
+
+### Risk if unaddressed
+
+- GDPR non-compliance if we onboard EU users. Article 17 is
+  not a 30-day-SLA right; it is an on-demand right.
+- User trust — "I want my prompt gone now" is an
+  operator-shell table-stakes feature.
+- No current customer has requested it; risk is latent until
+  that happens, at which point it needs to ship fast.
+
+### Proposed fix
+
+1. Add `DELETE /v1/tasks/:taskId` endpoint.
+   - Auth: user guard (same as GET single).
+   - Ownership check via the existing
+     `getTask(taskId, userId)` accessor (returns undefined
+     for not-yours → 404 enumeration-proof, matches the
+     PATCH of spec §3.1.2).
+2. Hard-delete the Firestore document. Rationale: user
+   explicitly asked for erasure; keeping a "deleted" row
+   contradicts the request. If we need ops analytics
+   (task-count-by-user trends), append an `audit_deletions`
+   row with only `{userId, deletedAt}` — no prompt, no
+   output, no taskId.
+3. Cascade:
+   - Any `task_dispatch_attempts` rows for that taskId
+     (Phase 3.2 will create this collection).
+   - Any `cost_records` rows for that taskId — or keep
+     (billing records are separate-interest; decide at
+     implementation time).
+4. Response: 204 No Content on success, 404 on not-found /
+   not-yours.
+5. Rate limit: same GET bucket (60/min).
+6. Mobile UI: add swipe-to-delete on TaskStream history tab
+   (Phase 3.3+ work).
+
+Decision deferred to implementation time:
+- Cost records: preserve (analytics / refunds) vs cascade?
+  Leaning preserve.
+- Dispatch attempts: cascade (no user value in retaining).
+- Agent-side task queue (Phase 3.2): should an in-flight
+  task be cancelled on delete? Yes — route issues WS
+  `task-cancel` to the assigned agent.
+
+### Related
+
+- ADR "Task Lifecycle + Retention Posture (Option B —
+  30 Days)" (2026-04-24) — records the 30-day auto-policy
+  that TD-028 complements.
+- `apps/api/src/routes/tasks.ts` — existing GET-single
+  path is the template for the DELETE handler.
+- `apps/api/src/integrations/firestore.ts` — needs a
+  `deleteTask(taskId, userId)` accessor (not-yours → no-op
+  + false return, not an error, so the route can 404).
+
+### History
+
+- 2026-04-24: filed when Gate 3.1.A approved Option B
+  retention. Deferred because no user-initiated deletion
+  need exists today; escalates to P1 the moment an EU user
+  (or any user who asks) reports the need.
