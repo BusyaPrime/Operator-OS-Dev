@@ -70,15 +70,16 @@ export const createAgentHeartbeatRateLimiter = (
   };
 };
 
-const defaultHeartbeatRateLimiter = createAgentHeartbeatRateLimiter();
-
 export const registerAgentRoutes = async (
   app: FastifyInstance,
   options: AgentRoutesOptions
 ) => {
   const routeOptions = { preHandler: options.authGuard } as const;
+  // Fresh limiter per registration — each Fastify instance
+  // maintains its own single-instance rate state (ADR: WS
+  // sessions in-memory; multi-instance migration is a future TD).
   const rateLimiter =
-    options.heartbeatRateLimiter ?? defaultHeartbeatRateLimiter;
+    options.heartbeatRateLimiter ?? createAgentHeartbeatRateLimiter();
 
   app.post('/v1/agent/heartbeat', routeOptions, async (request) => {
     const deviceState = deviceStateSchema.parse(request.body);
@@ -98,8 +99,22 @@ export const registerAgentRoutes = async (
   // and is what `AgentHeartbeatLoop` in desktop-agent posts to.
   // The two coexist until every client migrates — see the
   // "Agent Heartbeat Schema Is Additive, Not Replacement" ADR.
+  //
+  // safeParse over parse so a bad body surfaces as 400 with the
+  // Zod issues list, not as 500 through the generic error
+  // handler. The older /v1/agent/heartbeat still .parse()s for
+  // bug-for-bug backward compatibility with existing clients.
   app.post('/v1/agent/heartbeat/agent', routeOptions, async (request, reply) => {
-    const heartbeat = agentHeartbeatRequestSchema.parse(request.body);
+    const parsed = agentHeartbeatRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      reply.status(400);
+      return {
+        error: 'Bad Request',
+        message: 'agentHeartbeatRequestSchema validation failed',
+        issues: parsed.error.issues
+      };
+    }
+    const heartbeat = parsed.data;
 
     if (!rateLimiter.tryAccept(heartbeat.agentId)) {
       reply.status(429);
