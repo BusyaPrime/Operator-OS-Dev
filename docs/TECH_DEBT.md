@@ -1274,7 +1274,7 @@ waits for an EOF that sometimes doesn't arrive promptly.
 Discovered: 2026-04-24 (Week 2 Phase 1.4 commit c6)
 Type: missing-feature
 Priority: P2
-Status: open
+Status: resolved (Week 2 Phase 2, 2026-04-24 — PR #32)
 
 ### Description
 
@@ -1338,6 +1338,18 @@ because a zeroed spending report would misrepresent to a UI.
   Phase 1.4. Scope of the fix is not trivial (schema,
   Firestore model, pricing table) — scheduled for a later
   phase that focuses on billing observability.
+- 2026-04-24 (Phase 2): RESOLVED via PR #32. Endpoints landed:
+  `POST /v1/cost/estimate`, `POST /v1/cost/record`,
+  `GET /v1/cost/status/:userId`,
+  `GET /v1/cost/spending/:userId?period=`. Pricing table lives
+  in `apps/api/src/services/cost.ts` per the *Cost Records
+  Persist In Firestore, Pricing Table Lives In Code* ADR.
+  `ApiCostProvider` stubs in desktop-agent still render zero
+  until a follow-up commit swaps them for real calls;
+  functional replacement tracked inline (not a new TD — the
+  stubs are honest placeholders that log what they would do).
+  Enterprise admin surface for editing user_budgets docs is
+  the new TD-025.
 
 ## TD-023: Evaluate node-pty for raw-terminal agent streaming
 
@@ -1407,7 +1419,7 @@ decisions for the desktop agent's eventual signed installers.
 Discovered: 2026-04-24 (Week 2 Phase 1.4 commit c12)
 Type: missing-feature
 Priority: P2
-Status: open
+Status: resolved (Week 2 Phase 2, 2026-04-24 — PR #32)
 
 ### Description
 
@@ -1478,3 +1490,138 @@ rescuing a broken production path.
   in Phase 1.4 commit c12. api-side implementation is
   scheduled for the phase that opens agent observability
   to the mobile UI.
+- 2026-04-24 (Phase 2): RESOLVED via PR #32. Endpoint
+  `POST /v1/agent/heartbeat/agent` is live; request body
+  validated against `agentHeartbeatRequestSchema`; 5s-per-
+  agent in-memory rate limiter returns 429 on spam;
+  Firestore accessor persists to `agentHeartbeats` with
+  doc id `{agentId}__{receivedAtMs}`. Manual step
+  remaining: Firestore Console TTL policy on
+  `agentHeartbeats.receivedAt` (7 days) — noted in the PR
+  body and in a code comment next to the accessor.
+  Existing `POST /v1/agent/heartbeat` (deviceStateSchema)
+  left untouched; see *Agent Heartbeat v2 Ships As A New
+  Endpoint, Not A Modified One* ADR.
+
+## TD-017: api `/v1/agent/ws` WebSocket endpoint missing
+
+Discovered: 2026-04-22 (Phase 1.4 `WebSocketStreamProvider` landed
+    against a 404 endpoint)
+Type: missing-feature
+Priority: P2
+Status: resolved (Week 2 Phase 2, 2026-04-24 — PR #32)
+
+### Description
+
+The Desktop Agent's `WebSocketStreamProvider` (Phase 1.4)
+connects to `wss://.../v1/agent/ws` and POSTs a `hello` frame
+with the agent's manifest. The endpoint did not exist on the
+api until Phase 2. Without it, the provider's per-task WebSocket
+connect failed with `ECONNREFUSED` (local) or 404 (prod); the
+local fan-out to in-process listeners still worked, so
+`ClaudeCodeAgent` tests and local-only invocations were
+unaffected. The gap was strictly about enabling real end-to-end
+streaming from agent through api to mobile.
+
+### Resolution
+
+PR #32 added `WSS /v1/agent/ws` via `@fastify/websocket` with:
+- `preValidation` on the upgrade running the same agent-guard
+  the HTTP `/v1/agent/*` routes already use (HS256 JWT).
+- hello → welcome handshake with `sessionId` + `serverFeatures`.
+- Ping loop at `pingIntervalMs` (default 30s); inactive
+  sessions closed with 4008 after `pongTimeoutMs` (default 60s).
+- `AgentSessionRegistry` (in-memory, one Fastify instance) with
+  close-prior-on-duplicate-agentId (code 4004).
+- Close codes covered: 1000 normal, 1011 internal, 4001
+  unauthorized, 4002 hello-invalid, 4003 hello-timeout, 4004
+  duplicate-agent, 4008 ping-timeout.
+- Graceful `onClose` hook closes every live session with 1001
+  "going-away" so rolling deploys don't leak zombies.
+
+See ADR *Agent WebSocket Sessions Are In-Memory (MVP); Redis
+Coordination Is A Future TD* (2026-04-24) for the multi-instance
+migration plan.
+
+### Related
+
+- `apps/api/src/routes/agent-ws.ts` — route + handshake + ping
+  loop + post-welcome frame handlers.
+- `apps/api/src/services/agent-session-registry.ts` — in-memory
+  registry.
+- `apps/desktop-agent/src/providers/websocket-stream-provider.ts`
+  — the producer that was waiting on this endpoint.
+- Sibling Phase 2 TD closures: TD-022 (cost), TD-024 (heartbeat v2).
+
+### History
+
+- 2026-04-22: implicitly filed when `WebSocketStreamProvider`
+  landed in Phase 1.4 without a matching api endpoint. Tracked
+  informally in code comments + closure docs; never had a
+  dedicated `TECH_DEBT.md` entry until it closed.
+- 2026-04-24 (Phase 2): RESOLVED via PR #32. Retroactively
+  formalised here for the closure record.
+
+## TD-025: Enterprise admin surface for editing `user_budgets`
+
+Discovered: 2026-04-24 (Week 2 Phase 2 cost endpoints)
+Type: missing-feature
+Priority: P3
+Status: open
+
+### Description
+
+Phase 2 (TD-022) ships per-user cost records + a `user_budgets`
+Firestore collection that holds plan-override docs. The api
+surface to *read* a user's own budget already exists
+(`GET /v1/cost/status/:userId`). There is no surface to **set**
+a `userBudgets/{userId}` document except by manually editing
+Firestore in the Console.
+
+That is fine for local dev and the single-operator case — the
+internal `free` plan default of $1/month is enforced, and the
+ADR *Cost Records Persist In Firestore, Pricing Table Lives In
+Code* already records that plan-level budgets are source-of-
+truth in code. For enterprise customers who need a custom
+`monthlyLimitUsd`, an admin needs a way to upsert the override.
+
+### Risk if unaddressed
+
+- Today the free / pro / enterprise defaults cover every case;
+  `custom` plan users do not yet exist. So no functional harm
+  right now.
+- First enterprise onboarding will require either a manual
+  Firestore edit (error-prone) or this TD to close.
+- `user_budgets` docs are Zod-validated on read, so a malformed
+  manual edit is caught and logged, but the user would silently
+  fall back to plan defaults instead of their custom ceiling —
+  degrades gracefully rather than over-charging.
+
+### Proposed fix
+
+1. Add a `POST /v1/admin/budgets/:userId` endpoint behind an
+   admin-role guard (requires
+   `verifiedUserContextSchema.roles` to include `admin`).
+2. Body validated against the existing `UserBudgetRecord`
+   shape; Firestore repo already has `setUserBudget()`.
+3. Mobile settings tab gains a "billing" view (future) that
+   renders `GET /v1/cost/status/:userId` — but the *edit*
+   surface remains admin-only.
+4. Enterprise sign-up flow (further future) can call this
+   endpoint automatically.
+
+### Related
+
+- `apps/api/src/integrations/firestore.ts` — `setUserBudget`
+  method is already implemented; just unused by any route.
+- `apps/api/src/services/cost.ts` — `PLAN_BUDGETS` records
+  what `custom` plan means (monthlyLimitUsd = 0, i.e. "read
+  from Firestore").
+- ADR *Cost Records Persist In Firestore, Pricing Table Lives
+  In Code* (2026-04-24).
+
+### History
+
+- 2026-04-24: filed when the Phase 2 cost endpoints landed.
+  Deferred because no `custom` plan users exist yet; admin
+  surface is dead weight until the first enterprise onboarding.

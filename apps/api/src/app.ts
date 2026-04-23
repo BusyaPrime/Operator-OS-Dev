@@ -1,3 +1,4 @@
+import fastifyWebsocket from '@fastify/websocket';
 import Fastify from 'fastify';
 import type { ApiEnv } from '@operator-os/config';
 
@@ -14,18 +15,31 @@ import { IntegrationError } from './integrations/runtime.js';
 import { registerHealthRoutes } from './routes/health.js';
 import { registerAiRoutes } from './routes/ai.js';
 import { registerAgentRoutes } from './routes/agent.js';
+import { registerAgentWsRoute } from './routes/agent-ws.js';
+import { registerCostRoutes } from './routes/cost.js';
 import { registerInternalTasksRoutes } from './routes/internal-tasks.js';
 import { registerOperatorRoutes } from './routes/operator.js';
 import { VertexAIProvider } from './providers/index.js';
 import { buildReadinessResponse } from './readiness.js';
+import { createAgentSessionRegistry } from './services/agent-session-registry.js';
 import { AlertsService } from './services/alerts.js';
 import { CommandsService } from './services/commands.js';
+import { CostService } from './services/cost.js';
 import { ExportsService } from './services/exports.js';
 import { SessionsService } from './services/sessions.js';
 import type { AIProvider } from './types.js';
 
 interface BuildServerOptions {
   aiProvider?: AIProvider;
+  /**
+   * Defaults to `true`. Tests disable it because
+   * @fastify/websocket's `injectWS` helper produces a raw socket
+   * without a `remoteAddress`, which pino's req-serializer reads
+   * through `request.ip` → `proxyaddr` and then crashes during
+   * the pre-upgrade "incoming request" log. Production always
+   * wants it on (Cloud Run terminates TLS upstream).
+   */
+  trustProxy?: boolean;
 }
 
 export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) => {
@@ -37,11 +51,23 @@ export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) =>
         environment: config.NODE_ENV
       }
     },
-    trustProxy: true
+    trustProxy: options.trustProxy ?? true
   });
 
   app.decorateRequest('authSession', undefined);
   app.decorateRequest('currentUser', undefined);
+
+  // Register @fastify/websocket (Phase 2 — TD-017). Keeps ws
+  // support inside the same Fastify bootstrap so JWT middleware,
+  // error handler, and logger all apply to WS upgrade requests
+  // exactly like they apply to HTTP. Explicit max-payload guard
+  // here — agent-side messages are small JSON control frames
+  // and a multi-MB payload would be a bug worth surfacing.
+  void app.register(fastifyWebsocket, {
+    options: {
+      maxPayload: 1_048_576 // 1 MiB
+    }
+  });
 
   const aiProvider =
     options.aiProvider ??
@@ -88,6 +114,8 @@ export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) =>
     storageService,
     tasksQueue
   });
+  const costService = new CostService();
+  const agentSessionRegistry = createAgentSessionRegistry();
   const operatorModules = [
     authService,
     firestoreRepository,
@@ -165,6 +193,16 @@ export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) =>
   void registerAiRoutes(app, {
     aiProvider,
     authGuard: authService.createRequiredGuard()
+  });
+  void registerCostRoutes(app, {
+    costService,
+    repository: firestoreRepository,
+    agentGuard: authService.createAgentGuard(agentAudience),
+    userGuard: authService.createRequiredGuard()
+  });
+  void registerAgentWsRoute(app, {
+    agentGuard: authService.createAgentGuard(agentAudience),
+    sessionRegistry: agentSessionRegistry
   });
   void registerInternalTasksRoutes(app);
 
