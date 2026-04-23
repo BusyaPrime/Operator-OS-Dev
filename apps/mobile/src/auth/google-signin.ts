@@ -62,8 +62,9 @@ export interface GoogleSignInModule {
  * Minimal shape we need from the SDK. Keeping this local instead
  * of relying on the vendor types means if the SDK introduces a
  * breaking shape change, the compiler tells us exactly here.
+ * Exported so tests can construct a typed fake.
  */
-interface RawGoogleSDK {
+export interface RawGoogleSDK {
   configure(options: {
     webClientId: string;
     iosClientId?: string;

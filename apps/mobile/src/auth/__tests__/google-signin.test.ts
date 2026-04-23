@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 /**
  * Mock the vendor module wholesale so tests can run under Node
  * without the native Google Sign-In module linked. The wrapper
- * injects its own SDK via `createGoogleSignIn({ sdk })`, but
+ * injects its own SDK via `createGoogleSignIn({ sdk: asSdk(sdk) })`, but
  * `isErrorWithCode` + `statusCodes` still have to exist at
  * import time.
  */
@@ -33,7 +33,8 @@ vi.mock('@react-native-google-signin/google-signin', () => {
 
 import {
   createGoogleSignIn,
-  GoogleSignInError
+  GoogleSignInError,
+  type RawGoogleSDK
 } from '../google-signin.js';
 
 interface FakeSDK {
@@ -50,6 +51,9 @@ const makeFakeSdk = (): FakeSDK => ({
   signOut: vi.fn().mockResolvedValue(undefined)
 });
 
+/** vi.fn() is typed too loosely for `RawGoogleSDK`; narrow via unknown. */
+const asSdk = (sdk: FakeSDK): RawGoogleSDK => sdk as unknown as RawGoogleSDK;
+
 describe('googleSignIn wrapper', () => {
   let sdk: FakeSDK;
 
@@ -59,7 +63,7 @@ describe('googleSignIn wrapper', () => {
 
   describe('configure() + isConfigured()', () => {
     it('starts un-configured until configure() is called', () => {
-      const gs = createGoogleSignIn({ sdk });
+      const gs = createGoogleSignIn({ sdk: asSdk(sdk) });
       expect(gs.isConfigured()).toBe(false);
       gs.configure({ webClientId: 'web-id' });
       expect(gs.isConfigured()).toBe(true);
@@ -70,7 +74,7 @@ describe('googleSignIn wrapper', () => {
     });
 
     it('forwards iosClientId when provided', () => {
-      const gs = createGoogleSignIn({ sdk });
+      const gs = createGoogleSignIn({ sdk: asSdk(sdk) });
       gs.configure({ webClientId: 'web-id', iosClientId: 'ios-id' });
       expect(sdk.configure).toHaveBeenCalledWith({
         webClientId: 'web-id',
@@ -81,7 +85,7 @@ describe('googleSignIn wrapper', () => {
 
   describe('signIn()', () => {
     it('throws not-configured when configure() is missing', async () => {
-      const gs = createGoogleSignIn({ sdk });
+      const gs = createGoogleSignIn({ sdk: asSdk(sdk) });
       await expect(gs.signIn()).rejects.toMatchObject({
         code: 'not-configured'
       });
@@ -95,7 +99,7 @@ describe('googleSignIn wrapper', () => {
           user: { email: 'u@x.com', name: 'Test', photo: 'http://p/i.png' }
         }
       });
-      const gs = createGoogleSignIn({ sdk });
+      const gs = createGoogleSignIn({ sdk: asSdk(sdk) });
       gs.configure({ webClientId: 'web-id' });
 
       const result = await gs.signIn();
@@ -110,7 +114,7 @@ describe('googleSignIn wrapper', () => {
         idToken: 'id-token-legacy',
         user: { email: 'legacy@x.com' }
       });
-      const gs = createGoogleSignIn({ sdk });
+      const gs = createGoogleSignIn({ sdk: asSdk(sdk) });
       gs.configure({ webClientId: 'web-id' });
 
       const result = await gs.signIn();
@@ -120,7 +124,7 @@ describe('googleSignIn wrapper', () => {
 
     it('throws no-id-token when the SDK returns an empty idToken', async () => {
       sdk.signIn.mockResolvedValueOnce({ data: { idToken: null } });
-      const gs = createGoogleSignIn({ sdk });
+      const gs = createGoogleSignIn({ sdk: asSdk(sdk) });
       gs.configure({ webClientId: 'web-id' });
       await expect(gs.signIn()).rejects.toMatchObject({
         code: 'no-id-token'
@@ -132,7 +136,7 @@ describe('googleSignIn wrapper', () => {
         code: 'SIGN_IN_CANCELLED',
         message: 'dismissed'
       });
-      const gs = createGoogleSignIn({ sdk });
+      const gs = createGoogleSignIn({ sdk: asSdk(sdk) });
       gs.configure({ webClientId: 'web-id' });
       await expect(gs.signIn()).rejects.toMatchObject({ code: 'cancelled' });
     });
@@ -142,7 +146,7 @@ describe('googleSignIn wrapper', () => {
         code: 'IN_PROGRESS',
         message: 'already'
       });
-      const gs = createGoogleSignIn({ sdk });
+      const gs = createGoogleSignIn({ sdk: asSdk(sdk) });
       gs.configure({ webClientId: 'web-id' });
       await expect(gs.signIn()).rejects.toMatchObject({
         code: 'in-progress'
@@ -154,7 +158,7 @@ describe('googleSignIn wrapper', () => {
         code: 'PLAY_SERVICES_NOT_AVAILABLE',
         message: 'missing'
       });
-      const gs = createGoogleSignIn({ sdk });
+      const gs = createGoogleSignIn({ sdk: asSdk(sdk) });
       gs.configure({ webClientId: 'web-id' });
       await expect(gs.signIn()).rejects.toMatchObject({
         code: 'play-services-unavailable'
@@ -163,7 +167,7 @@ describe('googleSignIn wrapper', () => {
 
     it('maps any other SDK error → code=unknown', async () => {
       sdk.signIn.mockRejectedValueOnce(new Error('kaboom'));
-      const gs = createGoogleSignIn({ sdk });
+      const gs = createGoogleSignIn({ sdk: asSdk(sdk) });
       gs.configure({ webClientId: 'web-id' });
       await expect(gs.signIn()).rejects.toMatchObject({ code: 'unknown' });
     });
@@ -172,7 +176,7 @@ describe('googleSignIn wrapper', () => {
       sdk.signIn.mockResolvedValueOnce({
         data: { idToken: 'id-token' }
       });
-      const gs = createGoogleSignIn({ sdk });
+      const gs = createGoogleSignIn({ sdk: asSdk(sdk) });
       gs.configure({ webClientId: 'web-id', requirePlayServices: false });
       await gs.signIn();
       expect(sdk.hasPlayServices).not.toHaveBeenCalled();
@@ -181,13 +185,13 @@ describe('googleSignIn wrapper', () => {
 
   describe('signOut()', () => {
     it('no-ops when never configured', async () => {
-      const gs = createGoogleSignIn({ sdk });
+      const gs = createGoogleSignIn({ sdk: asSdk(sdk) });
       await gs.signOut();
       expect(sdk.signOut).not.toHaveBeenCalled();
     });
 
     it('delegates to the SDK once configured', async () => {
-      const gs = createGoogleSignIn({ sdk });
+      const gs = createGoogleSignIn({ sdk: asSdk(sdk) });
       gs.configure({ webClientId: 'web-id' });
       await gs.signOut();
       expect(sdk.signOut).toHaveBeenCalledOnce();
