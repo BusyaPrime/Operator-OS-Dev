@@ -21,6 +21,7 @@
     "firebase-admin": "^13.8.0",
     "google-auth-library": "^10.6.2",
     "jose": "^5.10.0",
+    "ws": "^8.20.0",
     "zod": "^4.1.12"
   },
   "scripts": {
@@ -30,5 +31,8 @@
     "start": "node dist/server.js",
     "test": "pnpm exec vitest run",
     "typecheck": "pnpm exec tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.1"
   }
 }

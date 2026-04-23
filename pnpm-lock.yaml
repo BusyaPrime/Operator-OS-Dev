@@ -89,9 +89,16 @@ importers:
       jose:
         specifier: ^5.10.0
         version: 5.10.0
+      ws:
+        specifier: ^8.20.0
+        version: 8.20.0
       zod:
         specifier: ^4.1.12
         version: 4.3.6
+    devDependencies:
+      '@types/ws':
+        specifier: ^8.18.1
+        version: 8.18.1
 
   apps/auth-gateway:
     dependencies:
