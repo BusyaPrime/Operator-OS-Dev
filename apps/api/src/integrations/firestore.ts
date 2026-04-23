@@ -588,6 +588,80 @@ export class FirestoreOperatorRepository {
     }
   }
 
+  /**
+   * Internal-dispatch read — no ownership check. Used by the Phase 3.2
+   * dispatch pipeline (Pub/Sub push handler → router → WS) where the
+   * caller is the api itself, not an end-user session. Ownership
+   * enforcement still happens on user-facing getTask(taskId, userId).
+   */
+  async getTaskByIdInternal(taskId: string): Promise<TaskRecord | undefined> {
+    if (!this.#adcStatus.available) return undefined;
+    try {
+      const doc = await this.#getClient()
+        .collection(TASKS_COLLECTION)
+        .doc(taskId)
+        .get();
+      if (!doc.exists) return undefined;
+      const parsed = taskRecordSchema.safeParse(doc.data());
+      if (!parsed.success) {
+        this.#logger.warn(
+          {
+            collectionName: TASKS_COLLECTION,
+            documentId: taskId,
+            issues: parsed.error.issues
+          },
+          'internal task read skipped — schema drift'
+        );
+        return undefined;
+      }
+      return parsed.data;
+    } catch (err) {
+      this.#logger.warn({ err, taskId }, 'internal task read failed');
+      return undefined;
+    }
+  }
+
+  /**
+   * Partial task update — Phase 3.2 dispatch writes status transitions
+   * (pending → queued → assigned → failed) and assignedAgentId. Fields
+   * not present in the patch are left unchanged. updatedAt is
+   * auto-set if the caller does not provide it.
+   *
+   * Returns {updated: false} on ADC-absent or Firestore failure; the
+   * dispatch pipeline tolerates record-only fallbacks the same way
+   * the publisher and retry scheduler do.
+   */
+  async updateTask(
+    taskId: string,
+    patch: {
+      readonly status?: TaskStatus;
+      readonly assignedAgentId?: string | null;
+      readonly error?: { readonly code: string; readonly message: string } | null;
+      readonly updatedAt?: string;
+    }
+  ): Promise<{ readonly updated: boolean }> {
+    if (!this.#adcStatus.available) return { updated: false };
+    try {
+      const sanitized: Record<string, unknown> = {
+        updatedAt: patch.updatedAt ?? new Date().toISOString()
+      };
+      if (patch.status !== undefined) sanitized.status = patch.status;
+      if (patch.assignedAgentId !== undefined) {
+        sanitized.assignedAgentId = patch.assignedAgentId;
+      }
+      if (patch.error !== undefined) sanitized.error = patch.error;
+
+      await this.#getClient()
+        .collection(TASKS_COLLECTION)
+        .doc(taskId)
+        .update(sanitized);
+      return { updated: true };
+    } catch (err) {
+      this.#logger.warn({ err, taskId, patch }, 'task update failed');
+      return { updated: false };
+    }
+  }
+
   async appendAuditEvent(event: AnalyticsEvent): Promise<MutationReceipt> {
     const parsedEvent = analyticsEventSchema.parse(event);
 

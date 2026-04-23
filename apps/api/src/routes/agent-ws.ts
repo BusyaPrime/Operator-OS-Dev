@@ -1,3 +1,4 @@
+import { agentManifestSchema } from '@operator-os/contracts';
 import type { FastifyInstance, preHandlerAsyncHookHandler } from 'fastify';
 import type { WebSocket as WsWebSocket } from 'ws';
 import { z } from 'zod';
@@ -69,6 +70,11 @@ const postWelcomeFrameSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('heartbeat-ping') }),
   z.object({ type: z.literal('task-accepted'), taskId: z.string().min(1) }),
   z.object({
+    type: z.literal('task-rejected'),
+    taskId: z.string().min(1),
+    reason: z.string().optional()
+  }),
+  z.object({
     type: z.literal('task-progress'),
     taskId: z.string().min(1),
     progress: z.unknown().optional()
@@ -92,6 +98,62 @@ const postWelcomeFrameSchema = z.discriminatedUnion('type', [
 
 export type AgentWsIncomingFrame = z.infer<typeof postWelcomeFrameSchema>;
 
+/**
+ * Server → agent `task-assign` frame payload. Schema is a mirror of
+ * the Phase 3.2 WS spec (Gate 3.2.A Section 7).
+ */
+export interface TaskAssignPayload {
+  readonly taskId: string;
+  readonly prompt: string;
+  readonly capabilities: readonly string[];
+  readonly metadata: {
+    readonly userId: string;
+    readonly createdAt: string;
+    readonly expireAt: string;
+  };
+}
+
+/**
+ * Outbound helper — the dispatch pipeline (composed in app.ts) invokes
+ * this once the router picks an agent. Returns false on send failure
+ * so the caller can treat the agent as unreachable and re-dispatch to
+ * a sibling agent rather than silently dropping the task.
+ */
+export const sendTaskAssign = (
+  socket: WsWebSocket,
+  payload: TaskAssignPayload
+): boolean => {
+  try {
+    socket.send(JSON.stringify({ type: 'task-assign', payload }));
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Callbacks invoked on inbound task-related frames so the route layer
+ * stays pure transport and the dispatch orchestration (router +
+ * scheduler + Firestore) lives in a single composition root.
+ *
+ * Callbacks run fire-and-forget; any throw is logged and swallowed so
+ * an orchestration bug cannot collapse the WS connection.
+ */
+export interface AgentWsTaskCallbacks {
+  onTaskAccepted?(params: {
+    readonly sessionId: string;
+    readonly agentId: string;
+    readonly taskId: string;
+  }): Promise<void> | void;
+
+  onTaskRejected?(params: {
+    readonly sessionId: string;
+    readonly agentId: string;
+    readonly taskId: string;
+    readonly reason?: string;
+  }): Promise<void> | void;
+}
+
 export interface AgentWsRouteOptions {
   readonly agentGuard: preHandlerAsyncHookHandler;
   readonly sessionRegistry: AgentSessionRegistry;
@@ -100,6 +162,8 @@ export interface AgentWsRouteOptions {
   readonly pongTimeoutMs?: number;
   /** Test clock; defaults to Date.now. */
   readonly now?: () => number;
+  /** Phase 3.2 task-dispatch callbacks. Absent in Phase 2 tests. */
+  readonly taskCallbacks?: AgentWsTaskCallbacks;
 }
 
 const DEFAULTS = {
@@ -226,6 +290,31 @@ export const registerAgentWsRoute = async (
           closeWith(4002, 'hello-invalid');
           return;
         }
+
+        // Phase 3.2: validate manifest capabilities against the runtime
+        // schema in @operator-os/contracts. An agent whose manifest
+        // does not type-check at this layer is rejected here so the
+        // router never observes malformed capability declarations.
+        const manifestValidation = agentManifestSchema.safeParse(
+          parsed.data.manifest
+        );
+        if (!manifestValidation.success) {
+          logger.warn(
+            {
+              agentId: parsed.data.agentId,
+              issues: manifestValidation.error.issues
+            },
+            'hello manifest failed runtime validation'
+          );
+          sendJson({
+            type: 'error',
+            code: 'manifest-invalid',
+            message: 'manifest capabilities failed runtime validation'
+          });
+          closeWith(4002, 'manifest-invalid');
+          return;
+        }
+
         if (helloTimer !== undefined) {
           clearTimeout(helloTimer);
           helloTimer = undefined;
@@ -280,21 +369,74 @@ export const registerAgentWsRoute = async (
           case 'heartbeat-ping':
             // Touch already handled above — nothing else to do.
             return;
-          case 'task-accepted':
-          case 'task-progress':
-          case 'task-delta':
-          case 'task-completed':
-          case 'task-failed':
-            // Phase 2 scope: log + bump. Router integration +
-            // task_results persistence lands in Week 4 — see the
-            // "End-to-end Task Flow" doc.
+          case 'task-accepted': {
             logger.info(
               {
                 sessionId,
                 messageType: parsed.data.type,
                 taskId: parsed.data.taskId
               },
-              'task-channel message received (logged only in Phase 2)'
+              'task-accepted received'
+            );
+            if (options.taskCallbacks?.onTaskAccepted) {
+              const session = options.sessionRegistry.byId(sessionId);
+              const agentId = session?.agentId ?? 'unknown';
+              void Promise.resolve(
+                options.taskCallbacks.onTaskAccepted({
+                  sessionId,
+                  agentId,
+                  taskId: parsed.data.taskId
+                })
+              ).catch((err) => {
+                logger.warn(
+                  { err, sessionId, taskId: parsed.data.taskId },
+                  'onTaskAccepted callback threw'
+                );
+              });
+            }
+            return;
+          }
+          case 'task-rejected': {
+            logger.info(
+              {
+                sessionId,
+                taskId: parsed.data.taskId,
+                reason: parsed.data.reason
+              },
+              'task-rejected received'
+            );
+            if (options.taskCallbacks?.onTaskRejected) {
+              const session = options.sessionRegistry.byId(sessionId);
+              const agentId = session?.agentId ?? 'unknown';
+              void Promise.resolve(
+                options.taskCallbacks.onTaskRejected({
+                  sessionId,
+                  agentId,
+                  taskId: parsed.data.taskId,
+                  reason: parsed.data.reason
+                })
+              ).catch((err) => {
+                logger.warn(
+                  { err, sessionId, taskId: parsed.data.taskId },
+                  'onTaskRejected callback threw'
+                );
+              });
+            }
+            return;
+          }
+          case 'task-progress':
+          case 'task-delta':
+          case 'task-completed':
+          case 'task-failed':
+            // Phase 3.3 scope: persist streaming / terminal state.
+            // Phase 3.2 logs only; see "End-to-end Task Flow" doc.
+            logger.info(
+              {
+                sessionId,
+                messageType: parsed.data.type,
+                taskId: parsed.data.taskId
+              },
+              'task-channel message received (logged only in Phase 3.2)'
             );
             return;
           default:

@@ -13,6 +13,7 @@ import { z } from 'zod';
 
 import type { FirestoreOperatorRepository } from '../integrations/firestore.js';
 import type { IdempotencyCache } from '../services/idempotency-cache.js';
+import type { TaskDispatchPublisher } from '../services/task-dispatch-publisher.js';
 
 /**
  * Retention window for TaskRecord.expireAt. Per Gate 3.1.A
@@ -98,6 +99,14 @@ export interface TaskRoutesOptions {
   /** Injectable clock (tests pass a controlled now). */
   readonly now?: () => Date;
   readonly rateLimiter?: TaskRateLimiter;
+  /**
+   * Phase 3.2 dispatch trigger. When present, POST /v1/tasks publishes
+   * {taskId, attempt=1} to the task-dispatch Pub/Sub topic after a
+   * successful recordTask. Absent in Phase 3.1 tests and in dev envs
+   * without ADC — POST returns 201 and the dispatch pipeline is
+   * record-only.
+   */
+  readonly dispatchPublisher?: TaskDispatchPublisher;
 }
 
 const listQuerySchema = z.object({
@@ -256,6 +265,28 @@ export const registerTaskRoutes = async (
         status: 'pending',
         createdAt
       });
+
+      // Phase 3.2 dispatch trigger. Fire-and-forget against Pub/Sub;
+      // a failure here is logged but does NOT fail the POST — Phase
+      // 3.1 persistence already succeeded, and the task can be
+      // re-dispatched by a reconciliation job (future TD) without
+      // user intervention.
+      if (options.dispatchPublisher) {
+        const dispatchResult = await options.dispatchPublisher.publishDispatchTask({
+          taskId,
+          attempt: 1
+        });
+        if (!dispatchResult.published) {
+          app.log.warn(
+            {
+              taskId,
+              mode: dispatchResult.mode,
+              reason: dispatchResult.reason
+            },
+            'task-dispatch publish failed; task will need manual re-dispatch'
+          );
+        }
+      }
 
       // Privacy: no prompt/output in logs. Only metadata + ids.
       // Gate 3.1.A Red Flag #1 / Option B retention posture.
