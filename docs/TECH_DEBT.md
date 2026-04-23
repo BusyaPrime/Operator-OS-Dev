@@ -1856,3 +1856,97 @@ Decision deferred to implementation time:
   retention. Deferred because no user-initiated deletion
   need exists today; escalates to P1 the moment an EU user
   (or any user who asks) reports the need.
+
+## TD-029: Apply TTL policy to `tasks.expireAt` post-first-write
+
+Discovered: 2026-04-24 (Phase 3.1 post-merge Firestore setup
+    by Akmal)
+Type: deployment · privacy
+Priority: P2
+Status: open
+Trigger: after the first successful POST /v1/tasks creates
+    the `tasks` collection in Firestore, apply TTL manually
+    via Firestore Console.
+
+### Description
+
+Phase 3.1 Firestore setup landed three composite indexes on
+`tasks` — all Enabled:
+
+- `tasks (userId ASC, createdAt DESC)`
+- `tasks (userId ASC, status ASC, createdAt DESC)`
+- `tasks (idempotencyKey ASC, userId ASC, createdAt DESC)`
+
+The TTL policy on `tasks.expireAt` was NOT applicable at setup
+time. Firestore Console TTL UI autocomplete only offers
+collections that already exist, and `tasks` had zero documents
+until the first POST /v1/tasks succeeds in production. Dropdown
+offered only the pre-existing collections (`users`,
+`refreshTokens`, `agentHeartbeats`, `costRecords`).
+
+The write-time logic in `apps/api/src/routes/tasks.ts` already
+sets `expireAt = createdAt + 30d` on every inserted task — the
+data contract is honored. What is missing is the server-side
+TTL policy that causes Firestore to actually garbage-collect
+expired documents.
+
+Absolute-timestamp convention (not duration-offset) is
+preserved: TD-026 lesson applies — a Firestore TTL fires when
+the named field has passed "now", so the field must be the
+absolute expiry timestamp, never `createdAt`.
+
+### Risk if unaddressed
+
+- Unbounded growth of the `tasks` collection once users are
+  active. At MVP submission rate (~1 task / user / min) and
+  a 100-user beta, ~145k docs/day accumulate with no
+  garbage collection.
+- Free-tier Firestore headroom masks the symptom for weeks,
+  but the stated privacy posture of "30-day retention"
+  becomes false after day 30 — ADR "Task Lifecycle +
+  Retention Posture (Option B — 30 Days)" becomes out of
+  sync with reality.
+- Zero risk before the first user-submitted task lands —
+  collection does not yet exist.
+
+### Proposed fix
+
+1. After the first production POST /v1/tasks creates the
+   `tasks` collection, open Firestore Console → TTL.
+2. Select collection `tasks`, field `expireAt`.
+3. Apply policy. Wait for "Serving" state (can take up to
+   24h per Firestore docs).
+4. Confirm with a smoke test: insert a task with
+   `expireAt = now - 1h`, wait the cleanup window, verify
+   the document was deleted. Optional — the policy is
+   self-evident from the absence of 30+-day-old rows over
+   time.
+
+### Alternative (future improvement, not blocking)
+
+- Automate via Terraform (`google_firestore_field` resource
+  with `ttl_config`) so the policy is infrastructure-as-code
+  alongside the index declarations. Would apply idempotently
+  even when the collection is empty, since TF operates at
+  the field-schema level, not the collection-exists level.
+- Or run `gcloud firestore fields ttls update` as a one-shot
+  post-first-write hook (Cloud Scheduler trigger or manual
+  CI step).
+
+### Related
+
+- TD-026: exact same pattern for `agentHeartbeats` (expireAt
+  = receivedAt + 7d, TTL deferred until that collection
+  schema change lands).
+- ADR "Task Lifecycle + Retention Posture (Option B — 30
+  Days)" (2026-04-24) — records the 30-day auto-policy that
+  this TTL enforces.
+- `apps/api/src/routes/tasks.ts` — authoritative writer of
+  `expireAt` at POST time.
+
+### History
+
+- 2026-04-24: filed when Akmal set up Firestore indexes for
+  Phase 3.1 post-PR-#33-merge. Console TTL UI could not find
+  the `tasks` collection because no documents existed yet.
+  Deferred to post-first-write manual application.
