@@ -1,3 +1,4 @@
+import fastifyWebsocket from '@fastify/websocket';
 import Fastify from 'fastify';
 import type { ApiEnv } from '@operator-os/config';
 
@@ -42,6 +43,18 @@ export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) =>
 
   app.decorateRequest('authSession', undefined);
   app.decorateRequest('currentUser', undefined);
+
+  // Register @fastify/websocket (Phase 2 — TD-017). Keeps ws
+  // support inside the same Fastify bootstrap so JWT middleware,
+  // error handler, and logger all apply to WS upgrade requests
+  // exactly like they apply to HTTP. Explicit max-payload guard
+  // here — agent-side messages are small JSON control frames
+  // and a multi-MB payload would be a bug worth surfacing.
+  void app.register(fastifyWebsocket, {
+    options: {
+      maxPayload: 1_048_576 // 1 MiB
+    }
+  });
 
   const aiProvider =
     options.aiProvider ??
