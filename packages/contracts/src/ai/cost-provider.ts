@@ -1,3 +1,5 @@
+import { z } from 'zod';
+
 import type { AIAgentUsage } from './ai-agent.js';
 
 /** Input for a cost estimate before task execution. */
@@ -104,3 +106,82 @@ export interface CostProvider {
   /** Aggregate spending for a reporting period. */
   getUserSpending(userId: string, period: SpendingPeriod): Promise<SpendingReport>;
 }
+
+// ---------------------------------------------------------------------
+// Zod schemas (additive, Phase 2 / TD-022)
+//
+// Wire-level validation for the api's `/v1/cost/*` endpoints.
+// Every schema mirrors the TypeScript interface above 1:1; the
+// __tests__/cost-provider.test.ts sibling asserts that
+// `z.infer<schema>` is assignable to the corresponding interface,
+// so a drift in either direction fails at compile time.
+//
+// Exporting from `@operator-os/contracts` keeps the api + desktop-
+// agent + (future) mobile on exactly one Zod representation —
+// same rule as the auth-gateway schemas.
+// ---------------------------------------------------------------------
+
+/** Usage counts + cost paid for one task invocation. */
+export const aiAgentUsageSchema = z.object({
+  promptTokens: z.number().int().nonnegative(),
+  completionTokens: z.number().int().nonnegative(),
+  totalTokens: z.number().int().nonnegative(),
+  costUsd: z.number().nonnegative()
+});
+
+export const costPlanSchema = z.enum(['free', 'pro', 'enterprise', 'custom']);
+
+export const spendingPeriodSchema = z.enum([
+  'today',
+  'this-week',
+  'this-month',
+  'all-time'
+]);
+
+export const costEstimateRequestSchema = z.object({
+  providerId: z.string().min(1),
+  model: z.string().min(1),
+  promptTokens: z.number().int().nonnegative(),
+  expectedCompletionTokens: z.number().int().nonnegative()
+});
+
+export const costEstimateSchema = z.object({
+  costUsd: z.number().nonnegative(),
+  breakdown: z.object({
+    promptCostUsd: z.number().nonnegative(),
+    completionCostUsd: z.number().nonnegative(),
+    otherCostUsd: z.number().nonnegative().optional()
+  }),
+  confidence: z.enum(['high', 'medium', 'low'])
+});
+
+export const costUsageRecordSchema = z.object({
+  userId: z.string().min(1),
+  taskId: z.string().min(1),
+  providerId: z.string().min(1),
+  model: z.string().min(1),
+  usage: aiAgentUsageSchema,
+  timestamp: z.string().datetime()
+});
+
+export const budgetStatusSchema = z.object({
+  userId: z.string().min(1),
+  plan: costPlanSchema,
+  periodStart: z.string().datetime(),
+  periodEnd: z.string().datetime(),
+  spentUsd: z.number().nonnegative(),
+  limitUsd: z.number().nonnegative(),
+  remainingUsd: z.number(),
+  isOverBudget: z.boolean(),
+  warnAtPercent: z.number().min(0).max(100)
+});
+
+export const spendingReportSchema = z.object({
+  userId: z.string().min(1),
+  period: spendingPeriodSchema,
+  totalUsd: z.number().nonnegative(),
+  byProvider: z.record(z.string(), z.number().nonnegative()),
+  byModel: z.record(z.string(), z.number().nonnegative()),
+  taskCount: z.number().int().nonnegative(),
+  avgCostPerTaskUsd: z.number().nonnegative()
+});

@@ -1,15 +1,24 @@
-import { describe, expectTypeOf, it } from 'vitest';
+import { describe, expect, expectTypeOf, it } from 'vitest';
+import type { z } from 'zod';
 
 import type { AIAgentUsage } from '../ai-agent.js';
-import type {
-  BudgetStatus,
-  CostEstimate,
-  CostEstimateRequest,
-  CostPlan,
-  CostProvider,
-  CostUsageRecord,
-  SpendingPeriod,
-  SpendingReport
+import {
+  aiAgentUsageSchema,
+  budgetStatusSchema,
+  costEstimateRequestSchema,
+  costEstimateSchema,
+  costPlanSchema,
+  costUsageRecordSchema,
+  spendingPeriodSchema,
+  spendingReportSchema,
+  type BudgetStatus,
+  type CostEstimate,
+  type CostEstimateRequest,
+  type CostPlan,
+  type CostProvider,
+  type CostUsageRecord,
+  type SpendingPeriod,
+  type SpendingReport
 } from '../cost-provider.js';
 
 describe('Cost enums', () => {
@@ -118,5 +127,111 @@ describe('CostProvider interface', () => {
     expectTypeOf<PeriodArg>().toEqualTypeOf<SpendingPeriod>();
     type Ret = ReturnType<CostProvider['getUserSpending']>;
     expectTypeOf<Ret>().toEqualTypeOf<Promise<SpendingReport>>();
+  });
+});
+
+describe('Cost Zod schemas (Phase 2 / TD-022 — no drift vs interfaces)', () => {
+  // Schema → interface drift guards. If a field is added to the
+  // interface without a matching schema field (or vice versa), the
+  // `satisfies` style assertions below fail at compile time.
+
+  it('aiAgentUsageSchema validates the AIAgentUsage shape', () => {
+    type Inferred = z.infer<typeof aiAgentUsageSchema>;
+    expectTypeOf<Inferred>().toExtend<AIAgentUsage>();
+    expectTypeOf<AIAgentUsage>().toExtend<Inferred>();
+
+    expect(
+      aiAgentUsageSchema.parse({
+        promptTokens: 100,
+        completionTokens: 25,
+        totalTokens: 125,
+        costUsd: 0.0042
+      })
+    ).toMatchObject({ costUsd: 0.0042 });
+  });
+
+  it('costPlanSchema matches the CostPlan enum', () => {
+    type Inferred = z.infer<typeof costPlanSchema>;
+    expectTypeOf<Inferred>().toEqualTypeOf<CostPlan>();
+  });
+
+  it('spendingPeriodSchema matches the SpendingPeriod enum', () => {
+    type Inferred = z.infer<typeof spendingPeriodSchema>;
+    expectTypeOf<Inferred>().toEqualTypeOf<SpendingPeriod>();
+  });
+
+  it('costEstimateRequestSchema matches CostEstimateRequest', () => {
+    type Inferred = z.infer<typeof costEstimateRequestSchema>;
+    expectTypeOf<Inferred>().toExtend<CostEstimateRequest>();
+    expectTypeOf<CostEstimateRequest>().toExtend<Inferred>();
+  });
+
+  it('costEstimateSchema matches CostEstimate', () => {
+    type Inferred = z.infer<typeof costEstimateSchema>;
+    expectTypeOf<Inferred>().toExtend<CostEstimate>();
+    expectTypeOf<CostEstimate>().toExtend<Inferred>();
+  });
+
+  it('costUsageRecordSchema matches CostUsageRecord', () => {
+    type Inferred = z.infer<typeof costUsageRecordSchema>;
+    expectTypeOf<Inferred>().toExtend<CostUsageRecord>();
+    expectTypeOf<CostUsageRecord>().toExtend<Inferred>();
+  });
+
+  it('budgetStatusSchema matches BudgetStatus', () => {
+    type Inferred = z.infer<typeof budgetStatusSchema>;
+    expectTypeOf<Inferred>().toExtend<BudgetStatus>();
+    expectTypeOf<BudgetStatus>().toExtend<Inferred>();
+  });
+
+  it('spendingReportSchema matches SpendingReport', () => {
+    type Inferred = z.infer<typeof spendingReportSchema>;
+    expectTypeOf<Inferred>().toExtend<SpendingReport>();
+    expectTypeOf<SpendingReport>().toExtend<Inferred>();
+  });
+
+  it('costEstimateRequestSchema rejects negative token counts', () => {
+    expect(() =>
+      costEstimateRequestSchema.parse({
+        providerId: 'anthropic',
+        model: 'claude-sonnet-4',
+        promptTokens: -1,
+        expectedCompletionTokens: 100
+      })
+    ).toThrow();
+  });
+
+  it('costUsageRecordSchema requires an ISO8601 timestamp', () => {
+    expect(() =>
+      costUsageRecordSchema.parse({
+        userId: 'user-1',
+        taskId: 'task-1',
+        providerId: 'anthropic',
+        model: 'claude-sonnet-4',
+        usage: {
+          promptTokens: 100,
+          completionTokens: 25,
+          totalTokens: 125,
+          costUsd: 0.01
+        },
+        timestamp: '2026-04-24'
+      })
+    ).toThrow();
+  });
+
+  it('budgetStatusSchema caps warnAtPercent between 0 and 100', () => {
+    expect(() =>
+      budgetStatusSchema.parse({
+        userId: 'u',
+        plan: 'free',
+        periodStart: '2026-04-01T00:00:00.000Z',
+        periodEnd: '2026-05-01T00:00:00.000Z',
+        spentUsd: 0,
+        limitUsd: 1,
+        remainingUsd: 1,
+        isOverBudget: false,
+        warnAtPercent: 150
+      })
+    ).toThrow();
   });
 });
