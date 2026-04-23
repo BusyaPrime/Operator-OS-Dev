@@ -15,11 +15,13 @@ import { IntegrationError } from './integrations/runtime.js';
 import { registerHealthRoutes } from './routes/health.js';
 import { registerAiRoutes } from './routes/ai.js';
 import { registerAgentRoutes } from './routes/agent.js';
+import { registerAgentWsRoute } from './routes/agent-ws.js';
 import { registerCostRoutes } from './routes/cost.js';
 import { registerInternalTasksRoutes } from './routes/internal-tasks.js';
 import { registerOperatorRoutes } from './routes/operator.js';
 import { VertexAIProvider } from './providers/index.js';
 import { buildReadinessResponse } from './readiness.js';
+import { createAgentSessionRegistry } from './services/agent-session-registry.js';
 import { AlertsService } from './services/alerts.js';
 import { CommandsService } from './services/commands.js';
 import { CostService } from './services/cost.js';
@@ -104,6 +106,7 @@ export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) =>
     tasksQueue
   });
   const costService = new CostService();
+  const agentSessionRegistry = createAgentSessionRegistry();
   const operatorModules = [
     authService,
     firestoreRepository,
@@ -187,6 +190,10 @@ export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) =>
     repository: firestoreRepository,
     agentGuard: authService.createAgentGuard(agentAudience),
     userGuard: authService.createRequiredGuard()
+  });
+  void registerAgentWsRoute(app, {
+    agentGuard: authService.createAgentGuard(agentAudience),
+    sessionRegistry: agentSessionRegistry
   });
   void registerInternalTasksRoutes(app);
 
