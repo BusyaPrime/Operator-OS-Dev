@@ -1950,3 +1950,153 @@ absolute expiry timestamp, never `createdAt`.
   Phase 3.1 post-PR-#33-merge. Console TTL UI could not find
   the `tasks` collection because no documents existed yet.
   Deferred to post-first-write manual application.
+
+## TD-030: Monitor for recurrent transient unreachability on `/v1/agent/heartbeat/agent`
+
+Discovered: 2026-04-23 ~22:15 UTC (Phase 3.1 post-deploy
+    sanity validation; Cloud Run revision
+    `operator-os-api-00011-nvj`)
+Type: observability · cloud-run-edge
+Priority: P3
+Status: open (observational; no action until recurrence)
+Trigger for action:
+- 3+ consecutive `curl` exit 56 (connection reset by peer) on
+  the same endpoint,
+- other endpoints on the same revision unaffected at the
+  same time,
+- zero Cloud Run application logs during the failure window.
+
+Until that pattern repeats, no action.
+
+### Description
+
+During Phase 3.1 post-deploy sanity validation on 2026-04-23
+at approximately 22:15 UTC, `POST /v1/agent/heartbeat/agent`
+returned `curl` exit 56 ("Failure when receiving data from
+the peer") on three consecutive attempts. All other endpoints
+on the same revision (`operator-os-api-00011-nvj`) responded
+cleanly within the same minute:
+
+- `GET  /health`                           → 200
+- `GET  /ready`                            → 503 (honest)
+- `POST /v1/tasks` (no auth)               → 401
+- `GET  /v1/tasks/<uuid>/stream`           → 501
+
+On 2026-04-24 at approximately 06:00 UTC (rested morning
+re-test), the same endpoint returned 401 normally across a
+9-probe diagnostic battery. The anomaly could not be
+reproduced.
+
+Cloud Run application logs for revision 00011-nvj show **zero
+entries** for the failing endpoint during the failure window
+— no WARNING, no ERROR, no connection-close record, no
+severity>=DEFAULT entry at all. Today's follow-up probes
+appear in the logs within ~1s of `curl` completion. The
+implication is that last night's three requests never
+reached the Cloud Run container. Failure was at the edge
+path (GFE → L7 load balancer → TLS terminator → service),
+not in application code or middleware.
+
+Classification E — transient resolved itself — at ~85%
+confidence. ~10% residual risk of a recurrent edge-level
+quirk under similar timing / load conditions; ~5% combined
+on other categories. Code-level hypotheses (route order
+regression, middleware glob) are ruled out by the diff —
+`apps/api/src/app.ts` diff `02898c1..e953378` is a pure
+additive insert of `registerTaskRoutes` between
+`registerAgentWsRoute` and `registerInternalTasksRoutes`,
+with no changes to middleware, plugins, or existing
+registration order.
+
+### Risk if unaddressed
+
+- Low today. Single unreproduced incident with no
+  user-visible impact (heartbeat is agent-side polling;
+  retry is built into the agent client).
+- Moderate on recurrence. Widespread heartbeat
+  unreachability would break alert pipelines that depend on
+  heartbeat liveness and would silently degrade agent-health
+  telemetry.
+- Documentation risk: without this TD filed, a future
+  occurrence looks like a fresh mystery; with it, the
+  first-responder has a diagnostic playbook and a known
+  baseline (Classification E) to compare against.
+
+### Proposed fix
+
+Action only on recurrence. When the trigger pattern repeats:
+
+1. Capture exact timestamp range (UTC, to the second) and
+   failing endpoint path(s).
+2. Capture any concurrent successful probes / production
+   traffic to the same revision for comparison.
+3. Re-query Cloud Run logs for that window across all
+   severities:
+
+   ```bash
+   export CLOUDSDK_PYTHON=/d/SDKs/GoogleCloudCLI/google-cloud-sdk/platform/bundledpython/python.exe
+   gcloud logging read \
+     'resource.type="cloud_run_revision"
+      AND resource.labels.service_name="operator-os-api"
+      AND resource.labels.revision_name="operator-os-api-<NN>-<suffix>"
+      AND timestamp>="<start>" AND timestamp<="<end>"' \
+     --project=operator-os-dev \
+     --limit=200
+   ```
+
+4. If the application logs are still **empty** during the
+   failure window → file a Cloud Run support case with:
+   - Incident timestamps + failing endpoint path
+   - Evidence that other endpoints on the same revision
+     worked
+   - Evidence of zero application logs during the failure
+   - Revision name + region (`europe-west4`)
+   - Request: edge-path investigation (GFE / L7 LB / TLS
+     terminator / instance-routing layer).
+5. If application logs **do** appear in that window →
+   reclassify as C (handler-specific) or B (middleware
+   glob) and diagnose in code.
+
+### Stale close condition
+
+If no recurrence within 90 days of filing (by ~2026-07-23),
+close as "unable to reproduce, single incident, attributed
+to Cloud Run edge transient." The evidence trail stays in
+git history + `decisions.md` for archaeology.
+
+### Evidence trail
+
+- `decisions.md` entry `2026-04-24-0600 — Heartbeat transient
+  diagnostic + classification` — full diagnostic session
+  transcript.
+- `decisions.md` entry `2026-04-23-2215 — Heartbeat 000×3
+  transient (unresolved at time…)` — original incident
+  capture.
+- Cloud Run revision at time of incident:
+  `operator-os-api-00011-nvj`.
+- Last code change before the incident: PR #33 (merge commit
+  `e953378`) — task submission + persistence, Phase 3.1.
+- Code diff verification: `apps/api/src/app.ts` diff
+  `02898c1..e953378` is purely additive — inserts
+  `registerTaskRoutes` between `registerAgentWsRoute` and
+  `registerInternalTasksRoutes`, no middleware or plugin
+  changes, no reordering of existing route registrations.
+
+### Related
+
+- TD-021 (`gcloud builds submit` log-streaming hangs in the
+  GitHub Actions runner) — same infrastructure family
+  (Cloud Run + gcloud cosmetic / edge quirks), different
+  surface. If both accumulate, it argues for a Cloud Run
+  edge-reliability tracking umbrella issue.
+- Phase 3.1 Gate 3.1.C `decisions.md` entry (2026-04-24-0100)
+  — route-registration context at time of incident.
+
+### History
+
+- 2026-04-24: filed after a 9-probe diagnostic sprint
+  (rested morning) confirmed Classification E at ~85%
+  confidence. No regression, no rollback, no code fix
+  needed today. Filed to preserve discipline: a future
+  recurrence inherits a known playbook rather than a fresh
+  mystery.
