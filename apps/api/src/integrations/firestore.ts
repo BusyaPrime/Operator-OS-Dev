@@ -3,12 +3,14 @@ import type { ApiEnv } from '@operator-os/config';
 import {
   alertSchema,
   analyticsEventSchema,
+  agentHeartbeatRequestSchema,
   costSnapshotSchema,
   deviceStateSchema,
   mutationReceiptSchema,
   operatorStateSchema,
   sessionSchema,
   type Alert,
+  type AgentHeartbeatRequest,
   type AnalyticsEvent,
   type CostSnapshot,
   type DeviceState,
@@ -25,6 +27,14 @@ import {
   buildNotConfiguredCheck,
   detectApplicationDefaultCredentials
 } from './runtime.js';
+
+/**
+ * Collection name for the agent-centric heartbeat stream
+ * (Phase 2 / TD-024). Hardcoded until a multi-env split is
+ * actually needed — matches the "no new env vars this phase"
+ * scope boundary from the Phase 2 pre-plan.
+ */
+const AGENT_HEARTBEATS_COLLECTION = 'agentHeartbeats';
 
 const mergeByKey = <T>(
   baseItems: readonly T[],
@@ -199,6 +209,45 @@ export class FirestoreOperatorRepository {
       parsedSnapshot.id,
       parsedSnapshot,
       'cost-snapshot.record'
+    );
+  }
+
+  // ---------------------------------------------------------------
+  // Agent heartbeat v2 (Phase 2 / TD-024)
+  //
+  // NOTE: TTL on `agentHeartbeats` is a Firestore Console-level
+  // setting (not configurable via the Node client SDK as of
+  // @google-cloud/firestore 8.x). Manual step required by Akmal
+  // before production scale:
+  //   Console → Firestore → agentHeartbeats collection → TTL
+  //   policy → field: receivedAt, 7 days.
+  // Callouts also in the Phase 2 PR body.
+  //
+  // Collection name is hardcoded — pre-plan said no new env vars
+  // this phase. If the name ever needs to flex per env, add a
+  // config key then.
+  // ---------------------------------------------------------------
+  async recordAgentHeartbeat(
+    heartbeat: AgentHeartbeatRequest,
+    userId: string
+  ): Promise<MutationReceipt> {
+    const parsed = agentHeartbeatRequestSchema.parse(heartbeat);
+    const receivedAtMs = Date.now();
+    const receivedAt = new Date(receivedAtMs).toISOString();
+    // Document id: `{agentId}__{receivedAtMs}`. Double underscore
+    // because single underscore can appear in some UUID variants,
+    // which would make the split parsing ambiguous if someone
+    // ever wants to dissect the id from a dashboard.
+    const documentId = `${parsed.agentId}__${receivedAtMs}`;
+    return this.#persistDocument(
+      AGENT_HEARTBEATS_COLLECTION,
+      documentId,
+      {
+        ...parsed,
+        userId,
+        receivedAt
+      },
+      'agent-heartbeat.v2'
     );
   }
 
