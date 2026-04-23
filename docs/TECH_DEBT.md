@@ -1625,3 +1625,81 @@ truth in code. For enterprise customers who need a custom
 - 2026-04-24: filed when the Phase 2 cost endpoints landed.
   Deferred because no `custom` plan users exist yet; admin
   surface is dead weight until the first enterprise onboarding.
+
+## TD-026: Add `expireAt` field to `agentHeartbeats` for proper TTL support
+
+Discovered: 2026-04-23 (Phase 2 post-merge Firestore manual
+    setup by Akmal)
+Type: schema-design / missing-feature
+Priority: P2
+Status: open
+Target: Week 4 batch
+
+### Description
+
+Phase 2 (TD-024) landed
+`FirestoreOperatorRepository.recordAgentHeartbeat`, which
+persists each heartbeat with a server-assigned `receivedAt`
+timestamp and expects manual TTL configuration on that field
+in the Firestore Console.
+
+Applying a TTL on `receivedAt` is **wrong**: Firestore's TTL
+service deletes documents when the named field's value equals
+or has passed "now". Because `receivedAt` is the *creation*
+timestamp, documents would be eligible for deletion from the
+moment they are written — the opposite of a 7-day retention.
+
+Correct design: write an **`expireAt`** field alongside
+`receivedAt`, computed at write time as `receivedAt + 7 days`.
+Firestore's TTL then fires on `expireAt` and preserves
+documents for the intended window.
+
+### Risk if unaddressed
+
+- Without TTL, heartbeats accumulate indefinitely. Rate:
+  ~4 KB per heartbeat × one agent × 30s cadence ≈
+  1.2 MB / week / agent. Firestore's free tier includes 1 GB
+  of storage, so a single agent runs for ~800 weeks before
+  the free tier bites. Acceptable for MVP / local dev.
+- At production scale (multi-agent, multi-user), storage
+  grows roughly linearly; cost is minor but the collection
+  becomes slower to range-query over time.
+- **No correctness impact today.** Every current reader of
+  `agentHeartbeats` queries on `(agentId, receivedAt DESC)`
+  which returns the latest rows first regardless of how many
+  stale rows exist behind them.
+
+### Proposed fix
+
+1. In `apps/api/src/integrations/firestore.ts`,
+   `recordAgentHeartbeat`, compute:
+   ```ts
+   const expireAtMs = receivedAtMs + 7 * 24 * 60 * 60 * 1000;
+   const expireAt = new Date(expireAtMs).toISOString();
+   ```
+   Persist alongside `receivedAt`.
+2. After deploy, Akmal applies Firestore TTL policy on
+   `agentHeartbeats.expireAt` (7-day behaviour then follows
+   from the field value, not from the policy offset).
+3. No code reader today needs the new field; it is write-only
+   for the TTL service. Adding it does not break existing
+   queries.
+
+### Related
+
+- `apps/api/src/integrations/firestore.ts` — the accessor that
+  needs the write addition.
+- ADR *Agent Heartbeat v2 Ships As A New Endpoint, Not A
+  Modified One* (2026-04-24) — the decision this TD follows up.
+- Firestore TTL docs note this precise pitfall:
+  https://cloud.google.com/firestore/docs/ttl
+
+### History
+
+- 2026-04-23: filed when Akmal attempted to apply the 7-day
+  TTL on `receivedAt` and realised the field semantics were
+  wrong for TTL purposes. Scheduled for Week 4 batch alongside
+  the `POST /v1/tasks` + task queue work so one deploy covers
+  the schema change + downstream task-result persistence.
+  Until then, heartbeats accumulate without harm (1.2 MB /
+  week / agent; free tier 1 GB).
