@@ -370,11 +370,12 @@ export const registerAgentWsRoute = async (
             // Touch already handled above — nothing else to do.
             return;
           case 'task-accepted': {
+            const acceptedTaskId = parsed.data.taskId;
             logger.info(
               {
                 sessionId,
                 messageType: parsed.data.type,
-                taskId: parsed.data.taskId
+                taskId: acceptedTaskId
               },
               'task-accepted received'
             );
@@ -385,11 +386,11 @@ export const registerAgentWsRoute = async (
                 options.taskCallbacks.onTaskAccepted({
                   sessionId,
                   agentId,
-                  taskId: parsed.data.taskId
+                  taskId: acceptedTaskId
                 })
               ).catch((err) => {
                 logger.warn(
-                  { err, sessionId, taskId: parsed.data.taskId },
+                  { err, sessionId, taskId: acceptedTaskId },
                   'onTaskAccepted callback threw'
                 );
               });
@@ -397,11 +398,13 @@ export const registerAgentWsRoute = async (
             return;
           }
           case 'task-rejected': {
+            const rejectedTaskId = parsed.data.taskId;
+            const rejectedReason = parsed.data.reason;
             logger.info(
               {
                 sessionId,
-                taskId: parsed.data.taskId,
-                reason: parsed.data.reason
+                taskId: rejectedTaskId,
+                reason: rejectedReason
               },
               'task-rejected received'
             );
@@ -412,12 +415,12 @@ export const registerAgentWsRoute = async (
                 options.taskCallbacks.onTaskRejected({
                   sessionId,
                   agentId,
-                  taskId: parsed.data.taskId,
-                  reason: parsed.data.reason
+                  taskId: rejectedTaskId,
+                  reason: rejectedReason
                 })
               ).catch((err) => {
                 logger.warn(
-                  { err, sessionId, taskId: parsed.data.taskId },
+                  { err, sessionId, taskId: rejectedTaskId },
                   'onTaskRejected callback threw'
                 );
               });
