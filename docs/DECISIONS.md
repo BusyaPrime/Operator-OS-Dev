@@ -1704,3 +1704,205 @@ References:
 - Sibling ADR *Mobile Phase 1.5 Adds Auth Alongside…*
   (2026-04-24) for the broader "keep existing navigation
   intact" rationale.
+
+## Agent Heartbeat v2 Ships As A New Endpoint, Not A Modified One
+
+Decided: 2026-04-24 (Week 2 Phase 2)
+
+Decision:
+
+- Add a new `POST /v1/agent/heartbeat/agent` to the api that
+  accepts `agentHeartbeatRequestSchema`.
+- Leave the existing `POST /v1/agent/heartbeat` accepting
+  `deviceStateSchema` completely unchanged. Both endpoints
+  coexist indefinitely; the older one retires only after every
+  client migrates to v2.
+
+Why:
+
+- The Desktop Agent's `AgentHeartbeatLoop` (Phase 1.4) already
+  posts to `/v1/agent/heartbeat/agent`. It has been hitting
+  404s since 1.4 merged; the 404s are backoff-absorbed and do
+  not break anything else. Adding the endpoint closes the
+  gap without any coordination dance.
+- The older `/v1/agent/heartbeat` still serves existing
+  clients (legacy device-state flow on mobile / any older
+  desktop-agent that never redeployed). A single endpoint that
+  accepts both shapes via discriminator would make the route
+  handler gnarlier than two narrow ones.
+- Additive matches the pattern the Phase 1.3
+  *Agent Heartbeat Schema Is Additive, Not Replacement* ADR
+  established: we do not rewrite wire contracts in place; we
+  add the next shape alongside and let clients roll forward.
+
+Alternatives considered:
+
+- **Modify the existing endpoint to accept both shapes.**
+  Rejected. Dispatch-on-discriminator adds branching to a hot
+  path for zero forward-compat benefit, and accidentally
+  forwards a bug to every legacy client when the shared
+  handler changes.
+- **Silent upgrade — keep the same URL, let the Zod schema do
+  the union.** Rejected. The error surface becomes impossible
+  to reason about ("which schema did it fail?").
+
+Consequences:
+
+- Two Firestore collections now: existing `deviceStates`
+  (behind the old endpoint) and new `agentHeartbeats`. TTL
+  policy on `agentHeartbeats.receivedAt` (7 days) is a manual
+  Firestore Console step — documented in the PR body and in a
+  code comment next to the accessor.
+- A 5-second-per-agent in-memory rate limiter shields the new
+  endpoint from a runaway agent. Single-instance MVP; the
+  related *WS Sessions In-Memory* ADR tracks the multi-instance
+  migration.
+- The retirement path for the old endpoint: when
+  `DeviceState.runtimeStatus` telemetry shows every connected
+  device-class is posting to v2, file a TD to sunset the
+  v1 route.
+
+References:
+
+- `apps/api/src/routes/agent.ts` — both endpoints live side by side.
+- `apps/api/src/integrations/firestore.ts` — `recordAgentHeartbeat`.
+- `packages/contracts/src/agent/heartbeat.ts` — schemas.
+- Sibling ADR *Agent Heartbeat Schema Is Additive, Not
+  Replacement* (2026-04-24).
+
+## Cost Records Persist In Firestore, Pricing Table Lives In Code
+
+Decided: 2026-04-24 (Week 2 Phase 2)
+
+Decision:
+
+- `cost_records` and `user_budgets` go to Firestore collections.
+- The (providerId, model) → per-1M-token pricing table lives
+  in `apps/api/src/services/cost.ts` as a module-level
+  `PRICING_TABLE` constant. Price updates ship as code
+  deploys, not as DB writes.
+
+Why:
+
+- Pricing is a small, rarely-changing, high-read surface.
+  Every `POST /v1/cost/estimate` and every `POST /v1/cost/record`
+  needs the table. Keeping it in code means zero DB round-trips
+  per cost call and a single source of truth that code review
+  sees.
+- Cost records are the opposite profile — high-cardinality
+  append-only writes keyed by user + task. Firestore's
+  composite indexes on `(userId, timestamp)` and
+  `(userId, providerId, timestamp)` give cheap range reads
+  for the spending report endpoints, which is what the table
+  would fight against.
+- Price changes through code reviews catch the case where the
+  wrong number lands (we see the diff). Price changes through
+  the DB would require audit tooling we do not have.
+- `user_budgets` is a low-volume override for enterprise /
+  custom tiers. Firestore doc-per-user is the right shape —
+  reads are keyed, writes are rare.
+
+Alternatives considered:
+
+- **Pricing in Firestore, cached in memory.** Rejected.
+  Adds an initialization step (cache warm on boot) and
+  a consistency question (stale cache vs. DB); for no real
+  benefit versus "change in code, ship a deploy". Google and
+  Anthropic publish pricing as blog posts, not via an API
+  our app could poll.
+- **Pricing and records both in code.** Rejected. Records
+  are per-user / per-task; stuffing them in memory would mean
+  no history survives a restart. Firestore is the right
+  persistence.
+- **Pricing and records both in Firestore.** Rejected for
+  the same reasons pricing-in-Firestore is rejected; combining
+  them just compounds the issue.
+
+Consequences:
+
+- A new pricing entry requires a deploy. Acceptable cadence
+  — we add agents quarterly, not daily.
+- `computeActualCost` runs on every `/v1/cost/record` to
+  sanity-check the agent-reported number. Within $0.01 of the
+  server's recompute → accepted; otherwise server overrides.
+  Protects against a misconfigured agent inflating user spend
+  without rejecting honest float drift.
+- Firestore composite indexes on `costRecords` are a manual
+  Console step; PR body enumerates them.
+- Enterprise admin UI to edit `user_budgets` docs is future
+  work — tracked as TD-025.
+
+References:
+
+- `apps/api/src/services/cost.ts` — PRICING_TABLE + PLAN_BUDGETS.
+- `apps/api/src/integrations/firestore.ts` — `recordCostUsage`,
+  `listCostRecordsForUser`, `getUserBudget`, `setUserBudget`.
+- `apps/api/src/routes/cost.ts` — endpoint composition + $0.01
+  trust window.
+
+## Agent WebSocket Sessions Are In-Memory (MVP); Redis Coordination Is A Future TD
+
+Decided: 2026-04-24 (Week 2 Phase 2)
+
+Decision:
+
+- The `AgentSessionRegistry` is a two-Map (by sessionId + by
+  agentId) in-process structure tied to a single Fastify
+  instance. No shared state across api replicas.
+- On a duplicate-agentId connect, the registry closes the
+  prior socket with close code 4004 ("duplicate-agent") and
+  replaces it with the new one.
+
+Why:
+
+- Today's api runs as a single Cloud Run revision serving all
+  traffic. There is one in-process registry, and that is the
+  source of truth. Zero coordination cost, zero network
+  round-trip per session touch.
+- Scaling to multi-instance needs either session affinity
+  (Cloud Run sticky mode) or a shared store — both are
+  non-trivial changes we are not paying for pre-scale.
+- Agents handle their own reconnection via exponential
+  backoff (Phase 1.4 `AgentHeartbeatLoop`'s design). A rolling
+  deploy drops sessions, agents reconnect, the new instance's
+  registry picks them up. No coordination required.
+- In-memory rate-limiting for heartbeat v2 shares the same
+  trade-off and benefits from the same assumption — one
+  instance, one Map.
+
+Alternatives considered:
+
+- **Redis-backed registry from day one.** Rejected. ~2h of
+  wiring (`ioredis`, connection pool, TTL policy on session
+  keys, recovery on Redis outage) for zero user-visible
+  benefit while we are single-instance.
+- **Cloud Run session affinity.** Rejected *for now*. It is
+  a mode we can enable in minutes, but it changes load
+  distribution characteristics; worth doing at the same time
+  we have a reason to scale horizontally.
+- **Fire-and-forget sessions (no close on duplicate).**
+  Rejected. Without the prior-close, two agents with the
+  same id would both register, and a later task-assign would
+  arrive at whichever socket was mapped last. Harder to
+  reason about than "one agentId, one session".
+
+Consequences:
+
+- When we go multi-instance, the migration is contained:
+  replace `createAgentSessionRegistry()` with a Redis-backed
+  implementation behind the same interface. Route handler
+  + heartbeat code stay put.
+- Duplicate-agent e2e tests are flaky under
+  `@fastify/websocket`'s `injectWS` (the 4004 close racing
+  with the plugin's message delivery). The registry behaviour
+  is unit-tested directly; the e2e layer only asserts the
+  handshake path.
+
+References:
+
+- `apps/api/src/services/agent-session-registry.ts` — the two-Map
+  implementation.
+- `apps/api/src/routes/agent-ws.ts` — wire-up + close-codes.
+- `apps/desktop-agent/src/heartbeat/agent-heartbeat-loop.ts` —
+  exponential backoff makes reconnection tolerant of
+  single-instance restarts.
