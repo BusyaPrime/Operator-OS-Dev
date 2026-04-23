@@ -19,6 +19,7 @@ import { registerAgentWsRoute } from './routes/agent-ws.js';
 import { registerCostRoutes } from './routes/cost.js';
 import { registerInternalTasksRoutes } from './routes/internal-tasks.js';
 import { registerOperatorRoutes } from './routes/operator.js';
+import { registerTaskRoutes } from './routes/tasks.js';
 import { VertexAIProvider } from './providers/index.js';
 import { buildReadinessResponse } from './readiness.js';
 import { createAgentSessionRegistry } from './services/agent-session-registry.js';
@@ -26,6 +27,7 @@ import { AlertsService } from './services/alerts.js';
 import { CommandsService } from './services/commands.js';
 import { CostService } from './services/cost.js';
 import { ExportsService } from './services/exports.js';
+import { createIdempotencyCache } from './services/idempotency-cache.js';
 import { SessionsService } from './services/sessions.js';
 import type { AIProvider } from './types.js';
 
@@ -116,6 +118,7 @@ export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) =>
   });
   const costService = new CostService();
   const agentSessionRegistry = createAgentSessionRegistry();
+  const taskIdempotencyCache = createIdempotencyCache();
   const operatorModules = [
     authService,
     firestoreRepository,
@@ -203,6 +206,12 @@ export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) =>
   void registerAgentWsRoute(app, {
     agentGuard: authService.createAgentGuard(agentAudience),
     sessionRegistry: agentSessionRegistry
+  });
+  void registerTaskRoutes(app, {
+    repository: firestoreRepository,
+    idempotencyCache: taskIdempotencyCache,
+    userGuard: authService.createRequiredGuard(),
+    apiBaseUrl: agentAudience
   });
   void registerInternalTasksRoutes(app);
 

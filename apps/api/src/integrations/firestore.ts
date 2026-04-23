@@ -11,6 +11,8 @@ import {
   mutationReceiptSchema,
   operatorStateSchema,
   sessionSchema,
+  taskRecordSchema,
+  taskStatusSchema,
   type Alert,
   type AgentHeartbeatRequest,
   type AnalyticsEvent,
@@ -20,7 +22,10 @@ import {
   type DeviceState,
   type MutationReceipt,
   type OperatorState,
-  type Session
+  type Session,
+  type TaskRecord,
+  type TaskStatus,
+  type TaskStatusResponse
 } from '@operator-os/contracts';
 import { z } from 'zod';
 import type { FastifyBaseLogger } from 'fastify';
@@ -42,6 +47,27 @@ import {
 const AGENT_HEARTBEATS_COLLECTION = 'agentHeartbeats';
 const COST_RECORDS_COLLECTION = 'costRecords';
 const USER_BUDGETS_COLLECTION = 'userBudgets';
+const TASKS_COLLECTION = 'tasks';
+
+/**
+ * List-query parameters for `listTasksForUser`. Opaque cursor
+ * is the `createdAt` ISO timestamp of the last row in the prior
+ * page — consumers should not parse it.
+ */
+export interface ListTasksQuery {
+  readonly status?: TaskStatus;
+  readonly limit?: number;
+  readonly cursor?: string;
+}
+
+const taskStatusResponseProjection = (record: TaskRecord): TaskStatusResponse => ({
+  taskId: record.taskId,
+  status: record.status,
+  createdAt: record.createdAt,
+  updatedAt: record.updatedAt,
+  output: record.output,
+  error: record.error
+});
 
 /**
  * Per-user budget override persisted in the `userBudgets`
@@ -386,6 +412,180 @@ export class FirestoreOperatorRepository {
       parsed,
       'user-budget.upsert'
     );
+  }
+
+  // ---------------------------------------------------------------
+  // Tasks (Phase 3.1)
+  //
+  // Doc id = taskId. Schema-validated on both read and write.
+  // Firestore TTL policy applied on `expireAt` (manual Console
+  // step, documented in PR #33 body). TTL fires when expireAt
+  // has passed — same pattern as TD-026's agentHeartbeats fix.
+  //
+  // Reads enforce ownership at this layer (getTask takes userId)
+  // so every caller is forced through the ownership-check path
+  // and there's one place to audit.
+  // ---------------------------------------------------------------
+
+  async recordTask(record: TaskRecord): Promise<MutationReceipt> {
+    const parsed = taskRecordSchema.parse(record);
+    return this.#persistDocument(
+      TASKS_COLLECTION,
+      parsed.taskId,
+      parsed,
+      'task.upsert'
+    );
+  }
+
+  /**
+   * Returns the task ONLY if it exists AND belongs to `userId`.
+   * A mismatch returns undefined (route layer renders 404 so
+   * we never leak existence of someone else's task).
+   */
+  async getTask(
+    taskId: string,
+    userId: string
+  ): Promise<TaskRecord | undefined> {
+    if (!this.#adcStatus.available) return undefined;
+    try {
+      const doc = await this.#getClient()
+        .collection(TASKS_COLLECTION)
+        .doc(taskId)
+        .get();
+      if (!doc.exists) return undefined;
+      const parsed = taskRecordSchema.safeParse(doc.data());
+      if (!parsed.success) {
+        this.#logger.warn(
+          {
+            collectionName: TASKS_COLLECTION,
+            documentId: taskId,
+            issues: parsed.error.issues
+          },
+          'task document skipped — does not match schema'
+        );
+        return undefined;
+      }
+      if (parsed.data.userId !== userId) {
+        // Ownership mismatch. Not this user's task — pretend it
+        // doesn't exist so the route can 404 without leaking.
+        return undefined;
+      }
+      return parsed.data;
+    } catch (err) {
+      this.#logger.warn({ err, taskId, userId }, 'task read failed');
+      return undefined;
+    }
+  }
+
+  /**
+   * Finds a task that matches `(userId, idempotencyKey)`. Used
+   * by POST /v1/tasks as a rebuild path when the in-memory LRU
+   * idempotency cache has evicted / restarted. The composite
+   * index (idempotencyKey, userId, createdAt DESC) supports
+   * this query; manual Console step listed in PR #33 body.
+   */
+  async findTaskByIdempotencyKey(
+    userId: string,
+    idempotencyKey: string
+  ): Promise<TaskRecord | undefined> {
+    if (!this.#adcStatus.available) return undefined;
+    try {
+      const snapshot = await this.#getClient()
+        .collection(TASKS_COLLECTION)
+        .where('idempotencyKey', '==', idempotencyKey)
+        .where('userId', '==', userId)
+        .orderBy('createdAt', 'desc')
+        .limit(1)
+        .get();
+      if (snapshot.empty) return undefined;
+      const parsed = taskRecordSchema.safeParse(snapshot.docs[0].data());
+      if (!parsed.success) {
+        this.#logger.warn(
+          {
+            collectionName: TASKS_COLLECTION,
+            documentId: snapshot.docs[0].id,
+            issues: parsed.error.issues
+          },
+          'idempotency-lookup row skipped — schema drift'
+        );
+        return undefined;
+      }
+      return parsed.data;
+    } catch (err) {
+      this.#logger.warn(
+        { err, userId, idempotencyKey },
+        'idempotency lookup failed'
+      );
+      return undefined;
+    }
+  }
+
+  /**
+   * Paginated list for GET /v1/tasks. Cursor is the ISO
+   * `createdAt` of the last row of the previous page — opaque
+   * to callers.
+   */
+  async listTasksForUser(
+    userId: string,
+    options: ListTasksQuery = {}
+  ): Promise<{
+    readonly tasks: readonly TaskStatusResponse[];
+    readonly nextCursor: string | null;
+  }> {
+    const limit = Math.min(Math.max(options.limit ?? 20, 1), 100);
+    if (!this.#adcStatus.available) {
+      return { tasks: [], nextCursor: null };
+    }
+
+    try {
+      let query = this.#getClient()
+        .collection(TASKS_COLLECTION)
+        .where('userId', '==', userId) as FirebaseFirestore.Query;
+
+      if (options.status !== undefined) {
+        // Validate caller-supplied status before pushing to Firestore.
+        // Route layer also safeParses — belt and braces.
+        taskStatusSchema.parse(options.status);
+        query = query.where('status', '==', options.status);
+      }
+
+      query = query.orderBy('createdAt', 'desc').limit(limit + 1);
+      if (options.cursor !== undefined) {
+        query = query.startAfter(options.cursor);
+      }
+
+      const snapshot = await query.get();
+      const docs = snapshot.docs;
+      const parsed: TaskStatusResponse[] = docs.flatMap((doc) => {
+        const r = taskRecordSchema.safeParse(doc.data());
+        if (!r.success) {
+          this.#logger.warn(
+            {
+              collectionName: TASKS_COLLECTION,
+              documentId: doc.id,
+              issues: r.error.issues
+            },
+            'task list row skipped — schema drift'
+          );
+          return [];
+        }
+        return [taskStatusResponseProjection(r.data)];
+      });
+
+      if (parsed.length > limit) {
+        // Extra row is the next-page marker; drop it and emit a
+        // cursor pointing at the last *kept* row's createdAt.
+        const page = parsed.slice(0, limit);
+        return {
+          tasks: page,
+          nextCursor: page[page.length - 1]?.createdAt ?? null
+        };
+      }
+      return { tasks: parsed, nextCursor: null };
+    } catch (err) {
+      this.#logger.warn({ err, userId }, 'task list read failed');
+      return { tasks: [], nextCursor: null };
+    }
   }
 
   async appendAuditEvent(event: AnalyticsEvent): Promise<MutationReceipt> {
