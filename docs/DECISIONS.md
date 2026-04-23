@@ -1906,3 +1906,268 @@ References:
 - `apps/desktop-agent/src/heartbeat/agent-heartbeat-loop.ts` —
   exponential backoff makes reconnection tolerant of
   single-instance restarts.
+
+## Task Lifecycle + Retention Posture (Option B — 30 Days)
+
+Decided: 2026-04-24 (Week 3 Phase 3.1, Gate 3.1.A)
+
+Status: Accepted
+
+### Context
+
+Phase 3.1 persists user task submissions to Firestore. The
+`TaskRecord.prompt` field carries the raw user-authored text,
+which can contain sensitive content (API keys, PII, internal
+codebase snippets). The `output` field carries the agent's
+response, which inherits the same sensitivity through
+reference. Before landing code that writes these fields,
+Gate 3.1.A required an explicit retention posture decision
+(Red Flag #1).
+
+Three retention windows were surfaced:
+
+  A. Persist indefinitely — keep task history forever unless
+     user requests deletion.
+  B. Persist with a fixed 30-day TTL — auto-delete on that
+     schedule; user-initiated deletion is a future TD.
+  C. Ephemeral — store only a hash + length of prompts;
+     keep outputs briefly for UI replay, discard after
+     completion.
+
+### Decision
+
+**Option B.** Every TaskRecord is written with a
+server-computed `expireAt = createdAt + 30 days`. Firestore
+TTL policy is applied on the `expireAt` field (not on
+`createdAt` — see the TD-026 pitfall from Phase 2's
+`agentHeartbeats` — TTL fires when the named field has
+passed "now", so the field MUST hold the expiry timestamp,
+not the creation timestamp). Documents are auto-deleted by
+Google's TTL service within ~24 h of their `expireAt`.
+
+### Consequences
+
+Positive
+- Bounded storage footprint — predictable cost, no unbounded
+  growth.
+- GDPR-practical — reduced blast radius; most regulatory
+  frameworks accept a 30-day retention default.
+- Aligns with industry norm (OpenAI, Anthropic, Stripe, Vercel
+  all default ~30d for prompt / event logs).
+- UX-sufficient for MVP — users work with recent tasks (last
+  week is typical); a 30-day window covers weekly retrospective
+  + reopen/iterate use cases.
+- Simpler ops — nothing to vacuum, nothing to archive, no
+  stale-index problems at the 30-day mark.
+
+Negative
+- History loss at 30 days. Beyond-30-day access requires a
+  future export feature (TD tracked outside this phase).
+- Manual Firestore Console TTL step per environment — listed
+  in the PR #33 body so the first deploy to a new env doesn't
+  silently skip it.
+- No user-initiated deletion path at 3.1 — a privacy request
+  between 0-30 days today has no endpoint; TD-028 fixes.
+
+Mitigations
+- TD-028 (user-initiated deletion, P2) closes the 0-30-day
+  gap. Planned for Week 4.
+- Logs never carry `prompt` or `output` content — only
+  metadata (`promptLength`, `taskId`, `userId`). Deliberate
+  constraint in POST /v1/tasks handler; verified in c6.
+- A follow-up ADR + TD can raise the window (to 90d / 180d)
+  if enterprise customer demand appears. The mechanism is
+  trivial — change `TASK_RETENTION_DAYS` + re-run migration
+  to set `expireAt` on pre-existing rows.
+
+### Alternatives considered
+
+Option A — persist indefinitely
+- Pros: preserves full history; zero "where did my task go"
+  support tickets.
+- Cons: unbounded GDPR liability; storage cost grows linearly
+  with usage; every new compliance regime (EU AI Act, CCPA
+  expansions) re-opens the retention question; audit burden
+  grows.
+- Rejected. Indefinite persistence turns every user's
+  prompt into a permanent record we must defend against a
+  future breach. Not a posture we want to ship MVP with.
+
+Option C — ephemeral / hash-only
+- Pros: smallest possible retention surface; "we never stored
+  your prompt" story is regulator-friendly.
+- Cons: Phase 3.2 task redispatch needs the prompt if the
+  assigned agent goes offline mid-dispatch — storing a hash
+  would force us to keep the prompt somewhere anyway (e.g.
+  Pub/Sub message payload, which has its own retention). UI
+  history becomes useless; every resubmit is a re-type.
+  Debugging user reports ("why did my task fail?") becomes
+  vastly harder with no prompt echo available.
+- Rejected. Ephemeral wins on privacy but breaks Phase 3.2
+  redispatch and most of the Phase 3.3 UX.
+
+Per-user custom retention (premature-generalisation alt)
+- Rejected. No enterprise customer has asked for it yet.
+  When one does, it grows as an override on `user_budgets`-
+  style pattern (already in place from Phase 2 cost). No
+  design lock-in today.
+
+### Implementation
+
+- `TaskRecord.expireAt: isoTimestampSchema` — required field
+  in `packages/contracts/src/ai/task.ts` (c1).
+- `POST /v1/tasks` computes `expireAt = now + 30 days` at
+  submission time (`TASK_RETENTION_MS` constant in
+  `apps/api/src/routes/tasks.ts`, c6).
+- Manual Firestore Console step: TTL policy on
+  `tasks.expireAt`. No offset — the policy uses the field
+  value as the absolute expiry timestamp. Listed in PR #33
+  body.
+
+### References
+
+- `packages/contracts/src/ai/task.ts` — schema
+- `apps/api/src/routes/tasks.ts` — expireAt computation at
+  write
+- Sibling ADR *Idempotency — In-Memory LRU With Firestore
+  Fallback* (2026-04-24) for the other Phase 3.1 lock-in.
+- TD-026 (Phase 2 heartbeat TTL pitfall) — the reason
+  `expireAt` holds the absolute timestamp, not an offset.
+- TD-028 (user-initiated task deletion, P2) for the 0-30-day
+  privacy gap.
+
+## Idempotency — In-Memory LRU With Firestore Fallback
+
+Decided: 2026-04-24 (Week 3 Phase 3.1, Gate 3.1.A)
+
+Status: Accepted
+
+### Context
+
+POST /v1/tasks must be idempotent. Mobile clients retry on
+flaky networks; users double-tap the submit button; the same
+client-supplied `idempotencyKey` (UUID v4) arrives multiple
+times. Two submits with the same `(userId, idempotencyKey)`
+within a reasonable window must resolve to the same taskId
+and return the same response shape.
+
+Phase 3.1 Red Flag #2 makes this a hard architectural
+constraint: "Every task dispatch must have at-least-once
+delivery + idempotency key + deduplication." The design
+question is where the dedup lives.
+
+### Decision
+
+Two-layer check on every POST:
+
+1. **In-memory LRU cache** (`IdempotencyCache` service) —
+   keyed by `${userId}:${idempotencyKey}`. 24-hour TTL,
+   10 000-entry cap. Authoritative inside a single Fastify
+   instance; first-lookup path, sub-millisecond.
+2. **Firestore fallback query** via
+   `FirestoreOperatorRepository.findTaskByIdempotencyKey`
+   on a composite index `(idempotencyKey ASC, userId ASC,
+   createdAt DESC)` — runs only on cache miss. Recovers
+   replay semantics after a Fastify-instance restart (cold
+   cache). Replay is only honoured when the Firestore hit
+   is less than 24 h old; older matches fall through to a
+   fresh taskId (same semantic as cache expiry).
+
+Cache is written AFTER a successful Firestore record. A
+thrown exception during `recordTask` leaves the cache
+untouched so a retry can write fresh.
+
+### Consequences
+
+Positive
+- Fast path: most replays in a process are cache hits.
+- Recovery: cache warms lazily from Firestore on cold miss
+  via the fallback query.
+- No new infrastructure — in-memory only.
+- Same architectural pattern as the Phase 2 heartbeat v2
+  rate limiter — single design vocabulary across the api.
+
+Negative
+- Single-Fastify-instance scope. Two api replicas don't share
+  cache state, so a concurrent identical submit routed to
+  different replicas can briefly pass both cache layers and
+  produce two `taskId`s (last write wins at Firestore).
+  Rare in practice — same client rarely submits to two
+  replicas concurrently — but not zero.
+- No hard uniqueness guarantee. Firestore doesn't support
+  unique constraints at write time; a truly atomic "check
+  + write" would require a transactional read-modify-write
+  which adds per-request latency.
+
+Mitigations
+- TD-027 (Redis-backed cache, P3) tracks the multi-instance
+  migration. Same `IdempotencyCache` interface; the
+  implementation swap is mechanical.
+- The composite index on
+  `(idempotencyKey, userId, createdAt DESC)` gives us a
+  rebuild path AND a dedup reconciliation query if we ever
+  want to post-hoc merge duplicates.
+
+### Alternatives considered
+
+Redis-backed cache from day one
+- Pros: shared across api instances; survives restart
+  without the Firestore fallback hop.
+- Cons: new infrastructure (Memorystore), new operational
+  surface (Redis outage = submit broken), new deploy
+  complexity (VPC connector, Memorystore instance), extra
+  cost (~$25/month minimum for Memorystore basic tier) for
+  no user-visible benefit while we're single-instance.
+- Rejected for MVP. TD-027 captures the trigger — switch
+  when we go multi-instance.
+
+Firestore-only (no cache layer)
+- Pros: no state in the api process; automatically correct
+  across restart + multi-instance.
+- Cons: every POST does a Firestore read before the write.
+  Cost at scale (two operations per submit vs one); latency
+  cold path (~50-100ms vs sub-ms cache hit); doesn't
+  solve the concurrent-race (still needs a transaction).
+- Rejected. The common path — user submits, no replay — is
+  the path we should optimise. Fallback query covers the
+  cold case without paying on every request.
+
+Client-only idempotency (HTTP 409 on conflict)
+- Pros: no server-side state.
+- Cons: forces every mobile client to handle the 409 flow,
+  including stale clients that forget. Not actually
+  idempotent — it's conflict detection, not dedup.
+- Rejected. The spec calls for idempotency (same response
+  on replay), not conflict detection.
+
+Firestore transactional read-modify-write
+- Pros: strict atomicity at write time; no concurrent-race
+  window.
+- Cons: serialises submits per user; Firestore transactions
+  have per-document contention limits; complexity for a
+  rare edge case.
+- Rejected for MVP. Can layer over the current design
+  later if the race becomes user-visible.
+
+### Implementation
+
+- `apps/api/src/services/idempotency-cache.ts` (c4): LRU
+  via Map insertion-order + delete-and-reinsert on hit;
+  lazy sweep of expired entries before eviction; injectable
+  clock.
+- `apps/api/src/integrations/firestore.ts`
+  `findTaskByIdempotencyKey(userId, idempotencyKey)` (c3):
+  Firestore fallback query.
+- `apps/api/src/routes/tasks.ts` POST /v1/tasks (c6): the
+  two-layer check + cache-after-success discipline.
+- Composite index `(idempotencyKey ASC, userId ASC,
+  createdAt DESC)` — manual Console step listed in the
+  PR #33 body.
+
+### References
+
+- c4 / c5 for cache impl + tests.
+- Sibling ADR *Task Lifecycle + Retention Posture* (2026-04-24)
+  — the other Phase 3.1 architectural lock-in.
+- TD-027 (Redis-backed cache, P3) for the multi-instance
+  migration path.
