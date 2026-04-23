@@ -52,13 +52,13 @@ describe('TaskDispatchPublisher', () => {
     );
 
     const result = await publisher.publishDispatchTask({
-      taskId: '11111111-1111-1111-1111-111111111111'
+      taskId: '11111111-1111-4111-8111-111111111111'
     });
 
     expect(fake.topic).toHaveBeenCalledWith('task-dispatch-test');
     expect(fake.publishMessage).toHaveBeenCalledWith({
       json: {
-        taskId: '11111111-1111-1111-1111-111111111111',
+        taskId: '11111111-1111-4111-8111-111111111111',
         attempt: 1
       }
     });
@@ -92,7 +92,7 @@ describe('TaskDispatchPublisher', () => {
 
     const failedAt = '2026-04-24T06:30:00.000Z';
     const result = await publisher.publishDlq({
-      taskId: '22222222-2222-2222-2222-222222222222',
+      taskId: '22222222-2222-4222-8222-222222222222',
       reason: 'exhausted max attempts',
       attempts: 5,
       failedAt
@@ -101,7 +101,7 @@ describe('TaskDispatchPublisher', () => {
     expect(fake.topic).toHaveBeenCalledWith('task-dispatch-dlq-test');
     expect(fake.publishMessage).toHaveBeenCalledWith({
       json: {
-        taskId: '22222222-2222-2222-2222-222222222222',
+        taskId: '22222222-2222-4222-8222-222222222222',
         reason: 'exhausted max attempts',
         attempts: 5,
         failedAt
@@ -120,7 +120,7 @@ describe('TaskDispatchPublisher', () => {
     );
 
     await publisher.publishDlq({
-      taskId: '33333333-3333-3333-3333-333333333333',
+      taskId: '33333333-3333-4333-8333-333333333333',
       reason: 'no agents matched',
       attempts: 5
     });
@@ -143,7 +143,7 @@ describe('TaskDispatchPublisher', () => {
     const publisher = new TaskDispatchPublisher(buildConfig(), logger, client);
 
     const result = await publisher.publishDispatchTask({
-      taskId: '44444444-4444-4444-4444-444444444444'
+      taskId: '44444444-4444-4444-8444-444444444444'
     });
 
     expect(result.published).toBe(false);
