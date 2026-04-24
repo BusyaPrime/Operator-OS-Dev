@@ -18,10 +18,14 @@
 #
 # Optional env overrides:
 #   PROJECT_ID               default: operator-os-dev
-#   LOCATION                 default: europe-west4  (MUST match api region
-#                            per Phase 3.2 stop rule #11 — the legacy
-#                            europe-west1 queues from Phase 2 are NOT
-#                            co-located, see TD-034 for unification)
+#   LOCATION                 default: europe-west1  (Cloud Tasks does
+#                            NOT support europe-west4 where the api
+#                            runs — see TD-039. europe-west1 is the
+#                            closest EU Cloud Tasks location and
+#                            co-located with the Phase 2 legacy
+#                            queues, which means TD-034 region
+#                            unification is now a no-op; all Cloud
+#                            Tasks live in europe-west1.)
 #   MAX_DISPATCHES_PER_SEC   default: 10
 #   MAX_CONCURRENT           default: 50
 #   MAX_ATTEMPTS             default: 5
@@ -38,7 +42,7 @@ set -euo pipefail
 
 ENV="${ENV:-dev}"
 PROJECT_ID="${PROJECT_ID:-operator-os-dev}"
-LOCATION="${LOCATION:-europe-west4}"
+LOCATION="${LOCATION:-europe-west1}"
 MAX_DISPATCHES_PER_SEC="${MAX_DISPATCHES_PER_SEC:-10}"
 MAX_CONCURRENT="${MAX_CONCURRENT:-50}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-5}"

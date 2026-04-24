@@ -2575,3 +2575,112 @@ NOT trigger CD, close as resolved.
 - 2026-04-24: filed after the path-filter trap surfaced during
   Phase 3.2 closure follow-up. Awaiting an infra / CI-cleanup
   PR.
+
+## TD-039: Pre-lock GCP service regional availability before DP decisions
+
+Discovered: 2026-04-24 (Phase 3.2 manual setup — Cloud Tasks
+    queue creation failed because `europe-west4` is not a
+    Cloud Tasks location)
+Type: process · planning-hygiene
+Priority: P3
+Status: open (process correction; decision already applied —
+    region switched to `europe-west1`)
+Trigger for action: next time a Decision Proposal locks a
+    GCP region without verifying service availability.
+
+### Description
+
+Gate 3.2.A DP-1 locked `TASK_DISPATCH_RETRY_QUEUE_LOCATION =
+europe-west4` to co-locate the new Cloud Tasks retry queue
+with the api's Cloud Run region, honoring the then-stated
+stop rule #11 ("Cloud Tasks queue must match europe-west4
+api"). The decision was approved without a
+`gcloud tasks locations list` check. Cloud Tasks does NOT
+support `europe-west4` as a region. The manual queue
+creation on 2026-04-24 failed with `Location
+'europe-west4' is not a valid location for Cloud Tasks.`
+
+The decision was corrected in-flight: the queue is now in
+`europe-west1` (closest EU Cloud Tasks region, co-located
+with the Phase 2 legacy queues). Knock-on effects:
+
+- Stop rule #11 as originally written is physically
+  impossible. Revised intent: "Cloud Tasks queue in the
+  closest supported EU region to the api" — `europe-west1`
+  meets that bar.
+- **TD-034 becomes a no-op** — it tracked "migrate
+  europe-west1 legacy queues to europe-west4 for uniformity
+  with api". The unification target is impossible; but the
+  NEW queue in europe-west1 achieves Cloud Tasks regional
+  uniformity (all our queues in one region). TD-034 should
+  be closed as "resolved by accident — europe-west4 not
+  available for Cloud Tasks".
+
+### Risk if unaddressed
+
+- Current incident is contained: the manual correction
+  happened within minutes; no production impact.
+- Future risk: the next DP that locks a region / project /
+  service tier without availability verification could bite
+  in a less-recoverable way (e.g. at deploy time, after CI
+  has already committed to a naming scheme that encodes the
+  region).
+
+### Proposed fix (process correction)
+
+Adopt a pre-DP checklist for any directive that locks:
+
+1. **Region / location**: run `gcloud <service> locations
+   list` (or equivalent) BEFORE accepting the DP. Confirm the
+   specific region supports the specific service.
+2. **Service tier / quota**: run
+   `gcloud services list --enabled` and check the project's
+   quotas for the proposed usage pattern.
+3. **Naming scheme that encodes GCP state**: verify the
+   encoding is valid for EVERY env (dev / staging / prod)
+   before committing.
+4. **IAM preconditions**: check whether the DP implies new
+   IAM bindings that require prior-permission grants on the
+   invoking identity. Document in the pre-plan.
+
+For this specific incident, the fix is already applied:
+`create-cloud-tasks-queue.sh` default LOCATION changed to
+`europe-west1`, `packages/config/src/api.ts` default
+changed to match, config tests updated.
+
+### Stale close condition
+
+When the pre-DP availability-check checklist appears in the
+project-level ADR process doc (or any equivalent written
+artifact reviewers actually use), close TD-039.
+
+### Evidence trail
+
+- Gate 3.2.A DP-1 approval: Obsidian
+  `decisions.md` entry `2026-04-24-0900` — DP-1 accepted
+  without region availability verification.
+- Manual setup failure: Akmal's PowerShell session reported
+  `ERROR: Location 'europe-west4' is not a valid location
+  for Cloud Tasks.`
+- `gcloud tasks locations list` output at correction time —
+  EU subset: `europe-central2`, `europe-west1`,
+  `europe-west2`, `europe-west3`, `europe-west6`. No
+  `europe-west4`, no `europe-north1`.
+
+### Related
+
+- **TD-034** — Cloud Tasks region unification. Invalidated
+  by this finding; close as "impossible target, resolved by
+  europe-west1 co-location". A follow-up edit here or to
+  TD-034 itself.
+- Stop rule #11 (Phase 3.2 kickoff) — revise to reference
+  "closest supported EU Cloud Tasks region" rather than
+  `europe-west4` specifically.
+
+### History
+
+- 2026-04-24: filed during Phase 3.2 manual setup when DP-1's
+  europe-west4 assumption broke at `gcloud tasks queues
+  create`. Region corrected to europe-west1 inline; TD
+  captures the process gap (DP accepted without availability
+  verification) so it does not recur.

@@ -82,7 +82,7 @@ describe('Phase 3.2 task-dispatch env vars', () => {
     expect(env.PUBSUB_TOPIC_TASK_DLQ).toBe('task-dispatch-dlq-dev');
     expect(env.PUBSUB_PUSH_AUDIENCE).toBeUndefined();
     expect(env.TASK_DISPATCH_RETRY_QUEUE).toBe('task-dispatch-retry-dev');
-    expect(env.TASK_DISPATCH_RETRY_QUEUE_LOCATION).toBe('europe-west4');
+    expect(env.TASK_DISPATCH_RETRY_QUEUE_LOCATION).toBe('europe-west1');
     expect(env.TASK_DISPATCH_RETRY_DELAY_SECONDS).toBe(30);
   });
 
@@ -93,7 +93,7 @@ describe('Phase 3.2 task-dispatch env vars', () => {
       PUBSUB_TOPIC_TASK_DLQ: 'task-dispatch-dlq-prod',
       PUBSUB_PUSH_AUDIENCE: 'https://operator-os-api-prod.example.com',
       TASK_DISPATCH_RETRY_QUEUE: 'task-dispatch-retry-prod',
-      TASK_DISPATCH_RETRY_QUEUE_LOCATION: 'europe-west4',
+      TASK_DISPATCH_RETRY_QUEUE_LOCATION: 'europe-west1',
       TASK_DISPATCH_RETRY_DELAY_SECONDS: '60'
     });
 
@@ -106,7 +106,7 @@ describe('Phase 3.2 task-dispatch env vars', () => {
       'https://operator-os-api-prod.example.com'
     );
     expect(env.TASK_DISPATCH_RETRY_QUEUE).toBe('task-dispatch-retry-prod');
-    expect(env.TASK_DISPATCH_RETRY_QUEUE_LOCATION).toBe('europe-west4');
+    expect(env.TASK_DISPATCH_RETRY_QUEUE_LOCATION).toBe('europe-west1');
     expect(env.TASK_DISPATCH_RETRY_DELAY_SECONDS).toBe(60);
   });
 

@@ -48,7 +48,7 @@ export const apiEnvSchema = z.object({
   TASK_DISPATCH_RETRY_QUEUE_LOCATION: z
     .string()
     .min(1)
-    .default('europe-west4'),
+    .default('europe-west1'),
   TASK_DISPATCH_RETRY_DELAY_SECONDS: integerFromString(30),
   TASKS_TARGET_BASE_URL: optionalUrlFromString(),
   AGENT_AUDIENCE: optionalUrlFromString(),
