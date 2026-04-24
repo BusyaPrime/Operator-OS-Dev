@@ -2453,3 +2453,125 @@ audience, email_verified, sub).
 - 2026-04-24: filed at Phase 3.2 Gate 3.2.A when DP-3 chose
   isolation. Deferred to a code-health sweep after the middleware
   has stabilised.
+
+## TD-038: CD Deploy workflow path filter is too broad
+
+Discovered: 2026-04-24 (Phase 3.2 closure follow-up — TD-030
+    recurrence commit `666b576` triggered an unintended CD
+    redeploy on a docs + `apps/api/scripts/*.sh` change)
+Type: operational-hygiene · ci
+Priority: P3
+Status: open
+Trigger for action: next infra / CI-cleanup PR, or next time
+    someone bundles a non-container change with a container
+    change and the resulting CD redeploy becomes inconvenient.
+
+### Description
+
+`.github/workflows/cd-deploy.yml` has two layers of path filters,
+both of which currently include the whole `apps/api/**` tree:
+
+1. Top-level workflow `paths:` — governs whether the workflow
+   runs at all on a push to `phase3/live-deploy-and-vertex`.
+2. Job-level `dorny/paths-filter@v3` inside `detect-changes`
+   — sets `api_changed`, which gates whether `deploy-api`
+   fires.
+
+Both match `apps/api/scripts/*.sh`, `apps/api/README.md`, and
+`apps/api/**/__tests__/**` even though none of those are
+compiled into the Cloud Run container. A push that touches any
+of them produces a cosmetic redeploy (new revision, byte-
+identical to the prior one) with all the usual Cloud Build
+cost and TD-030 post-deploy-window risk.
+
+Concrete incident: commit `666b576` bundled
+`docs/TECH_DEBT.md` edits + a new
+`apps/api/scripts/heartbeat-probe.sh`. Intent was docs-only;
+actual outcome was CD Deploy run `24910979376` firing on the
+push (cancelled manually before a redeploy landed).
+
+### Risk if unaddressed
+
+- Cosmetic redeploys waste Cloud Build minutes and burn
+  revision numbers.
+- Each redeploy is a fresh post-deploy window that may exercise
+  the TD-030 heartbeat pattern — noise in a signal we are
+  trying to observe.
+- Revision churn during a manual `gcloud run services update`
+  can collide (409) with in-flight CD-driven revision
+  creation, forcing retry dances.
+- Path-filter ambiguity makes it harder to reason about
+  "will this commit deploy?" from the diff alone — surprises
+  the reviewer and the on-call.
+
+### Proposed fix
+
+Preferred — tighten the top-level `paths:` filter to list
+only container inputs explicitly:
+
+```yaml
+on:
+  push:
+    branches:
+      - phase3/live-deploy-and-vertex
+    paths:
+      - 'apps/api/src/**'
+      - 'apps/api/package.json'
+      - 'apps/api/tsconfig.json'
+      - 'apps/api/Dockerfile'
+      - 'apps/auth-gateway/src/**'
+      - 'apps/auth-gateway/package.json'
+      - 'apps/auth-gateway/tsconfig.json'
+      - 'apps/auth-gateway/Dockerfile'
+      - 'packages/contracts/src/**'
+      - 'packages/config/src/**'
+      - 'infra/cloudbuild/**'
+      - 'infra/cloud-run/**'
+```
+
+And mirror the same discipline in the inner
+`dorny/paths-filter@v3` step.
+
+Alternative — negative-path exclusions (GitHub Actions path
+filter supports `!` prefix):
+
+```yaml
+paths:
+  - 'apps/api/**'
+  - '!apps/api/scripts/**'
+  - '!apps/api/README.md'
+  - '!apps/api/**/__tests__/**'
+  - '!apps/api/**/*.test.ts'
+```
+
+Both work; the explicit-positive list is more auditable and
+matches how the Cloud Build context is assembled today.
+
+### Stale close condition
+
+When the PR landing the tighter filter is merged AND a
+subsequent docs + `scripts/` commit has been verified to
+NOT trigger CD, close as resolved.
+
+### Evidence trail
+
+- Incident commit: `666b576` (2026-04-24)
+  — `docs/TECH_DEBT.md` + `apps/api/scripts/heartbeat-probe.sh`
+- Triggered run: CD Deploy `24910979376` (cancelled by
+  operator decision before revision creation).
+- Historical contrast: Phase 3.1 docs-only commits `f4e1265`
+  (TD-029) and `3d83326` (TD-030) — both under `docs/` only
+  — correctly did NOT trigger CD.
+
+### Related
+
+- TD-021 — cosmetic CD hang. Different surface but same
+  workflow file; a CI-cleanup PR can address both together.
+- TD-030 — post-deploy heartbeat transient. Fewer cosmetic
+  deploys = fewer uncontrolled TD-030 windows.
+
+### History
+
+- 2026-04-24: filed after the path-filter trap surfaced during
+  Phase 3.2 closure follow-up. Awaiting an infra / CI-cleanup
+  PR.
