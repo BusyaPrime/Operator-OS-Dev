@@ -2100,3 +2100,320 @@ git history + `decisions.md` for archaeology.
   needed today. Filed to preserve discipline: a future
   recurrence inherits a known playbook rather than a fresh
   mystery.
+
+## TD-031: Redis-backed round-robin cursor for multi-instance api
+
+Discovered: 2026-04-24 (Phase 3.2 c9 — task-router in-memory cursor)
+Type: scalability · correctness
+Priority: P3
+Status: open
+Trigger: when `operator-os-api` runs on more than one Cloud Run
+    instance (likely at >100 concurrent users).
+
+### Description
+
+`apps/api/src/services/task-router.ts` keeps its round-robin
+cursor in a private `Map<bucketKey, lastIdx>`. Two api replicas
+will each have their own cursor; the same capability bucket can
+over-pick one agent because each replica's cursor advances
+independently. Under single-instance deploy today this is a
+non-issue; under multi-instance it becomes a fairness bug.
+
+### Risk if unaddressed
+
+- Agent load imbalance once api is horizontally scaled. Worst
+  case: one agent receives ~2× the dispatch volume of its peers
+  in a bucket until organic load rotates the cursors back into
+  sync.
+- Zero risk today (single-instance by design, ADR *Agent
+  WebSocket Sessions Are In-Memory* covers the posture).
+
+### Proposed fix
+
+1. Provision a Memorystore (Redis) instance in the
+   `operator-os-dev` project via a separate infra PR. VPC
+   Connector required for Cloud Run → Memorystore.
+2. Add `ioredis` as an `apps/api` dependency.
+3. Reimplement `TaskRouter` cursor storage as a Redis HSET keyed
+   by bucket, value = lastIdx. Interface (`findMatchingAgent`)
+   stays identical; consumers do not change.
+4. Env additions: `REDIS_HOST`, `REDIS_PORT`. Route through
+   `packages/config/src/api.ts`.
+
+### Related
+
+- TD-027: same migration trigger for the idempotency cache. A
+  single Memorystore instance can serve both the idempotency
+  cache and the router cursor.
+- ADR *Capability Matching — Subset Rule + In-Memory Round-Robin*
+  (2026-04-24) records the deferral rationale.
+
+### History
+
+- 2026-04-24: filed when Phase 3.2 c9 landed the in-memory cursor.
+  Deferred until horizontal scaling.
+
+## TD-032: Pub/Sub dispatch monitoring + alerting
+
+Discovered: 2026-04-24 (Phase 3.2 c3/c7 — dispatch topics landed
+    without monitoring surface)
+Type: observability
+Priority: P3
+Status: open
+Trigger: before the first paying customer, or when dispatch
+    exhaustion becomes invisible to ops.
+
+### Description
+
+Phase 3.2 ships `task-dispatch-${ENV}`, `task-dispatch-dlq-${ENV}`,
+and the `task-dispatch-retry-${ENV}` Cloud Tasks queue without
+a Cloud Monitoring dashboard or alert policies. Ops visibility
+today is via `gcloud logging read` — sufficient for debugging but
+not for trend detection (gradual drift of DLQ rate, sudden spike
+in retry depth).
+
+### Risk if unaddressed
+
+- Silent failure modes: all agents disconnect during a regional
+  issue; tasks pile up in retry queue; no page fires until a
+  user complains.
+- DLQ fills without a consumer reading it (Phase 3.2 logs DLQ
+  entries but does not expose them in a UI).
+- Hard to tell when it is time to act on TD-031/033 without
+  fleet-level utilisation data.
+
+### Proposed fix
+
+1. Cloud Monitoring dashboard with:
+   - Pub/Sub `task-dispatch-${ENV}` oldest-unacked-message-age
+   - Pub/Sub `task-dispatch-dlq-${ENV}` message rate
+   - Cloud Tasks `task-dispatch-retry-${ENV}` queue depth +
+     dispatch rate
+   - api log rate for `task_dispatch_receive_failed` +
+     `task_dispatch_dlq_received`
+2. Alert policies:
+   - DLQ rate > 1/min for 5 minutes → page
+   - Retry queue depth > 100 for 10 minutes → warn
+   - Oldest-unacked-message-age > 60s for 5 minutes → warn
+3. Terraform the above so future envs inherit for free.
+
+### Related
+
+- TD-021 (gcloud log-streaming hang): monitoring via Cloud
+  Console instead of CLI would have made that cosmetic hang
+  obvious faster.
+- TD-033 (reliability scoring) — reliability input feeds from
+  the same telemetry pipeline.
+
+### History
+
+- 2026-04-24: filed when Phase 3.2 dispatch infra landed without
+  a monitoring surface. Deferred to the next ops hardening pass.
+
+## TD-033: Agent reliability scoring (weighted capability match)
+
+Discovered: 2026-04-24 (Phase 3.2 c9 — round-robin ignores agent
+    reliability)
+Type: scalability · correctness
+Priority: P3
+Status: open
+Trigger: when a fleet includes agents with observably different
+    reliability and flat round-robin produces visible complaints.
+
+### Description
+
+`TaskRouter.findMatchingAgent` treats every capability-matched
+agent identically. A newly-connected, rarely-tested agent gets
+the same rotation slot as a well-understood stable one. Under
+the current single-agent Phase 3.2 demo this is fine; once a
+fleet has >1 agent per capability bucket and observable failure
+rates, equal treatment becomes wasteful.
+
+### Risk if unaddressed
+
+- User-visible dispatch to unreliable agents even when better
+  options exist — task-rejected + re-queue latency counts
+  against user wait time.
+- Harder to onboard a new agent safely — once accepted it gets
+  equal traffic immediately.
+
+### Proposed fix
+
+1. Persist per-agent telemetry in Firestore: task-accepted /
+   task-rejected / task-completed / task-failed counters over
+   a rolling window (30 days).
+2. Compute a reliability score (decay-weighted acceptance +
+   completion rate) at router initialisation and after each
+   terminal task event.
+3. Augment round-robin with reliability weighting: agents with
+   score < threshold get routed half as often as their peers.
+4. Keep the canonical bucket-key scheme for grouping.
+
+### Related
+
+- TD-031 (Redis round-robin) — reliability store needs a shared
+  backing; roll into the Memorystore migration.
+- TD-032 (dispatch monitoring) — telemetry pipeline feeding this
+  score is the same one that feeds the monitoring dashboard.
+
+### History
+
+- 2026-04-24: filed when Phase 3.2 c9 chose flat round-robin.
+  Deferred pending telemetry.
+
+## TD-034: Cloud Tasks region unification (europe-west1 → europe-west4)
+
+Discovered: 2026-04-24 (Phase 3.2 c1 — new retry queue pinned to
+    europe-west4 per stop rule #11; legacy queues stay europe-west1)
+Type: infrastructure
+Priority: P3
+Status: open
+Trigger: when the legacy queues are touched for any reason, or
+    during the next ops-hygiene pass.
+
+### Description
+
+`CLOUD_TASKS_LOCATION` is `europe-west1` and controls the
+Phase 2 legacy queues (`commands`, `approvals`, `exports`).
+Phase 3.2 introduced a new env var
+`TASK_DISPATCH_RETRY_QUEUE_LOCATION` (default `europe-west4`) so
+the new retry queue is co-located with the api (stop rule #11).
+The result is two regions in one project — historical accident
+compounded by a principled new choice.
+
+### Risk if unaddressed
+
+- Cross-region latency on legacy queue flows (marginal today,
+  worse under load).
+- Mental overhead for on-call: two regions to check when tracing
+  a dispatch.
+- Confusing for new engineers reading the config schema.
+
+### Proposed fix
+
+1. Recreate `commands`, `approvals`, `exports` queues in
+   `europe-west4` via `gcloud tasks queues create`.
+2. Double-dispatch window: api publishes to both regions for
+   ~24h while we verify drain on europe-west1.
+3. Drain europe-west1 queues (wait for all inflight tasks to
+   finish).
+4. Flip `CLOUD_TASKS_LOCATION` default to `europe-west4`.
+5. Delete europe-west1 queues.
+
+### Related
+
+- ADR *Task Dispatch — Pub/Sub Push + Cloud Tasks Retry*
+  (2026-04-24) — where the new europe-west4 retry queue was
+  introduced.
+
+### History
+
+- 2026-04-24: filed at Phase 3.2 c1 when the region asymmetry
+  landed. Deferred to the next infrastructure-touching PR.
+
+## TD-035: Internal routes path migration (`/internal/*` → `/v1/internal/*`)
+
+Discovered: 2026-04-24 (Phase 3.2 c7 — new internal routes use the
+    versioned /v1 prefix while Phase 2 /internal/tasks/{commands,
+    approvals, exports} stayed unversioned)
+Type: consistency
+Priority: P3
+Status: open
+Trigger: next docs/refactor sweep that touches the legacy internal
+    routes, or when the parallel conventions start confusing new
+    engineers.
+
+### Description
+
+Phase 3.2 Gate 3.2.A decision DP-2 locked `/v1/internal/*` for
+all NEW internal routes to match the rest of the API's `/v1/*`
+versioning. Phase 2 `/internal/tasks/{commands,approvals,exports}`
+kept their unversioned paths to avoid scope creep at merge time.
+Result: two internal-path conventions coexist.
+
+### Risk if unaddressed
+
+- Confusion for on-call / new engineers reading the route
+  registry.
+- No breaking change risk (these are internal routes, not
+  user-facing), but the inconsistency accumulates mental debt.
+
+### Proposed fix
+
+1. Move `commands`, `approvals`, `exports` handlers to
+   `/v1/internal/tasks/{commands,approvals,exports}`.
+2. Update the Cloud Tasks queue callers (in
+   `apps/api/src/integrations/tasks.ts`) to the new paths.
+3. Docs-only PR. No CD redeploy required (the Cloud Tasks
+   target paths are written at enqueue time, so existing
+   in-flight tasks still hit the old paths for ~a day; ship the
+   new paths + keep the old handlers as aliases for a
+   deprecation window).
+
+### Related
+
+- ADR *Task Dispatch — Pub/Sub Push + Cloud Tasks Retry*
+  (2026-04-24) — where the `/v1/internal/*` convention was
+  set for new routes.
+
+### History
+
+- 2026-04-24: filed at Phase 3.2 Gate 3.2.A when DP-2 was
+  accepted. Deferred to a dedicated cleanup PR.
+
+## TD-036: OIDC verification paths consolidation
+
+Discovered: 2026-04-24 (Phase 3.2 c5 — new middleware file created
+    instead of extending integrations/auth.ts per DP-3)
+Type: code-health
+Priority: P3
+Status: open
+Trigger: when the Phase 3.2 OIDC middleware has seen two months
+    of production usage without regression, or when a third
+    OIDC code path tempts someone to create another separate
+    verifier.
+
+### Description
+
+The api now has two OIDC verifiers:
+
+- `apps/api/src/integrations/auth.ts`
+  `FirebaseAuthService.verifyGoogleIdToken` — serves user + agent
+  auth (Firebase + Google OIDC fallback via OAuth2Client).
+- `apps/api/src/middleware/google-oidc-verifier.ts` — Phase 3.2
+  internal-route preHandler (pure Google OIDC, SA allowlist).
+
+DP-3 (Gate 3.2.A, Akmal-approved) chose isolation over consolidation
+for Phase 3.2 to avoid regression risk on Phase 1/2 callers. The
+two paths share ~40 lines of verification logic (issuer check,
+audience, email_verified, sub).
+
+### Risk if unaddressed
+
+- Drift: a security-critical change to one verifier (e.g. adding
+  `aud: string[]` handling) may not land in the other.
+- Test surface duplication — both code paths have their own
+  mocks + coverage.
+
+### Proposed fix
+
+1. Extract shared verification primitives into
+   `apps/api/src/middleware/oidc-primitives.ts` (`verifyClaims`,
+   `extractBearer`).
+2. Rewrite `FirebaseAuthService.verifyGoogleIdToken` and
+   `GoogleOidcVerifier.verify` to delegate to the primitives.
+3. Keep the two factory functions (user auth vs internal guard)
+   as separate public APIs — they have different rejection
+   semantics (IntegrationError vs OidcVerificationError).
+
+### Related
+
+- DP-3 (Gate 3.2.A, 2026-04-24) — the isolation decision.
+- ADR *Internal Route Authentication — Google OIDC ID Token*
+  (2026-04-24).
+
+### History
+
+- 2026-04-24: filed at Phase 3.2 Gate 3.2.A when DP-3 chose
+  isolation. Deferred to a code-health sweep after the middleware
+  has stabilised.
