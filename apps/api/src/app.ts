@@ -15,11 +15,23 @@ import { IntegrationError } from './integrations/runtime.js';
 import { registerHealthRoutes } from './routes/health.js';
 import { registerAiRoutes } from './routes/ai.js';
 import { registerAgentRoutes } from './routes/agent.js';
-import { registerAgentWsRoute } from './routes/agent-ws.js';
+import {
+  registerAgentWsRoute,
+  sendTaskAssign,
+  type AgentWsTaskCallbacks
+} from './routes/agent-ws.js';
 import { registerCostRoutes } from './routes/cost.js';
-import { registerInternalTasksRoutes } from './routes/internal-tasks.js';
+import {
+  registerInternalPubsubRoutes,
+  registerInternalTasksRoutes,
+  type DispatchHandler
+} from './routes/internal-tasks.js';
 import { registerOperatorRoutes } from './routes/operator.js';
 import { registerTaskRoutes } from './routes/tasks.js';
+import {
+  GoogleOidcVerifier,
+  createGoogleOidcGuard
+} from './middleware/google-oidc-verifier.js';
 import { VertexAIProvider } from './providers/index.js';
 import { buildReadinessResponse } from './readiness.js';
 import { createAgentSessionRegistry } from './services/agent-session-registry.js';
@@ -29,6 +41,9 @@ import { CostService } from './services/cost.js';
 import { ExportsService } from './services/exports.js';
 import { createIdempotencyCache } from './services/idempotency-cache.js';
 import { SessionsService } from './services/sessions.js';
+import { TaskDispatchPublisher } from './services/task-dispatch-publisher.js';
+import { TaskRetryScheduler } from './services/task-retry-scheduler.js';
+import { createTaskRouter } from './services/task-router.js';
 import type { AIProvider } from './types.js';
 
 interface BuildServerOptions {
@@ -203,17 +218,184 @@ export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) =>
     agentGuard: authService.createAgentGuard(agentAudience),
     userGuard: authService.createRequiredGuard()
   });
+  // Phase 3.2 infrastructure — always constructed (each service has
+  // its own ADC-absent record-only fallback, so boot is safe even in
+  // dev/test). The Pub/Sub PUSH receiver routes below are still gated
+  // on PUBSUB_PUSH_AUDIENCE because OIDC verification needs an
+  // explicit audience.
+  const taskDispatchPublisher = new TaskDispatchPublisher(config, app.log);
+  const taskRouter = createTaskRouter({
+    sessionRegistry: agentSessionRegistry
+  });
+  const taskRetryScheduler = new TaskRetryScheduler(config, app.log);
+
+  const MAX_DISPATCH_ATTEMPTS = 5;
+
+  /**
+   * Compose dispatch: router.findMatchingAgent → WS task-assign →
+   * Firestore state transition. No match → Cloud Tasks retry or DLQ
+   * on exhaustion. A null task document is a terminal failure (cannot
+   * dispatch something we don't know about).
+   */
+  const dispatch: DispatchHandler = async ({ taskId, attempt }) => {
+    const task = await firestoreRepository.getTaskByIdInternal(taskId);
+    if (!task) {
+      app.log.warn(
+        { taskId, attempt, source: 'dispatch' },
+        'dispatch: task not found in Firestore'
+      );
+      return { kind: 'failed', reason: 'task not found' };
+    }
+
+    const agent = taskRouter.findMatchingAgent({
+      capabilities: task.capabilities
+    });
+
+    if (agent) {
+      const sent = sendTaskAssign(agent.socket, {
+        taskId,
+        prompt: task.prompt,
+        capabilities: task.capabilities,
+        metadata: {
+          userId: task.userId,
+          createdAt: task.createdAt,
+          expireAt: task.expireAt
+        }
+      });
+      if (!sent) {
+        // Socket looked alive to the router but send failed. Treat as
+        // no-match so the retry path picks a sibling agent via
+        // round-robin. No Firestore update — status stays where it
+        // was; the retry attempt will update on its next pass.
+        app.log.warn(
+          { taskId, agentId: agent.agentId, sessionId: agent.sessionId },
+          'dispatch: sendTaskAssign failed; scheduling retry'
+        );
+        if (attempt < MAX_DISPATCH_ATTEMPTS) {
+          await taskRetryScheduler.scheduleRetry({
+            taskId,
+            attempt: attempt + 1
+          });
+          return {
+            kind: 'no-match',
+            willRetry: true,
+            nextAttempt: attempt + 1
+          };
+        }
+        return { kind: 'no-match', willRetry: false };
+      }
+      await firestoreRepository.updateTask(taskId, {
+        status: 'assigned',
+        assignedAgentId: agent.agentId
+      });
+      return { kind: 'assigned', agentSessionId: agent.sessionId };
+    }
+
+    // No matching agent.
+    if (attempt >= MAX_DISPATCH_ATTEMPTS) {
+      await taskDispatchPublisher.publishDlq({
+        taskId,
+        reason: 'no agent matched required capabilities',
+        attempts: attempt
+      });
+      await firestoreRepository.updateTask(taskId, {
+        status: 'failed',
+        error: {
+          code: 'no_matching_agent',
+          message: 'Dispatch exhausted max attempts without a matching agent.'
+        }
+      });
+      return { kind: 'no-match', willRetry: false };
+    }
+
+    await taskRetryScheduler.scheduleRetry({
+      taskId,
+      attempt: attempt + 1
+    });
+    await firestoreRepository.updateTask(taskId, { status: 'queued' });
+    return {
+      kind: 'no-match',
+      willRetry: true,
+      nextAttempt: attempt + 1
+    };
+  };
+
+  const taskCallbacks: AgentWsTaskCallbacks = {
+    async onTaskAccepted(params) {
+      // Status is already 'assigned' from the dispatch that sent the
+      // task-assign frame; the agent acknowledging is primarily an
+      // ops marker for Phase 3.2. Phase 3.3 will transition here to
+      // 'executing' once first task-progress arrives.
+      app.log.info(
+        {
+          source: 'agent-ws.taskCallbacks',
+          sessionId: params.sessionId,
+          agentId: params.agentId,
+          taskId: params.taskId
+        },
+        'task-accepted acknowledged'
+      );
+    },
+    async onTaskRejected(params) {
+      // Re-queue and schedule a fresh retry. Attempt counter resets;
+      // Phase 3.3 will add a dispatchAttempts field on TaskRecord so
+      // reject + retry share a budget with Pub/Sub-push retries.
+      app.log.info(
+        {
+          source: 'agent-ws.taskCallbacks',
+          sessionId: params.sessionId,
+          agentId: params.agentId,
+          taskId: params.taskId,
+          reason: params.reason
+        },
+        'task-rejected -> re-queueing'
+      );
+      await firestoreRepository.updateTask(params.taskId, {
+        status: 'queued',
+        assignedAgentId: null
+      });
+      await taskRetryScheduler.scheduleRetry({
+        taskId: params.taskId,
+        attempt: 1
+      });
+    }
+  };
+
   void registerAgentWsRoute(app, {
     agentGuard: authService.createAgentGuard(agentAudience),
-    sessionRegistry: agentSessionRegistry
+    sessionRegistry: agentSessionRegistry,
+    taskCallbacks
   });
   void registerTaskRoutes(app, {
     repository: firestoreRepository,
     idempotencyCache: taskIdempotencyCache,
     userGuard: authService.createRequiredGuard(),
-    apiBaseUrl: agentAudience
+    apiBaseUrl: agentAudience,
+    dispatchPublisher: taskDispatchPublisher
   });
   void registerInternalTasksRoutes(app);
+
+  // Phase 3.2 Pub/Sub + Cloud Tasks PUSH RECEIVER routes. Gated on
+  // PUBSUB_PUSH_AUDIENCE because OIDC verification requires an
+  // explicit audience; absence skips registration (routes absent ≠
+  // routes unauthenticated — stop rule honored).
+  if (config.PUBSUB_PUSH_AUDIENCE) {
+    const oidcVerifier = new GoogleOidcVerifier({
+      audience: config.PUBSUB_PUSH_AUDIENCE,
+      allowedEmails: new Set([config.CLOUD_RUN_SERVICE_ACCOUNT])
+    });
+    const oidcGuard = createGoogleOidcGuard(oidcVerifier);
+    void registerInternalPubsubRoutes(app, {
+      oidcGuard,
+      publisher: taskDispatchPublisher,
+      dispatch
+    });
+  } else {
+    app.log.info(
+      { source: 'buildServer' },
+      'PUBSUB_PUSH_AUDIENCE not set — Phase 3.2 internal pubsub routes not registered'
+    );
+  }
 
   return app;
 };

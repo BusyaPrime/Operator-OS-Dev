@@ -2171,3 +2171,382 @@ Firestore transactional read-modify-write
   — the other Phase 3.1 architectural lock-in.
 - TD-027 (Redis-backed cache, P3) for the multi-instance
   migration path.
+
+## Task Dispatch — Pub/Sub Push + Cloud Tasks Retry (Phase 3.2)
+
+### Context
+
+Phase 3.1 landed POST /v1/tasks, which persists a TaskRecord in
+Firestore. Phase 3.2 must carry that record to an actual agent:
+find a matching agent by capability, send the task over the
+WebSocket control channel, and retry with backoff when no agent
+is currently available. Two non-functional constraints shape the
+design:
+
+1. Dispatch must tolerate an api instance restart between POST
+   and agent-assignment (durability).
+2. Dispatch must support delayed retry when no agent matches
+   — the agent may be seconds away from connecting.
+
+### Decision
+
+Two complementary Google Cloud primitives, each handling one
+responsibility:
+
+- **Pub/Sub push subscription** — immediate dispatch. POST /v1/tasks
+  publishes `{taskId, attempt: 1}` to `task-dispatch-${ENV}` after
+  the Firestore write. Pub/Sub delivers the message to
+  `/v1/internal/pubsub/task-dispatch`, which resolves to the real
+  DispatchHandler (router → sendTaskAssign → state).
+
+- **Cloud Tasks queue** — delayed retry. When the router finds no
+  matching agent, DispatchHandler schedules a Cloud Tasks HTTP
+  task targeting `/v1/internal/tasks/retry-dispatch` with a 30-
+  second delay (configurable). That callback re-enters
+  DispatchHandler with `attempt += 1`. Exhausting 5 attempts fans
+  out to the DLQ topic and marks the task failed.
+
+Both receivers share the same DispatchHandler, so the
+orchestration logic has one implementation. The receivers are
+composed in `app.ts`; the route layer stays thin.
+
+### Consequences
+
+Positive
+- Low-latency happy path (Pub/Sub push ≈ 50-200ms end-to-end) for
+  the common case of an already-connected agent.
+- Durable dispatch: Pub/Sub retains the message until ACKed, so an
+  api crash mid-dispatch does not lose the task.
+- Backoff for free: Cloud Tasks handles scheduling + retry
+  counting on our behalf; we do not roll our own scheduler loop.
+- DLQ topic gives us ops visibility on exhausted tasks without
+  inventing a new persistence schema.
+
+Negative
+- Two moving parts instead of one. Push semantics + delayed retry
+  have subtly different retry policies (Pub/Sub has its own
+  retry-on-nack; Cloud Tasks has its own max-attempts). The
+  invariant — "at most 5 total dispatch attempts across both
+  paths" — is enforced by the app-level counter, not by the
+  infra.
+- Attempt counter lives in the Pub/Sub envelope, not in the
+  TaskRecord. A re-dispatch triggered by a task-rejected WS frame
+  restarts the counter at 1 (Phase 3.3 TD to unify).
+- Google region asymmetry. Pub/Sub is global; Cloud Tasks is
+  regional. Retry queue pinned to europe-west4 (same as api); Phase
+  2 legacy queues in europe-west1 stay there (TD-034).
+
+Mitigations
+- Stop rule #2 enforced via route-level no-op on redelivery (c8
+  test pins it): the route does not mutate Firestore twice for a
+  redelivered message; the DispatchHandler's state transitions
+  are idempotent in practice (updateTask is a merge).
+- TD-032 (dispatch monitoring, P3) tracks adding a Cloud Monitoring
+  dashboard for task-dispatch-dev + dlq topics + retry queue so
+  exhaustion trends are visible.
+
+### Alternatives considered
+
+Cloud Tasks alone (no Pub/Sub)
+- Pros: one infra primitive; unified retry policy; simpler mental
+  model.
+- Cons: Cloud Tasks minimum delay is 1 second, so even a
+  "zero-delay" dispatch burns 1s latency on the happy path. We'd
+  be paying a fixed tax for the common case to simplify the
+  uncommon one.
+- Rejected.
+
+Pub/Sub alone (no Cloud Tasks)
+- Pros: single infra primitive.
+- Cons: Pub/Sub's retry backoff is subscription-scoped and blunt
+  (exponential with a global min/max). Delaying one specific
+  message for exactly 30 seconds requires either (a) publishing
+  the task with a server-side delay hack (Pub/Sub does not
+  support that natively) or (b) writing a scheduler loop in the
+  api, which is exactly what Cloud Tasks is.
+- Rejected.
+
+BullMQ / Redis-backed queue (self-hosted)
+- Pros: fine control over retry + delay semantics; powerful
+  features (priority, rate limits).
+- Cons: stop rule #7 — new top-level dependency (ioredis + BullMQ)
+  and new infrastructure (Memorystore). Self-host operational
+  burden for no MVP benefit.
+- Rejected. TD-031 stores the scaling trigger for Redis.
+
+Direct WS dispatch from POST /v1/tasks (no queue)
+- Pros: simplest possible pipeline.
+- Cons: if the api instance crashes between the Firestore write
+  and sendTaskAssign, the task is lost. No durability. No
+  backoff. No multi-instance story.
+- Rejected.
+
+temporal.io workflows
+- Pros: industrial-strength orchestration; exact semantics.
+- Cons: heavy new runtime, new operational model, new skill
+  surface. Massive overkill for a 3-step dispatch.
+- Rejected.
+
+### Implementation
+
+- `apps/api/src/services/task-dispatch-publisher.ts` (c3) —
+  publishes to the dispatch + DLQ topics. Record-only fallback
+  when ADC absent.
+- `apps/api/src/services/task-retry-scheduler.ts` (c11) — creates
+  Cloud Tasks HTTP tasks with OIDC auth, pinned europe-west4.
+- `apps/api/src/routes/internal-tasks.ts` (c7) — Pub/Sub push
+  receiver + Cloud Tasks callback route handlers, both
+  OIDC-guarded.
+- `apps/api/src/app.ts` (c13) — real DispatchHandler composition
+  (router + scheduler + publisher + firestore.updateTask).
+- `apps/api/scripts/create-pubsub-topics.sh` +
+  `create-cloud-tasks-queue.sh` (c18) — idempotent provisioning.
+
+### References
+
+- Sibling Phase 3.2 ADRs: *Internal Route Authentication — Google
+  OIDC ID Token*, *Capability Matching — Subset Rule + In-Memory
+  Round-Robin*.
+- TD-031 (Redis round-robin), TD-032 (dispatch monitoring),
+  TD-034 (Cloud Tasks region unification).
+
+## Internal Route Authentication — Google OIDC ID Token (Phase 3.2)
+
+### Context
+
+Phase 3.2 adds three api routes that are NOT user-facing:
+
+- `POST /v1/internal/pubsub/task-dispatch` — Pub/Sub push
+- `POST /v1/internal/pubsub/task-dlq` — DLQ push
+- `POST /v1/internal/tasks/retry-dispatch` — Cloud Tasks callback
+
+These are invoked by Google-managed services (Pub/Sub push
+identity, Cloud Tasks). Without authentication, they are a
+public DDoS surface — any unauthenticated POST could spoof a
+dispatch event. Stop rule #8 makes this a hard constraint: "No
+Pub/Sub push target without OIDC auth."
+
+### Decision
+
+Each internal route is guarded by a Fastify preHandler that:
+
+1. Extracts a Bearer token from the `Authorization` header.
+2. Verifies it via `google-auth-library`'s `OAuth2Client.verifyIdToken`
+   with `audience = PUBSUB_PUSH_AUDIENCE` (the api URL). This
+   library handles JWKS fetching + caching + rotation transparently.
+3. Asserts the payload's `iss`, `email_verified`, `email` claims
+   and the `aud` matches explicitly (belt-and-suspenders over the
+   lib's internal audience check).
+4. Consults an `allowedEmails` set — in Phase 3.2 populated with
+   `{CLOUD_RUN_SERVICE_ACCOUNT}`, because the Pub/Sub push identity
+   and the Cloud Tasks invoker are both configured to be that one
+   runtime SA.
+
+Rejection matrix: missing/malformed token → 401, verification
+failure → 401, email not in allowlist → 403. On success the
+route sees `request.oidcIdentity` with the verified subject +
+email + audience.
+
+### Consequences
+
+Positive
+- No static secrets. OIDC tokens rotate automatically; SA
+  identity is verifiable.
+- Google-managed JWKS endpoint — no key management on our side.
+- Aligns with Cloud Run's native auth model, so the same identity
+  that invokes the service passes the app-layer check.
+
+Negative
+- Library dependency (`google-auth-library` is already in use by
+  `apps/api/src/integrations/auth.ts`, so no new dep added).
+- Local dev friction — developers need to mint an OIDC token via
+  `gcloud auth print-identity-token --audiences=<api-url>` before
+  probing the internal routes manually. Documented in
+  `docs/flows/end-to-end-task-flow.md`.
+- Separate verifier file (`apps/api/src/middleware/
+  google-oidc-verifier.ts`) duplicates some logic from
+  `integrations/auth.ts`. TD-036 tracks consolidation.
+
+Mitigations
+- `apps/api/src/app.ts` gates route registration on
+  `config.PUBSUB_PUSH_AUDIENCE`. Dev environments without the
+  audience set simply do not register the routes — this is
+  different from registering-without-auth, so stop rule #8 holds.
+
+### Alternatives considered
+
+Shared-secret header (static API key)
+- Pros: simplest possible auth; easy to test.
+- Cons: static secret must be rotated manually; no SA-level
+  identity; leaks in logs/env are permanent until rotation.
+- Rejected.
+
+Custom HS256 JWT issued by the api
+- Pros: reuse the existing user JWT machinery.
+- Cons: we would be re-implementing OIDC without Google's SA
+  identity model; the api would need to run its own JWKS; Cloud
+  Tasks + Pub/Sub don't know how to mint our custom JWT — they
+  issue Google-signed OIDC tokens natively.
+- Rejected.
+
+VPC-only network isolation
+- Pros: no token verification; traffic has to come through the
+  VPC.
+- Cons: Cloud Run ingress does not selectively gate Pub/Sub
+  service traffic by VPC — Pub/Sub push comes from Google's
+  managed edge, not a VPC we control. VPC-only would also block
+  our local dev probes.
+- Rejected.
+
+Signed URLs on the push subscription
+- Pros: no token verification.
+- Cons: Pub/Sub push does not support signed-URL authentication.
+- Rejected as not supported.
+
+mTLS
+- Pros: origin identity cryptographically bound.
+- Cons: Cloud Run terminates TLS at the edge; no mTLS-to-origin.
+- Rejected as not supported.
+
+### Implementation
+
+- `apps/api/src/middleware/google-oidc-verifier.ts` (c5) —
+  `GoogleOidcVerifier` class + `createGoogleOidcGuard`
+  preHandler. Test seam via `oauthClient?` injection.
+- `apps/api/src/routes/internal-tasks.ts` (c7) — all 3 new
+  routes declare `{preHandler: oidcGuard}`.
+- `apps/api/src/app.ts` (c7/c13) — verifier constructed inside
+  the `if (config.PUBSUB_PUSH_AUDIENCE)` block; absence skips
+  route registration entirely.
+
+### References
+
+- Sibling Phase 3.2 ADR *Task Dispatch — Pub/Sub Push + Cloud
+  Tasks Retry*.
+- TD-036 (OIDC verification paths consolidation).
+
+## Capability Matching — Subset Rule + In-Memory Round-Robin (Phase 3.2)
+
+### Context
+
+Phase 3.2 dispatch must pick an agent for a given task. Tasks
+declare `capabilities: string[]` (user-visible requirements —
+code-generation, planning, shell-execution, …). Agents declare
+`manifest.capabilities: CapabilityDescriptor[]` at WS hello
+time. The router bridges the two.
+
+Three design choices are intertwined: what counts as a match,
+how to pick one among multiple matches, and where the selection
+state lives.
+
+### Decision
+
+**Match rule** — subset: `task.capabilities ⊆ agent.capabilities`.
+An agent matches when every required capability is declared in
+its manifest; the agent may have more.
+
+**Selection** — per-bucket round-robin. The "bucket key" is a
+canonical form of the required set: sorted, deduped, joined by
+`|`. Two tasks whose requirements are equal under set semantics
+share a cursor; the router advances the cursor on each call so
+consecutive identical requests route to different agents.
+
+**State** — in-memory `Map<bucketKey, lastIdx>` inside the
+`TaskRouter` instance. No Firestore writes from the router.
+
+**Candidate ordering** — stable-sorted by `sessionId` before the
+cursor is applied. Phase 2's `AgentSessionRegistry.list()` does
+not contractually guarantee iteration order; explicit sort makes
+round-robin deterministic.
+
+### Consequences
+
+Positive
+- Simple mental model: "same requirements → next agent in line."
+- No cross-request state in a shared store for MVP — no new
+  infrastructure.
+- Works correctly for the common cases: one matching agent, many
+  matching agents with identical capabilities, overlapping buckets.
+- Empty required set matches any agent — useful for dispatcher
+  testing and for a future "any available worker" task type.
+
+Negative
+- Multi-instance unfairness. Two api replicas each maintain their
+  own cursor; the same bucket can over-pick one agent if another
+  agent was already at the tail of the other replica's rotation.
+  Stop rule #10 bans Firestore-backed cursors; TD-031 tracks the
+  Redis migration trigger.
+- Round-robin is oblivious to agent load, cost, reliability, or
+  latency. Every matching agent is treated identically. TD-033
+  tracks weighted reliability scoring.
+- Cursor is lost on api restart. Fresh cursor starts at the first
+  agent in sorted order. Marginal unfairness that self-corrects
+  over one round.
+
+Mitigations
+- Phase 3.2 is single-instance by design; the fairness problem
+  does not exist today.
+- TD-031 (Redis round-robin) + TD-033 (reliability scoring)
+  stored as P3. Promotion to P1 when multi-instance or observed
+  hot-spot.
+
+### Alternatives considered
+
+Set equality (`task.capabilities === agent.capabilities`)
+- Pros: unambiguous match semantics.
+- Cons: over-restrictive — a task needing only `code-generation`
+  would fail to match an agent that supports
+  `{code-generation, planning, tool-use}`. Starves specialist
+  agents and makes fleet composition brittle.
+- Rejected.
+
+Random selection among matches
+- Pros: simplest possible implementation; no state.
+- Cons: statistical imbalance under low agent count; hot-spot
+  risk (same agent can get 3 consecutive identical tasks); harder
+  to reason about in tests.
+- Rejected.
+
+Weighted by agent success rate / reliability
+- Pros: gracefully degrades around flaky agents.
+- Cons: requires historical telemetry we don't have at Phase 3.2.
+  Introduces a feedback loop that is subtle to tune.
+- Deferred. TD-033.
+
+Redis-backed cursor from day one
+- Pros: coherent rotation across api replicas.
+- Cons: new infrastructure (Memorystore), new operational
+  surface, cost (~$25/month minimum), no MVP benefit while
+  single-instance.
+- Deferred. TD-031 captures the trigger.
+
+Agent pull model (agents claim tasks from a queue)
+- Pros: dispersed state; naturally load-balanced; no central
+  selection.
+- Cons: harder to observe (no single place to see which agent
+  owns a task); weaker ordering guarantees; fundamentally
+  different architecture from the Phase 2 WS control-channel
+  decision.
+- Rejected as scope change.
+
+### Implementation
+
+- `packages/contracts/src/ai/agent-manifest-schema.ts` (c9) —
+  runtime Zod mirror of the AgentCapability union + loose
+  manifest schema (`.passthrough()`).
+- `apps/api/src/services/task-router.ts` (c9) — `createTaskRouter`
+  factory with subset match, bucket-keyed cursors, stable-sorted
+  candidates, malformed-manifest exclusion.
+- `apps/api/src/routes/agent-ws.ts` (c13) — manifest validation
+  on hello; malformed manifest → `close 4002 manifest-invalid`
+  before the session reaches the router.
+- `apps/desktop-agent/src/providers/control-channel-ws.ts` (c15)
+  — agent-side defense-in-depth capability filter before the
+  executor sees a task-assign.
+
+### References
+
+- Sibling Phase 3.2 ADRs: *Task Dispatch — Pub/Sub Push + Cloud
+  Tasks Retry*, *Internal Route Authentication — Google OIDC
+  ID Token*.
+- TD-031 (Redis round-robin), TD-033 (reliability scoring).

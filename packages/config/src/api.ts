@@ -41,6 +41,15 @@ export const apiEnvSchema = z.object({
   COMMANDS_QUEUE: z.string().min(1).default('commands'),
   APPROVALS_QUEUE: z.string().min(1).default('approvals'),
   EXPORTS_QUEUE: z.string().min(1).default('exports'),
+  TASK_DISPATCH_RETRY_QUEUE: z
+    .string()
+    .min(1)
+    .default('task-dispatch-retry-dev'),
+  TASK_DISPATCH_RETRY_QUEUE_LOCATION: z
+    .string()
+    .min(1)
+    .default('europe-west4'),
+  TASK_DISPATCH_RETRY_DELAY_SECONDS: integerFromString(30),
   TASKS_TARGET_BASE_URL: optionalUrlFromString(),
   AGENT_AUDIENCE: optionalUrlFromString(),
   AUTH_ACCESS_TOKEN_ISSUER: z
@@ -60,6 +69,19 @@ export const apiEnvSchema = z.object({
   BUDGET_EVENTS_TOPIC: z.string().min(1).default('budget-events'),
   OPERATOR_ALERTS_TOPIC: z.string().min(1).default('operator-alerts'),
   SESSION_EVENTS_TOPIC: z.string().min(1).default('session-events'),
+  PUBSUB_TOPIC_TASK_DISPATCH: z
+    .string()
+    .min(1)
+    .default('task-dispatch-dev'),
+  PUBSUB_SUBSCRIPTION_TASK_DISPATCH: z
+    .string()
+    .min(1)
+    .default('task-dispatch-api-dev'),
+  PUBSUB_TOPIC_TASK_DLQ: z
+    .string()
+    .min(1)
+    .default('task-dispatch-dlq-dev'),
+  PUBSUB_PUSH_AUDIENCE: optionalUrlFromString(),
   BIGQUERY_DATASET: z.string().min(1).default('ops_analytics'),
   ARTIFACTS_BUCKET: z.string().min(1).default('operator-os-dev-artifacts'),
   EXPORTS_BUCKET: z.string().min(1).default('operator-os-dev-exports'),

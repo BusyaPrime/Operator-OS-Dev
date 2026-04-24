@@ -72,3 +72,49 @@ describe('@operator-os/config', () => {
     );
   });
 });
+
+describe('Phase 3.2 task-dispatch env vars', () => {
+  it('applies defaults for Pub/Sub + Cloud Tasks retry vars', () => {
+    const env = parseApiEnv({});
+
+    expect(env.PUBSUB_TOPIC_TASK_DISPATCH).toBe('task-dispatch-dev');
+    expect(env.PUBSUB_SUBSCRIPTION_TASK_DISPATCH).toBe('task-dispatch-api-dev');
+    expect(env.PUBSUB_TOPIC_TASK_DLQ).toBe('task-dispatch-dlq-dev');
+    expect(env.PUBSUB_PUSH_AUDIENCE).toBeUndefined();
+    expect(env.TASK_DISPATCH_RETRY_QUEUE).toBe('task-dispatch-retry-dev');
+    expect(env.TASK_DISPATCH_RETRY_QUEUE_LOCATION).toBe('europe-west4');
+    expect(env.TASK_DISPATCH_RETRY_DELAY_SECONDS).toBe(30);
+  });
+
+  it('accepts per-env overrides for topic/subscription/queue names', () => {
+    const env = parseApiEnv({
+      PUBSUB_TOPIC_TASK_DISPATCH: 'task-dispatch-prod',
+      PUBSUB_SUBSCRIPTION_TASK_DISPATCH: 'task-dispatch-api-prod',
+      PUBSUB_TOPIC_TASK_DLQ: 'task-dispatch-dlq-prod',
+      PUBSUB_PUSH_AUDIENCE: 'https://operator-os-api-prod.example.com',
+      TASK_DISPATCH_RETRY_QUEUE: 'task-dispatch-retry-prod',
+      TASK_DISPATCH_RETRY_QUEUE_LOCATION: 'europe-west4',
+      TASK_DISPATCH_RETRY_DELAY_SECONDS: '60'
+    });
+
+    expect(env.PUBSUB_TOPIC_TASK_DISPATCH).toBe('task-dispatch-prod');
+    expect(env.PUBSUB_SUBSCRIPTION_TASK_DISPATCH).toBe(
+      'task-dispatch-api-prod'
+    );
+    expect(env.PUBSUB_TOPIC_TASK_DLQ).toBe('task-dispatch-dlq-prod');
+    expect(env.PUBSUB_PUSH_AUDIENCE).toBe(
+      'https://operator-os-api-prod.example.com'
+    );
+    expect(env.TASK_DISPATCH_RETRY_QUEUE).toBe('task-dispatch-retry-prod');
+    expect(env.TASK_DISPATCH_RETRY_QUEUE_LOCATION).toBe('europe-west4');
+    expect(env.TASK_DISPATCH_RETRY_DELAY_SECONDS).toBe(60);
+  });
+
+  it('treats an empty PUBSUB_PUSH_AUDIENCE as unset', () => {
+    const env = parseApiEnv({
+      PUBSUB_PUSH_AUDIENCE: ''
+    });
+
+    expect(env.PUBSUB_PUSH_AUDIENCE).toBeUndefined();
+  });
+});
