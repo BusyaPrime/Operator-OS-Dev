@@ -1951,14 +1951,17 @@ absolute expiry timestamp, never `createdAt`.
   the `tasks` collection because no documents existed yet.
   Deferred to post-first-write manual application.
 
-## TD-030: Monitor for recurrent transient unreachability on `/v1/agent/heartbeat/agent`
+## TD-030: Recurrent transient unreachability on `/v1/agent/heartbeat/agent`
 
 Discovered: 2026-04-23 ~22:15 UTC (Phase 3.1 post-deploy
     sanity validation; Cloud Run revision
-    `operator-os-api-00011-nvj`)
+    `operator-os-api-00011-nvj`); second incident
+    2026-04-24 ~12:00 UTC on `operator-os-api-00012-zrk`
+    (Phase 3.2 merge, ~8 min post-deploy)
 Type: observability · cloud-run-edge
-Priority: P3
-Status: open (observational; no action until recurrence)
+Priority: P2
+Status: open (recurrent; no action until third incident or
+    user-facing impact)
 Trigger for action:
 - 3+ consecutive `curl` exit 56 (connection reset by peer) on
   the same endpoint,
@@ -2022,16 +2025,50 @@ registration order.
   first-responder has a diagnostic playbook and a known
   baseline (Classification E) to compare against.
 
-### Proposed fix
+### Incident log
 
-Action only on recurrence. When the trigger pattern repeats:
+**Incident 1 — 2026-04-23 ~22:15 UTC**
+- Revision: `operator-os-api-00011-nvj`
+- Timing: Phase 3.1 CD deploy, ~2h post-deploy
+- Failures: 3 consecutive `curl` exit 56 on `POST /v1/agent/heartbeat/agent`
+- Other endpoints in same window: `/health` 200, `/ready` 503, `/v1/tasks` 401, stream 501 — all expected
+- Evidence: zero Cloud Run application logs for the endpoint during the failure window
+- Resolution: **spontaneous** within ~8h (endpoint returned 401 normally the following morning; 9-probe diagnostic battery all green)
 
-1. Capture exact timestamp range (UTC, to the second) and
-   failing endpoint path(s).
-2. Capture any concurrent successful probes / production
-   traffic to the same revision for comparison.
-3. Re-query Cloud Run logs for that window across all
-   severities:
+**Incident 2 — 2026-04-24 ~12:00 UTC**
+- Revision: `operator-os-api-00012-zrk`
+- Timing: Phase 3.2 CD deploy, ~8 min post-deploy
+- Failures: 4 consecutive `curl` exit 56 on the same endpoint
+- Other endpoints in same window: `/health` 200, `/ready` 503, `/v1/tasks` 401, `/v1/cost/estimate` 401, stream 501 — all expected
+- Evidence: zero Cloud Run application logs for the endpoint during the failure window
+- Code-diff ruling: `git diff 02898c1..751c9c3 -- apps/api/src/routes/agent.ts` is empty. Phase 3.2 did not modify the heartbeat route or any adjacent code path.
+- Resolution: **pending** — passive observation via `apps/api/scripts/heartbeat-probe.sh`
+
+### Updated hypothesis (post-incident 2)
+
+- **H1 (~65%)** — Cloud Run edge routing cache / state inconsistency during or immediately after a revision swap, scoped to this one endpoint path. Pattern support: both incidents occurred minutes-to-hours of a fresh revision going live; both produced zero application logs; other endpoints on the same revision at the same time responded normally.
+- **H2 (~20%)** — Network-path / TLS edge transient that varies per day. Pattern support: Phase 3.1 resolved spontaneously; weak time-of-day correlation; N=2 is too small to conclude.
+- **H3 (~5%)** — Code regression. Pattern against: diff-empty between Phase 2 merge (`02898c1`) and Phase 3.2 merge (`751c9c3`) on the agent route file; other endpoints on the new revision respond normally.
+- **H4 (~5%)** — Agent-side / client-local issue. Pattern against: same `curl` binary, same TLS session, same client box successfully probed other endpoints in the same minute.
+- **H5 (~5%)** — Regional / project-wide Cloud Run anomaly. Pattern against: endpoint-specific scope; no other services in the project report similar behavior.
+
+### Action on recurrence
+
+On a **third** incident OR on any user-facing impact:
+
+1. **File a Cloud Run support case** with full evidence for all three incidents — timestamps, revisions, zero-app-logs proof, endpoint-specific pattern, regional + project scope. Request edge-path investigation (GFE / L7 LB / TLS terminator / instance-routing layer).
+2. **Consider a route-layer workaround** — client-side retry on `curl` exit-56 / `ECONNRESET` in the desktop-agent's `AgentHeartbeatLoop` poster. The loop already has backoff + 401 refresh hooks; extend to also retry on mid-response connection drop.
+3. **Escalate priority to P1** if a user reports impact (e.g. agent appearing offline in the UI despite being connected).
+
+Until the third incident or a user-facing report, continue passive observation. `apps/api/scripts/heartbeat-probe.sh` is designed to be run every 15–30 min — it returns 401 when the endpoint has resolved, 000 when still in a failure window.
+
+### Re-query playbook (unchanged — applies to every new failure window)
+
+When a new failure window is observed, re-capture:
+
+1. Exact timestamp range (UTC, to the second) and failing endpoint path(s).
+2. Any concurrent successful probes / production traffic to the same revision for comparison.
+3. Cloud Run logs for that window across all severities:
 
    ```bash
    export CLOUDSDK_PYTHON=/d/SDKs/GoogleCloudCLI/google-cloud-sdk/platform/bundledpython/python.exe
@@ -2044,18 +2081,8 @@ Action only on recurrence. When the trigger pattern repeats:
      --limit=200
    ```
 
-4. If the application logs are still **empty** during the
-   failure window → file a Cloud Run support case with:
-   - Incident timestamps + failing endpoint path
-   - Evidence that other endpoints on the same revision
-     worked
-   - Evidence of zero application logs during the failure
-   - Revision name + region (`europe-west4`)
-   - Request: edge-path investigation (GFE / L7 LB / TLS
-     terminator / instance-routing layer).
-5. If application logs **do** appear in that window →
-   reclassify as C (handler-specific) or B (middleware
-   glob) and diagnose in code.
+4. If application logs are still empty during the window → append a new entry under "Incident log" + proceed per "Action on recurrence" step 1 if this is the third or later window.
+5. If application logs appear → reclassify as C (handler-specific) or B (middleware glob) and diagnose in code.
 
 ### Stale close condition
 
@@ -2100,6 +2127,15 @@ git history + `decisions.md` for archaeology.
   needed today. Filed to preserve discipline: a future
   recurrence inherits a known playbook rather than a fresh
   mystery.
+- 2026-04-24 ~12:00 UTC: **Incident 2** observed on Phase
+  3.2 CD-deploy revision `operator-os-api-00012-zrk`.
+  Trigger criteria met (4 × exit 56, zero app logs, other
+  endpoints clean, diff-empty). Priority promoted **P3 →
+  P2** — no longer a single incident; pattern established.
+  Incident log + updated hypothesis + action-on-recurrence
+  protocol added to this TD. `apps/api/scripts/
+  heartbeat-probe.sh` added for passive monitoring.
+  Support case deferred until a third incident.
 
 ## TD-031: Redis-backed round-robin cursor for multi-instance api
 
