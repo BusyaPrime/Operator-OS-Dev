@@ -6,10 +6,16 @@ import type {
 } from '@operator-os/contracts';
 import { create } from 'zustand';
 
+import { createAuthClient } from '../services/auth-client.js';
+import { createAuthenticatedFetch } from '../services/authenticated-api-client.js';
 import {
+  createTaskApiClient,
   TaskApiClientError,
   type TaskApiClient
 } from '../services/task-api-client.js';
+import { tokenStorage } from '../auth/token-storage.js';
+
+import { useAuthStore } from './auth-store.js';
 
 /**
  * Lightweight in-memory model of a task observed from the mobile
@@ -218,3 +224,52 @@ export const createTaskStore = (deps: TaskStoreDeps) => {
     }
   }));
 };
+
+// ---------------------------------------------------------------------------
+// Default singleton wired against real deps. Screens consume this;
+// tests build isolated instances via `createTaskStore` directly.
+// Mirrors the `useAuthStore` pattern at the bottom of auth-store.ts.
+// ---------------------------------------------------------------------------
+
+const defaultApiBaseUrl =
+  process.env.EXPO_PUBLIC_API_BASE_URL ?? 'http://localhost:8080';
+const defaultGatewayBaseUrl =
+  process.env.EXPO_PUBLIC_AUTH_GATEWAY_BASE_URL ?? 'http://localhost:8081';
+
+const defaultAuthClient = createAuthClient({
+  gatewayBaseUrl: defaultGatewayBaseUrl
+});
+
+const defaultAuthenticatedFetch = createAuthenticatedFetch({
+  authStore: {
+    getState: () => {
+      const s = useAuthStore.getState();
+      return {
+        accessToken: s.accessToken,
+        accessTokenExpiresAt: s.accessTokenExpiresAt
+      };
+    },
+    applyRefreshedTokens: (accessToken, accessTokenExpiresAt) => {
+      useAuthStore
+        .getState()
+        .applyRefreshedTokens(accessToken, accessTokenExpiresAt);
+    },
+    forceSignOut: async () => {
+      await useAuthStore.getState().forceSignOut();
+    }
+  },
+  authClient: defaultAuthClient,
+  tokenStorage
+});
+
+const defaultApiClient = createTaskApiClient({
+  baseUrl: defaultApiBaseUrl,
+  fetchFn: defaultAuthenticatedFetch
+});
+
+export const useTaskStore = createTaskStore({
+  apiClient: defaultApiClient,
+  onForceSignOut: async () => {
+    await useAuthStore.getState().forceSignOut();
+  }
+});
