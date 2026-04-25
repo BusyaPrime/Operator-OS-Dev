@@ -3200,3 +3200,284 @@ separate ticket.
 - 2026-04-25: filed alongside Phase 3.3 c7 adapter. Deferred
   as post-MVP feature; MVP ships with happy-path-only
   execution.
+
+## TD-046: Authenticated end-to-end smoke-test harness
+
+Discovered: 2026-04-25 (Phase 3.3 MVP smoke test caught two
+    latent prod bugs — see TD-046 / TD-047 / TD-048 sibling
+    entries — that no prior test layer could detect)
+Type: testing infrastructure
+Priority: P2
+Status: open
+Trigger: every CD deploy of api + auth-gateway should run this
+    before traffic-shifting to the new revision.
+
+### Description
+
+Phase 3.3 c18 added an E2E integration test that composes most
+of the api-side layers, but it cuts two corners that hide whole
+classes of production bug:
+
+1. The Firestore repository is a **recording-fake** (in-memory
+   Map). Real Firestore SDK semantics (e.g., undefined-field
+   rejection) are never exercised.
+2. The dispatch handler is invoked **directly**, bypassing the
+   real Pub/Sub publish + push subscription round-trip. The
+   real IAM bindings on the topics are never exercised.
+
+Phase 3.3's first authenticated end-to-end POST in production
+hit both seams immediately (TD-046 = `metadata: undefined`
+silent reject; TD-047 = `pubsub.publisher` IAM gap). Neither
+shows up in unit, integration, or sanity-probe layers.
+
+A staging-or-production smoke test that authenticates as a
+dev-minted user, submits a real task, watches the SSE stream,
+and asserts a delta or two arrived would have caught both on
+the first try.
+
+### Risk if unaddressed
+
+- Future feature work on the dispatch / streaming path lands
+  with the same blind spot. Each new optional schema field is
+  a new chance to silently brick production. Each new IAM
+  permission is a new chance to silently break a downstream
+  integration.
+- Smoke debt compounds: by the time the next user-visible bug
+  fires, the change-window will be much larger than today's
+  one-line fix.
+
+### Proposed fix
+
+Single test file (e.g.
+`apps/api/src/__tests__/smoke-prod.test.ts`) that:
+
+1. Reads `OPERATOR_OS_SMOKE_TARGET=https://...` and
+   `OPERATOR_OS_SMOKE_GATEWAY=https://...` from env. CI / staging
+   sets these; localhost is the default.
+2. Mints a user JWT via the dev-mint endpoint (TD-045 PR #36's
+   gating: requires `AUTH_DEV_MINT_ENABLED=true` on the gateway).
+3. POSTs `/v1/tasks` with a tiny prompt that the agent can echo
+   without spending real Anthropic credit (use the echo-stub
+   executor on the smoke-target agent).
+4. GETs the SSE stream, asserts at least one `delta` and the
+   `completed` frame arrive.
+5. Disables `AUTH_DEV_MINT_ENABLED` on the way out.
+
+CI hook: post-deploy verification step (after CD redeploys but
+before declaring "deploy successful"). Failure aborts the
+traffic shift.
+
+### Stale close condition
+
+When the harness lands AND has caught at least one real bug AND
+is wired into the CD workflow as a gate.
+
+### Related
+
+- Sibling: TD-047 (IAM gaps) and TD-048 (POST swallow-and-log).
+- PR introducing the dev mint enabling this harness:
+  `feat(auth-gateway): dev mint endpoint for smoke testing` (#36).
+
+### History
+
+- 2026-04-25: filed when the Phase 3.3 first-prompt smoke test
+  caught two prod bugs that all prior test layers missed.
+
+## TD-047: Audit IAM bindings for the api + agent + dispatch surfaces
+
+Discovered: 2026-04-25 (Phase 3.3 smoke test surfaced
+    `pubsub.publisher` gap on cloudrun-runtime SA)
+Type: ops / IAM
+Priority: P2
+Status: open
+Trigger: now, while the audit context is fresh — and again
+    before each future deploy that adds a new topic, queue, or
+    storage bucket.
+
+### Description
+
+The Phase 3.3 smoke test caught one specific IAM gap (the api's
+runtime SA had no `roles/pubsub.publisher` on
+`task-dispatch-dev`). That gap was fixed in
+`apps/api/scripts/iam/grant-pubsub-publisher.sh` and applied
+out-of-band against operator-os-dev. But the discovery raises
+the question: **what other IAM bindings is the project missing
+because nothing has exercised them in production yet?**
+
+Surfaces that should be audited:
+
+1. **Pub/Sub topics + the runtime SA**:
+   - `task-dispatch-dev`: ✅ bound (today)
+   - `task-dispatch-dlq-dev`: ✅ bound (today)
+   - other topics in the project (`agent-events`, `budget-events`,
+     `session-events`, `trend-*`, `operator-alerts`): not
+     currently used by Phase 3.3 but may need bindings if/when
+     the api starts publishing to them. Probably none today;
+     check.
+2. **Cloud Tasks queues + the runtime SA**:
+   - `task-dispatch-retry-${ENV}` queue (Phase 3.2 c5): the api
+     `TaskRetryScheduler` calls `cloudtasks.tasks.create`, which
+     requires `roles/cloudtasks.enqueuer` on the queue. If this
+     was never bound, dispatch retries will silently fail the
+     same way Pub/Sub publish did.
+3. **Firestore + the runtime SA**:
+   - api currently uses `roles/datastore.user` on the project
+     (broad). Verify this binding still exists; verify scoping
+     opportunity (collection-level if Firestore supports it).
+4. **Secret Manager + the runtime SA**:
+   - HS256 signing secret access. Current pattern: ADC-based
+     access. Verify the binding exists.
+5. **auth-gateway runtime SA** (separate from api's): may need
+   distinct topic-publish bindings if it ever publishes events
+   (e.g., user-created notifications).
+6. **Both gateways' Firestore clients**: same Firestore-undefined
+   pattern as TD-046 sibling — see
+   `apps/auth-gateway/src/services/refresh-token-store.ts:225`
+   and `users-repository.ts:175`. They `new Firestore({})`
+   without `ignoreUndefinedProperties: true`. Doesn't bite today
+   (records they write don't have leaky undefined fields) but
+   matches the pattern that bit api.
+
+### Risk if unaddressed
+
+Same shape as TD-046's smoke gap: future deploys can land with
+silent IAM holes that only surface when authenticated traffic
+exercises the path. The blast radius is "the feature stops
+working in production but unit tests are green and CI deploys
+clean."
+
+### Proposed fix
+
+One audit pass:
+
+```bash
+# Print every IAM binding on the project + topics + queues.
+gcloud projects get-iam-policy operator-os-dev
+gcloud pubsub topics list --project=operator-os-dev | \
+  while read t; do
+    name=$(echo "$t" | awk -F/ '{print $NF}')
+    echo "=== $name ==="
+    gcloud pubsub topics get-iam-policy "$name" --project=operator-os-dev
+  done
+gcloud tasks queues list --project=operator-os-dev --location=europe-west4 | \
+  while read q; do
+    [ -n "$q" ] || continue
+    name=$(echo "$q" | awk '{print $1}')
+    echo "=== $name ==="
+    gcloud tasks queues get-iam-policy "$name" --project=operator-os-dev --location=europe-west4
+  done
+```
+
+Cross-reference each binding with what the runtime SAs need.
+File any gaps as IAM-grant scripts under
+`apps/api/scripts/iam/` and `apps/auth-gateway/scripts/iam/`.
+
+Bonus: also harden the auth-gateway Firestore clients with the
+same `ignoreUndefinedProperties: true` pattern as
+TD-046's fix — defensive consistency.
+
+### Stale close condition
+
+When the audit script has run AND any gaps are filled AND the
+audit script is checked into the repo for repeatable runs.
+
+### Related
+
+- TD-046 (smoke test harness) — same root concern, different
+  axis.
+- `apps/api/scripts/iam/grant-pubsub-publisher.sh` — first
+  IAM-grant script in the new pattern.
+
+### History
+
+- 2026-04-25: filed alongside Phase 3.3 smoke test that caught
+  the first IAM gap.
+
+## TD-048: POST /v1/tasks swallow-and-log on Firestore write failure
+
+Discovered: 2026-04-25 (smoke test exposed the false-positive 201)
+Type: correctness
+Priority: P2
+Status: open
+Trigger: now — this is a real user-facing correctness bug that
+    only smoke-level testing surfaced.
+
+### Description
+
+`apps/api/src/routes/tasks.ts:264-273`:
+
+```ts
+try {
+  await options.repository.recordTask(record);
+} catch (err) {
+  app.log.warn({ err, taskId }, 'recordTask threw; returning 503');
+  reply.status(503);
+  return apiError('firestore_unavailable', 'Task could not be durably recorded');
+}
+```
+
+The handler appears to handle Firestore write failures correctly
+(503 + structured error). HOWEVER, in production we observed:
+
+- POST returned **201** with a taskId.
+- Firestore log: `firestore write failed: Cannot use 'undefined'
+  as a Firestore value`.
+- GET on the taskId: 404. The task does not exist.
+
+Hypothesis: the Firestore SDK's `set()` call may not throw
+synchronously for some write-rejection modes — it may resolve
+successfully on the wire (network OK, service OK) but log the
+error elsewhere (driver-level) without surfacing it to the
+caller's promise. Worth confirming by reading the
+`@google-cloud/firestore` source for the
+`ignoreUndefinedProperties: false` rejection path.
+
+Either way, the handler trusts the SDK to throw on failure. If
+the SDK ever returns a "successful but actually broken" promise,
+the api hands the client a taskId for a record that doesn't
+exist. The client then 404s on every GET / SSE / list. From the
+user's perspective: silent data loss.
+
+### Risk if unaddressed
+
+Same shape as TD-046 (smoke harness gap). The Firestore-undefined
+fix in TD-046's PR is sufficient for the specific symptom we hit,
+but the antipattern remains: **a `try/catch` around an SDK call
+isn't enough if the SDK can fail without throwing**. Any future
+write that fails-but-doesn't-throw will recreate the false 201.
+
+### Proposed fix
+
+Two layers:
+
+1. **Defense in depth in the POST handler** — after
+   `recordTask`, optionally `getTask(taskId, userId)` to verify
+   it exists. If not, treat as a 503 (same handling as the
+   thrown branch). One extra read per POST; acceptable cost.
+2. **OR, instrumentation only** — keep the current path, but
+   add a metric / structured-log line `task_post_persistence_ok`
+   whose absence-after-a-201 we can alert on. Lower-cost; later
+   detection but at least we know it's happening.
+
+Both have downsides; (1) doubles the Firestore round-trip, (2)
+adds an alert that's only as good as the ops cadence reading it.
+Pick (1) for correctness-first stance.
+
+### Stale close condition
+
+When the handler verifies persistence (or the SDK contract is
+documented and verified to throw on every failure mode that
+matters).
+
+### Related
+
+- TD-046 (smoke harness) — same root concern.
+- TD-047 (IAM audit) — sibling discovered together.
+- The Firestore-undefined fix in
+  `fix/firestore-undefined-and-pubsub-iam` patches the immediate
+  symptom; this TD covers the antipattern itself.
+
+### History
+
+- 2026-04-25: filed when the smoke test caught a 201 → 404
+  inconsistency on a fresh production submit.
