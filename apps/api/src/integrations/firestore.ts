@@ -829,7 +829,20 @@ export class FirestoreOperatorRepository {
   #getClient() {
     this.#client ??= new Firestore({
       projectId: this.#config.GOOGLE_CLOUD_PROJECT,
-      databaseId: this.#config.FIRESTORE_DATABASE
+      databaseId: this.#config.FIRESTORE_DATABASE,
+      // Tolerate `undefined` values in record objects we hand to
+      // Firestore writes. The Phase 3.3 smoke test caught the
+      // POST /v1/tasks handler at routes/tasks.ts:261 spreading a
+      // `metadata: submit.metadata` field into the record where
+      // the request body had no `metadata` at all — the Firestore
+      // SDK's default behaviour rejects every such write with
+      // "Cannot use 'undefined' as a Firestore value".
+      // `ignoreUndefinedProperties: true` is the canonical fix
+      // recommended by the SDK error message itself; it makes
+      // every write through this client tolerate `undefined`
+      // fields by silently omitting them, matching the JSON.stringify
+      // / Firestore-document mental model.
+      ignoreUndefinedProperties: true
     });
 
     return this.#client;
