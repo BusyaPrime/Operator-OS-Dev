@@ -1,5 +1,4 @@
 import type {
-  AIAgent,
   AIAgentTaskInput,
   AIAgentTaskType,
   AIResponseStream,
