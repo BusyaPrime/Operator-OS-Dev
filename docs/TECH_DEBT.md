@@ -2909,3 +2909,294 @@ least one CD redeploy + post-deploy env-var presence check
   `cloudbuild.yaml` files); fix confirmation lands when the
   next legitimate code-touching CD redeploys without
   stripping.
+
+## TD-041: Multi-instance event bus for SSE fan-out
+
+Discovered: 2026-04-25 (Phase 3.3 c1 — DP-2 in-memory event
+    bus shipped knowing it doesn't survive horizontal scale)
+Type: scalability
+Priority: P3
+Status: open
+Trigger: when api scales beyond 1 Cloud Run instance, OR when
+    mobile users report stuck / dropped streams that correlate
+    with the agent being on a different replica.
+
+### Description
+
+Phase 3.3 ships `taskEventBus` as an in-process
+`Map<taskId, Set<subscriber>>` for the SSE fan-out. A single
+api instance handles both the agent → bus publish (via the
+agent-ws task callbacks) and the bus → SSE subscribe in the same
+process — the in-memory bus is correct.
+
+Multi-instance breaks this. If the agent's WebSocket is on
+replica A and the user's SSE connection is on replica B, replica
+B's bus never sees the agent's deltas. The mobile client would
+hang on the post-status frame until the heartbeat keep-alive runs
+out, then reconnect onto a random replica and either work (lucky
+sticky-routing) or hang again.
+
+### Risk if unaddressed
+
+- The MVP runs on min-instances=0, max-instances=1 today, so
+  the dispatch + SSE pair always lands on the same process.
+  We're correct *because* we're single-instance.
+- The first time we set max-instances > 1 (cost spike, latency
+  push, regional spread), agent ↔ user routing breaks for the
+  ~50% of cases where the two connections land on different
+  replicas.
+- Symptoms will look like flaky network: sometimes streams
+  work, sometimes don't. Hard to debug without already
+  suspecting the bus.
+
+### Proposed fix
+
+Replace the in-memory bus with a Pub/Sub or Redis layer:
+
+1. **Redis Pub/Sub via Memorystore** (preferred). Each api
+   instance subscribes to `taskId` topics dynamically; agent
+   callbacks publish to those topics. Local SSE subscribers
+   are still served by an in-process registry, but the
+   registry is fed by both the local agent and remote
+   instances via Redis. Cost: ~$25/month minimum.
+2. **GCP Pub/Sub topics keyed by taskId**. Same pattern but
+   higher latency (Pub/Sub end-to-end is 100-500ms). Probably
+   too slow for live token streaming.
+3. **Sticky session routing** (Cloud Run header-based). Hack:
+   route the SSE GET to the same replica the agent's WS is on
+   via a custom header. Doesn't actually solve the problem
+   for new agent connections that race the SSE.
+
+Option 1 lands when triggered.
+
+### Stale close condition
+
+When the bus has been migrated AND verified across at least
+two-replica deployment, OR when the project is sunsetted
+without ever scaling.
+
+### Related
+
+- TD-031 (Redis round-robin cursor for multi-instance) — same
+  Redis migration trigger; both can land together.
+- ADR *Mobile-To-Api Streaming — SSE* (Phase 3.3) — the
+  Consequences section flags this as the load-bearing
+  scalability constraint.
+
+### History
+
+- 2026-04-25: filed alongside Phase 3.3 c1 when the DP-2
+  in-memory event bus was deliberately chosen for MVP simplicity
+  knowing the multi-instance gap.
+
+## TD-042: SSE Last-Event-ID replay caching
+
+Discovered: 2026-04-25 (Phase 3.3 c3 — Firestore replay path
+    is correct but unbounded in cost)
+Type: cost / performance
+Priority: P3
+Status: open
+Trigger: when Firestore read costs spike OR when p99 SSE
+    reconnect latency exceeds 500ms.
+
+### Description
+
+The SSE handler in `apps/api/src/routes/tasks.ts` replays
+`task.outputDeltas` slice-by-seq on every reconnect that carries
+a `Last-Event-ID` header. Each reconnect = one Firestore
+`getTask` read.
+
+For a stable network this is fine — the connection lasts up to
+the Cloud Run 60-min cap and reconnect is rare. For unstable
+networks (mobile commute, radio handoff, app suspend/resume,
+Wi-Fi drop) the same task can trigger 5-10 reconnects in a
+single user session. Each reconnect re-reads the full
+`outputDeltas` array — Firestore charges per-read regardless of
+how much of the array we actually slice.
+
+### Risk if unaddressed
+
+- Firestore bill scales with reconnect frequency × delta count.
+  A user with a 100-token answer and 5 reconnects pays for 5
+  reads of a doc that may be 10-20 KB depending on prompt
+  history.
+- Cold-start latency on reconnect: Firestore network round-trip
+  is 30-80ms p99. For tasks already mid-stream, that is wall
+  time the user waits before seeing tokens resume.
+- Heavy reconnect storms (mass mobile reconnect after server
+  rotation, regional outage) amplify both effects in a thin
+  window.
+
+### Proposed fix
+
+Add an LRU cache keyed by `taskId` carrying the last N deltas
+(N = 200 or task-completion, whichever is smaller). Sit in
+front of the Firestore replay path:
+
+1. SSE handler subscribes → check cache → cache miss → fall
+   back to Firestore (current behaviour) → populate cache.
+2. Agent emit → `taskEventBus.publish` AND cache.append.
+3. `closeTask` → cache eviction.
+
+Single-instance: in-memory LRU with `quick-lru` or similar.
+Multi-instance: Memorystore cache (folds in with TD-041's
+Redis migration).
+
+### Stale close condition
+
+When the cache lands AND a 30-day window shows reduced Firestore
+read rate per active stream, OR when usage doesn't trigger the
+cost / latency thresholds for 90 days after MVP.
+
+### Related
+
+- TD-041 (multi-instance event bus) — natural pairing; both
+  benefit from the same Redis investment.
+- ADR *Mobile-To-Api Streaming — SSE* (Phase 3.3).
+
+### History
+
+- 2026-04-25: filed alongside Phase 3.3 c3 SSE handler.
+  Deferred — current single-user MVP load doesn't justify the
+  added complexity.
+
+## TD-043: Mobile SSE polyfill consolidation
+
+Discovered: 2026-04-25 (Phase 3.3 c14 — DP-1 added
+    `@microsoft/fetch-event-source ^2.0.1`)
+Type: dependency / cleanup
+Priority: P3
+Status: open
+Trigger: when the React Native ecosystem adds native
+    `EventSource` support with custom-header attachment, OR
+    when `@microsoft/fetch-event-source` becomes unmaintained.
+
+### Description
+
+The standard `EventSource` API does not allow the client to
+attach an `Authorization: Bearer ...` header. Phase 3.3 c14
+adopted `@microsoft/fetch-event-source` as DP-1 to bridge that
+gap — the library wraps the native `fetch` with the SSE
+streaming protocol and accepts an arbitrary `headers` object.
+
+This is one more dependency on the mobile critical path. The
+library is well-maintained (Microsoft) and the API surface we
+use is small, so the dependency is fine for MVP. But the
+ecosystem is moving: Expo SDK and React Native both periodically
+revisit `EventSource` support, and a future version may close
+the header gap natively.
+
+### Risk if unaddressed
+
+- The dep stays in `apps/mobile/package.json` indefinitely.
+  Low blast radius (~10 KB minified) but unnecessary if the
+  platform catches up.
+- `@microsoft/fetch-event-source` could go unmaintained
+  upstream (the project is small + Microsoft-stewarded; not
+  imminent). Migrating off would be an emergency item rather
+  than a planned one.
+
+### Proposed fix
+
+Audit the mobile platform's `EventSource` shape every ~6
+months. If `expo-fetch-event-source` lands or `EventSource` in
+the RN core gains custom-header support, migrate
+`apps/mobile/src/services/sse-client.ts` and remove the dep.
+Behaviourally identical migration; the wrapper API surface
+stays the same.
+
+Alternative: keep `@microsoft/fetch-event-source` indefinitely.
+The library is stable enough that "do nothing" is a defensible
+plan as long as upstream stays maintained.
+
+### Stale close condition
+
+Migration lands, OR 2 calendar years pass without an
+ecosystem change AND the dep stays maintained.
+
+### Related
+
+- DP-1 (initial dependency approval).
+- ADR *Mobile-To-Api Streaming — SSE* (Phase 3.3) —
+  Consequences section flags the dep as a known cost.
+
+### History
+
+- 2026-04-25: filed alongside Phase 3.3 c14 dep adoption.
+
+## TD-044: Agent execution control hooks (cancel / pause / resume)
+
+Discovered: 2026-04-25 (Phase 3.3 c7 — adapter intentionally
+    leaves these out of MVP scope)
+Type: feature gap
+Priority: P3
+Status: open
+Trigger: real user feedback requesting any of: mid-stream
+    cancellation, pause / resume of long-running tasks, admin
+    priority interruption.
+
+### Description
+
+The Phase 3.3 task pipeline has the basic happy path:
+submit → assign → execute → stream → complete or fail. There
+is no path for the user (or operator admin) to ask the running
+task to stop, pause, or hand off mid-stream. The closest thing
+today is closing the SSE connection — which only severs the
+read leg; the agent keeps spending tokens until the model
+finishes.
+
+The Phase 3.2 WS protocol has space for control frames
+(`task-rejected` already covers "agent declines this work"),
+but no `task-cancel-request`, `task-pause-request`, or
+`task-priority-bump`.
+
+### Risk if unaddressed
+
+- Users have no abort affordance. A wrong-prompt task burns
+  the full token budget before the user can stop it.
+- Long-running agentic tasks (file edits, tool-use loops) have
+  no graceful interruption; `kill` is the only option, which
+  loses progress.
+- Quotas / cost accounting can over-count when an
+  ill-conceived task runs to completion vs. being cancelled
+  early.
+
+### Proposed fix
+
+Extend the WS protocol with three new client→agent frame types:
+
+- `task-cancel-request` — user pressed cancel; agent should
+  finish current sentence then exit gracefully. Server logs
+  partial output as `cancelled`.
+- `task-pause-request` / `task-resume-request` — adjacent
+  primitive; useful for human-in-the-loop review of a tool-use
+  step before the agent commits. Optional in v1.
+- `task-priority-bump` — admin-only override; not user-visible
+  in MVP+1.
+
+Agent-side handlers in `ClaudeCodeAgent.cancelTask` etc.
+Adapter layer (Phase 3.3 c7 `task-executor-adapter.ts`)
+forwards to those handlers. Server-side: the
+`taskEventBus.closeTask` already handles the SSE side; add a
+`status: 'cancelled'` frame so the client knows the difference
+between "agent died" and "agent was told to stop."
+
+### Stale close condition
+
+When cancellation lands AND user feedback confirms the
+affordance is sufficient. Pause/resume can land later as a
+separate ticket.
+
+### Related
+
+- ADR *ClaudeCodeAgent Integration — Phase 1.4 + Thin
+  Adapter* (Phase 3.3) — Consequences section notes this as
+  the deferred control-plane work.
+- Phase 3.2 `task-rejected` frame — sibling shape; would
+  follow the same routing.
+
+### History
+
+- 2026-04-25: filed alongside Phase 3.3 c7 adapter. Deferred
+  as post-MVP feature; MVP ships with happy-path-only
+  execution.

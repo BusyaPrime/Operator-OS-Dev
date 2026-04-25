@@ -1,12 +1,16 @@
 # End-to-End Task Flow
 
-Status: Phase 3.2 landed the durable task-dispatch pipeline on top
-of Phase 3.1's `POST /v1/tasks` persistence. The full
-mobile → api → Pub/Sub → router → WS → agent → WS → api loop is
-wired with an echo-stub executor; Phase 3.3 swaps the executor for
-ClaudeCodeAgent and adds SSE streaming back to mobile. The
-historical Phase 2 diagram below is preserved for context; the
-Phase 3.2 Mermaid sequence after it is the current state.
+Status: Phase 3.3 closes the loop. ClaudeCodeAgent now executes
+the dispatched task (Phase 1.4 + thin adapter); mobile receives
+live token-stream output via Server-Sent Events from
+`GET /v1/tasks/:taskId/stream`. The MVP pipeline runs end-to-end:
+Mobile → api → Pub/Sub → router → WS → ClaudeCodeAgent →
+`claude` CLI → tokens → bus → SSE → mobile.
+
+The historical Phase 2 ASCII diagram below is preserved for
+context. The Phase 3.2 dispatch Mermaid sequence is the
+foundation; the Phase 3.3 SSE leg sits on top of it (final
+section in this document).
 
 ## Participants
 
@@ -262,14 +266,133 @@ the full rejection matrix.
 - `apps/api/scripts/create-pubsub-topics.sh` +
   `create-cloud-tasks-queue.sh` — idempotent provisioning
 
-## What's still Phase 3.3+
+## Phase 3.3 SSE Streaming Leg (closes the MVP loop)
 
-- **Real ClaudeCodeAgent execution** — today the echo-stub
-  returns `echo: <prompt>` with no real model call. Phase 3.3
-  swaps `createEchoStubExecutor()` for `ClaudeCodeAgent.executeTask`.
-- **Streaming response mobile ← api** — likely SSE
-  (one-directional) since mobile is consuming, not publishing.
-  WS is an alternative but SSE survives proxies better.
+Phase 3.3 turns the echo-stub into the real `ClaudeCodeAgent`
+and adds the mobile-facing SSE leg. The agent → api WebSocket
+work the dispatch pipeline already does is unchanged; Phase 3.3
+adds an in-memory `taskEventBus` that fans the agent's
+`task-delta` / `task-completed` / `task-failed` frames out to
+SSE subscribers.
+
+```mermaid
+sequenceDiagram
+    participant Mobile
+    participant API as API (Cloud Run)
+    participant Bus as taskEventBus<br/>(in-memory)
+    participant FS as Firestore
+    participant Agent as Desktop Agent<br/>(ControlChannelWs)
+    participant Claude as claude CLI<br/>(execa subprocess)
+
+    Note over Mobile,Agent: dispatch already happened — see Phase 3.2 Mermaid above
+    Note over Agent: ClaudeCodeAgent.executeTask spawns claude CLI
+
+    Mobile->>API: GET /v1/tasks/:taskId/stream<br/>Authorization: Bearer + Last-Event-ID?
+    API->>FS: getTask(taskId, userId)<br/>(404 if not owned)
+    API-->>Mobile: 200 text/event-stream<br/>Cache-Control: no-cache
+    API->>Bus: subscribe(taskId, sseWriter)
+    API-->>Mobile: : heartbeat <ts>  (every 25s)
+
+    Note over API: replay outputDeltas[seq > Last-Event-ID]<br/>+ status frame
+
+    Claude-->>Agent: stdout chunk
+    Agent->>API: WS task-delta {taskId, delta}
+    API->>FS: appendTaskDelta {seq, delta, ts}
+    API->>Bus: publish('delta', {seq, delta, ts})
+    Bus-->>API: invoke sseWriter(event)
+    API-->>Mobile: id: <seq><br/>event: delta<br/>data: {kind:"delta", delta:{…}}
+
+    Claude-->>Agent: exit 0
+    Agent->>API: WS task-completed {taskId, output}
+    API->>FS: setTaskTerminal(status=completed, output)
+    API->>Bus: publish('completed', {output, seq})
+    Bus-->>API: invoke sseWriter(event)
+    API-->>Mobile: id: <seq><br/>event: completed<br/>data: {kind:"completed", output, seq}
+    API->>Bus: closeTask(taskId)
+    API-->>Mobile: <connection close>
+
+    Note over Mobile: client receives terminal frame,<br/>navigates to next state
+```
+
+### SSE Reconnection Protocol
+
+The Cloud Run 60-minute hard limit means any long-lived stream
+must reconnect transparently. The mobile client also reconnects
+opportunistically on radio-handoff / app-resume. The protocol is
+stock SSE plus our `seq`-as-id discipline:
+
+1. **Heartbeat.** Server emits `: heartbeat <iso8601>` comment
+   frames every 25 seconds (DP-3). EventSource clients discard
+   the comment naturally; our wrapper observes it as a liveness
+   ping.
+2. **Last-Event-ID tracking.** The store updates
+   `taskViewModel.lastEventId` whenever a delta frame's `seq`
+   exceeds the current value (idempotent on duplicate seq).
+3. **Reconnect.** When the SSE connection drops (Cloud Run
+   timeout, network blip, AppState wake), the screen calls
+   `connectSse()` again with `lastEventId: String(seq)`. The
+   client wrapper sets that as the `Last-Event-ID` request
+   header.
+4. **Server replay.** On a request that carries
+   `Last-Event-ID`, the SSE handler reads `task.outputDeltas`
+   from Firestore and emits every delta with `seq > Last-Event-ID`
+   before subscribing live. The client sees no gap.
+5. **Pre-emptive reconnect.** The mobile screen also fires a
+   timer at 55 minutes to abort + reconnect ahead of the Cloud
+   Run boundary so token streaming never dies in the user's
+   face.
+
+### Mid-Stream Reauth Path (NOTE 4)
+
+If the access token expires while the SSE connection is open,
+the next reconnect (or the very next request) returns 401. The
+sse-client wrapper handles this with a 4th `onClose` reason:
+
+1. Server returns 401 on the (re)connect attempt.
+2. Wrapper invokes the consumer's `onUnauthorized()` callback.
+3. The screen-level callback calls
+   `authClient.refresh(refreshToken)`, applies the rotated
+   tokens to `useAuthStore`, returns `true`.
+4. Wrapper fires `onClose('reauth-needed')` and stops retrying.
+5. Screen sees `reauth-needed` and calls `connectSse()` again.
+   The fresh `authHeader()` returns the new bearer; the same
+   `lastEventId` is passed so no delta is lost across the
+   rotation.
+6. If the refresh fails (`onUnauthorized()` resolves `false`
+   or throws), wrapper fires `onClose('fatal')`. Screen
+   surfaces the error and the auth store's
+   `forceSignOut()` bounces the user to the SignIn screen.
+
+The 4th close reason is necessary because
+`@microsoft/fetch-event-source` captures the headers object at
+connect time — internal retries reuse the same (now-stale)
+bearer. Our screen-level reconnect is what actually picks up the
+new token.
+
+### Local development with the real ClaudeCodeAgent
+
+The desktop agent reads `DESKTOP_AGENT_EXECUTOR` to pick its
+executor:
+
+- `claude-code` (default) — uses `ClaudeCodeAgent` via the
+  Phase 3.3 c7 adapter. Requires `ANTHROPIC_API_KEY` in the
+  agent process environment and the `claude` CLI on the
+  user's PATH (`claude --version` must succeed).
+- `echo-stub` — uses the Phase 3.2 echo executor. No model
+  call, no API key needed. Used in CI / unit tests.
+
+Set the executor in `apps/desktop-agent/.env` (gitignored):
+
+```
+ANTHROPIC_API_KEY=sk-ant-...
+DESKTOP_AGENT_EXECUTOR=claude-code
+```
+
+The Phase 3.2 OIDC token-mint instructions (above) still apply
+for probing the internal routes locally.
+
+## What's still Phase 3.3+ (deferred)
+
 - **Dispatch-attempts persistence on TaskRecord** — today the
   attempt counter lives in the Pub/Sub + Cloud Tasks envelopes;
   a `task-rejected`-driven re-queue starts a fresh counter. A
@@ -279,13 +402,16 @@ the full rejection matrix.
   costs; aggregation + budget enforcement in the hot path
   (blocking an over-budget user pre-dispatch) is separate.
 - **Multi-instance coordination** — today's in-memory
-  `AgentSessionRegistry` + in-memory `TaskRouter` cursor are
-  single-Cloud-Run-instance only. TD-031 (Redis cursor) + ADR
-  *Agent WebSocket Sessions Are In-Memory* record the migration
-  plan.
+  `AgentSessionRegistry`, `TaskRouter` cursor, and
+  `taskEventBus` are single-Cloud-Run-instance only. TD-031
+  (Redis cursor) + TD-041 (Redis bus) + ADR *Agent WebSocket
+  Sessions Are In-Memory* + ADR *Mobile-To-Api Streaming — SSE*
+  record the migration plan.
 - **Dispatch monitoring dashboard** — TD-032 tracks Cloud
   Monitoring dashboard + alert policies for DLQ rate, retry
   queue depth, oldest-unacked-message-age.
+- **Agent execution control hooks** — cancel / pause / resume
+  protocol gaps. TD-044 tracks the WS protocol extension.
 
 ## Verification endpoints (once live)
 
@@ -305,6 +431,15 @@ the full rejection matrix.
 - `apps/api/src/services/agent-session-registry.ts` — in-memory sessions
 - `apps/desktop-agent/src/heartbeat/agent-heartbeat-loop.ts` — producer
 - `apps/desktop-agent/src/agents/claude-code-agent/claude-code-agent.ts` — concrete agent
+- `apps/desktop-agent/src/agents/claude-code-agent/task-executor-adapter.ts` — Phase 3.3 c7 adapter
+- `apps/api/src/services/task-event-bus.ts` — Phase 3.3 c1 in-memory fan-out bus
+- `apps/api/src/routes/tasks.ts` — Phase 3.3 c3 SSE handler + Last-Event-ID replay
+- `packages/contracts/src/ai/task-stream.ts` — Phase 3.3 c17 wire-format schema
+- `apps/mobile/src/services/sse-client.ts` — Phase 3.3 c14 SSE wrapper with reauth-needed close reason
+- `apps/mobile/src/screens/task-stream-screen.tsx` — Phase 3.3 c14 mobile UI
 - `apps/mobile/src/services/authenticated-api-client.ts` — bearer + refresh
-- `docs/DECISIONS.md` — Phase 2 ADRs: additive heartbeat, code-based pricing, in-memory sessions
-- `docs/TECH_DEBT.md` — TD-017 / TD-022 / TD-024 closed; TD-025 filed
+- `docs/DECISIONS.md` — Phase 2 ADRs (additive heartbeat, in-memory sessions),
+  Phase 3.2 ADRs (Pub/Sub + Cloud Tasks, OIDC, capability matching),
+  Phase 3.3 ADRs (SSE, ClaudeCodeAgent adapter, Zustand confirmation)
+- `docs/TECH_DEBT.md` — TD-017 / TD-022 / TD-024 closed; TDs 041-044 filed
+  for Phase 3.3 deferred work

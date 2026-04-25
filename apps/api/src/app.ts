@@ -44,6 +44,7 @@ import { SessionsService } from './services/sessions.js';
 import { TaskDispatchPublisher } from './services/task-dispatch-publisher.js';
 import { TaskRetryScheduler } from './services/task-retry-scheduler.js';
 import { createTaskRouter } from './services/task-router.js';
+import { createTaskEventBus } from './services/task-event-bus.js';
 import type { AIProvider } from './types.js';
 
 interface BuildServerOptions {
@@ -229,6 +230,21 @@ export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) =>
   });
   const taskRetryScheduler = new TaskRetryScheduler(config, app.log);
 
+  // Phase 3.3 SSE event bus: in-memory pub/sub keyed by taskId.
+  // Subscribers = SSE handlers; publishers = WS task-callbacks.
+  // Single-instance scope per DP-2; TD-041 tracks Redis migration.
+  const taskEventBus = createTaskEventBus();
+
+  // Per-task seq counter for SSE Last-Event-ID. Lives next to the
+  // bus because it is the bus-side numbering that clients see in
+  // SSE `id:` fields. Cleared on terminal events.
+  const taskSeqCounters = new Map<string, number>();
+  const nextTaskSeq = (taskId: string): number => {
+    const next = (taskSeqCounters.get(taskId) ?? 0) + 1;
+    taskSeqCounters.set(taskId, next);
+    return next;
+  };
+
   const MAX_DISPATCH_ATTEMPTS = 5;
 
   /**
@@ -324,8 +340,8 @@ export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) =>
     async onTaskAccepted(params) {
       // Status is already 'assigned' from the dispatch that sent the
       // task-assign frame; the agent acknowledging is primarily an
-      // ops marker for Phase 3.2. Phase 3.3 will transition here to
-      // 'executing' once first task-progress arrives.
+      // ops marker. Phase 3.3 also transitions to 'executing' to
+      // mirror the agent state machine on the user-visible task.
       app.log.info(
         {
           source: 'agent-ws.taskCallbacks',
@@ -335,18 +351,47 @@ export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) =>
         },
         'task-accepted acknowledged'
       );
+      const seq = nextTaskSeq(params.taskId);
+      taskEventBus.publish(params.taskId, {
+        kind: 'status',
+        status: 'executing',
+        seq
+      });
+      await firestoreRepository.updateTask(params.taskId, {
+        status: 'executing'
+      });
     },
+
     async onTaskRejected(params) {
-      // Re-queue and schedule a fresh retry. Attempt counter resets;
-      // Phase 3.3 will add a dispatchAttempts field on TaskRecord so
-      // reject + retry share a budget with Pub/Sub-push retries.
+      // NOTE 3 (Phase 3.3): if the agent rejects with reason
+      // 'already-executing', the task is being processed by this
+      // (or another) agent already and a Pub/Sub redelivery just
+      // raced through. NO-OP — do NOT re-queue, do NOT increment
+      // dispatchAttempts, do NOT scheduleRetry.
+      const reason = params.reason ?? '';
+      if (reason.includes('already-executing')) {
+        app.log.info(
+          {
+            source: 'agent-ws.taskCallbacks',
+            sessionId: params.sessionId,
+            agentId: params.agentId,
+            taskId: params.taskId,
+            reason
+          },
+          'task-rejected with already-executing reason — no-op (not re-queued)'
+        );
+        return;
+      }
+
+      // Otherwise re-queue + schedule a fresh retry. Attempt counter
+      // resets; TD-044 tracks the dispatchAttempts unification.
       app.log.info(
         {
           source: 'agent-ws.taskCallbacks',
           sessionId: params.sessionId,
           agentId: params.agentId,
           taskId: params.taskId,
-          reason: params.reason
+          reason
         },
         'task-rejected -> re-queueing'
       );
@@ -358,6 +403,84 @@ export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) =>
         taskId: params.taskId,
         attempt: 1
       });
+    },
+
+    async onTaskDelta(params) {
+      // Persist + publish. Persist first so a client that connects
+      // mid-stream (or reconnects on Last-Event-ID gap) sees the
+      // delta in Firestore replay.
+      const seq = nextTaskSeq(params.taskId);
+      const deltaText =
+        typeof params.delta === 'string'
+          ? params.delta
+          : JSON.stringify(params.delta ?? '');
+      const delta = {
+        seq,
+        delta: deltaText,
+        timestamp: new Date().toISOString()
+      };
+      await firestoreRepository.appendTaskDelta(params.taskId, delta);
+      taskEventBus.publish(params.taskId, { kind: 'delta', delta });
+    },
+
+    async onTaskCompleted(params) {
+      const seq = nextTaskSeq(params.taskId);
+      const outputText =
+        typeof params.output === 'string'
+          ? params.output
+          : JSON.stringify(params.output ?? '');
+      await firestoreRepository.setTaskTerminal(params.taskId, {
+        status: 'completed',
+        output: outputText,
+        completedAt: new Date().toISOString()
+      });
+      taskEventBus.publish(params.taskId, {
+        kind: 'completed',
+        output: outputText,
+        seq
+      });
+      taskEventBus.closeTask(params.taskId);
+      taskSeqCounters.delete(params.taskId);
+    },
+
+    async onTaskFailed(params) {
+      const seq = nextTaskSeq(params.taskId);
+      const error = ((): { code: string; message: string } => {
+        if (
+          params.error &&
+          typeof params.error === 'object' &&
+          'code' in (params.error as object) &&
+          'message' in (params.error as object)
+        ) {
+          const e = params.error as { code: unknown; message: unknown };
+          return {
+            code: typeof e.code === 'string' ? e.code : 'agent_error',
+            message:
+              typeof e.message === 'string'
+                ? e.message
+                : 'Agent reported a task failure without a message.'
+          };
+        }
+        return {
+          code: 'agent_error',
+          message:
+            typeof params.error === 'string'
+              ? params.error
+              : 'Agent reported a task failure without a structured error.'
+        };
+      })();
+      await firestoreRepository.setTaskTerminal(params.taskId, {
+        status: 'failed',
+        error,
+        completedAt: new Date().toISOString()
+      });
+      taskEventBus.publish(params.taskId, {
+        kind: 'failed',
+        error,
+        seq
+      });
+      taskEventBus.closeTask(params.taskId);
+      taskSeqCounters.delete(params.taskId);
     }
   };
 
@@ -371,7 +494,8 @@ export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) =>
     idempotencyCache: taskIdempotencyCache,
     userGuard: authService.createRequiredGuard(),
     apiBaseUrl: agentAudience,
-    dispatchPublisher: taskDispatchPublisher
+    dispatchPublisher: taskDispatchPublisher,
+    taskEventBus
   });
   void registerInternalTasksRoutes(app);
 

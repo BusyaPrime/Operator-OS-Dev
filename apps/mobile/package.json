@@ -10,6 +10,7 @@
     "typecheck": "pnpm exec tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@microsoft/fetch-event-source": "^2.0.1",
     "@operator-os/config": "workspace:*",
     "@operator-os/contracts": "workspace:*",
     "@react-native-google-signin/google-signin": "^16.1.2",

@@ -1,4 +1,4 @@
-import { Firestore } from '@google-cloud/firestore';
+import { Firestore, FieldValue } from '@google-cloud/firestore';
 import type { ApiEnv } from '@operator-os/config';
 import {
   alertSchema,
@@ -658,6 +658,78 @@ export class FirestoreOperatorRepository {
       return { updated: true };
     } catch (err) {
       this.#logger.warn({ err, taskId, patch }, 'task update failed');
+      return { updated: false };
+    }
+  }
+
+  /**
+   * Phase 3.3 streaming: atomically append a delta to the task's
+   * `outputDeltas` array. Idempotent at the Firestore layer because
+   * `arrayUnion` deduplicates by deep equality — a Pub/Sub redelivery
+   * of the same delta (same seq + delta + timestamp) is a no-op.
+   *
+   * Returns `{appended: false}` on ADC-absent or write failure; the
+   * dispatch pipeline tolerates record-only fallbacks the same way
+   * publisher and updateTask do.
+   */
+  async appendTaskDelta(
+    taskId: string,
+    delta: { readonly seq: number; readonly delta: string; readonly timestamp: string }
+  ): Promise<{ readonly appended: boolean }> {
+    if (!this.#adcStatus.available) return { appended: false };
+    try {
+      await this.#getClient()
+        .collection(TASKS_COLLECTION)
+        .doc(taskId)
+        .update({
+          outputDeltas: FieldValue.arrayUnion(delta),
+          updatedAt: new Date().toISOString()
+        });
+      return { appended: true };
+    } catch (err) {
+      this.#logger.warn(
+        { err, taskId, seq: delta.seq },
+        'task delta append failed'
+      );
+      return { appended: false };
+    }
+  }
+
+  /**
+   * Phase 3.3 terminal state write — records final status + output
+   * (or error) + completedAt timestamp. Used by the WS task-completed
+   * / task-failed callbacks (composed in `app.ts`) and by the
+   * dispatch handler when DLQ-promoting a max-attempt task.
+   */
+  async setTaskTerminal(
+    taskId: string,
+    params: {
+      readonly status: 'completed' | 'failed' | 'cancelled';
+      readonly output?: string | null;
+      readonly error?: { readonly code: string; readonly message: string } | null;
+      readonly completedAt?: string;
+    }
+  ): Promise<{ readonly updated: boolean }> {
+    if (!this.#adcStatus.available) return { updated: false };
+    try {
+      const sanitized: Record<string, unknown> = {
+        status: params.status,
+        completedAt: params.completedAt ?? new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+      if (params.output !== undefined) sanitized.output = params.output;
+      if (params.error !== undefined) sanitized.error = params.error;
+
+      await this.#getClient()
+        .collection(TASKS_COLLECTION)
+        .doc(taskId)
+        .update(sanitized);
+      return { updated: true };
+    } catch (err) {
+      this.#logger.warn(
+        { err, taskId, status: params.status },
+        'task terminal write failed'
+      );
       return { updated: false };
     }
   }
