@@ -1,8 +1,6 @@
-import type {
-  TaskError,
-  TaskOutputDelta,
-  TaskStatus
-} from '@operator-os/contracts';
+import type { TaskStreamEvent } from '@operator-os/contracts';
+
+export type { TaskStreamEvent };
 
 /**
  * Frame the SSE handler emits to the client. Discriminated by `kind`:
@@ -27,16 +25,9 @@ import type {
  * and `failed` carry an explicit `seq` so the SSE handler can tag
  * the terminal SSE frame with `id: <seq>` per the spec.
  */
-export type TaskStreamEvent =
-  | { readonly kind: 'delta'; readonly delta: TaskOutputDelta }
-  | { readonly kind: 'status'; readonly status: TaskStatus; readonly seq: number }
-  | {
-      readonly kind: 'completed';
-      readonly output: string;
-      readonly seq: number;
-    }
-  | { readonly kind: 'failed'; readonly error: TaskError; readonly seq: number }
-  | { readonly kind: 'heartbeat'; readonly timestamp: string };
+// `TaskStreamEvent` lives in @operator-os/contracts (Phase 3.3 c17)
+// and is re-exported above so existing imports of `TaskStreamEvent`
+// from this module keep working.
 
 export type TaskStreamSubscriber = (event: TaskStreamEvent) => void;
 

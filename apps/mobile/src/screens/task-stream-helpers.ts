@@ -1,8 +1,10 @@
 import type {
   TaskError,
   TaskOutputDelta,
-  TaskStatus
+  TaskStatus,
+  TaskStreamEvent
 } from '@operator-os/contracts';
+import { safeParseTaskStreamEvent } from '@operator-os/contracts';
 
 /**
  * Pure-logic helpers for TaskStreamScreen, extracted into a
@@ -12,32 +14,25 @@ import type {
  *
  * Same Phase 1.5 / Phase 3.3 c12 pattern: target the extracted
  * handler, not the rendered tree.
+ *
+ * Phase 3.3 c17: parsing is delegated to the shared Zod schema
+ * `taskStreamEventSchema` from @operator-os/contracts so the
+ * client-server agreement is enforced by a single source of
+ * truth. Heartbeat frames pass through the validator but are
+ * filtered before reaching the store (the screen renders them
+ * as connection-state heartbeats only).
  */
 
 /**
- * Discriminated union mirroring `TaskStreamEvent` from
- * `apps/api/src/services/task-event-bus.ts`. We don't import the
- * server-side type to keep the mobile build dependency-free of
- * the api package; the wire format is the source of truth and is
- * covered by the server-side type tests.
+ * Non-heartbeat parsed events. Heartbeat is dropped at the
+ * helper boundary because the store only cares about deltas +
+ * terminal events. The screen-level connection state subscribes
+ * separately to liveness via SSE comment frames.
  */
-export type ParsedStreamEvent =
-  | { readonly kind: 'delta'; readonly delta: TaskOutputDelta }
-  | {
-      readonly kind: 'status';
-      readonly status: TaskStatus;
-      readonly seq: number;
-    }
-  | {
-      readonly kind: 'completed';
-      readonly output: string;
-      readonly seq: number;
-    }
-  | {
-      readonly kind: 'failed';
-      readonly error: TaskError;
-      readonly seq: number;
-    };
+export type ParsedStreamEvent = Exclude<
+  TaskStreamEvent,
+  { kind: 'heartbeat' }
+>;
 
 /**
  * Parse a single SSE message's `data` payload into a
@@ -61,56 +56,12 @@ export const parseStreamEvent = (
   } catch {
     return undefined;
   }
-  if (typeof json !== 'object' || json === null) return undefined;
-  const obj = json as { kind?: unknown };
-  switch (obj.kind) {
-    case 'delta': {
-      const d = obj as { delta?: unknown };
-      if (
-        typeof d.delta !== 'object' ||
-        d.delta === null ||
-        typeof (d.delta as { seq?: unknown }).seq !== 'number'
-      ) {
-        return undefined;
-      }
-      return { kind: 'delta', delta: d.delta as TaskOutputDelta };
-    }
-    case 'status': {
-      const s = obj as { status?: unknown; seq?: unknown };
-      if (typeof s.status !== 'string' || typeof s.seq !== 'number') {
-        return undefined;
-      }
-      return {
-        kind: 'status',
-        status: s.status as TaskStatus,
-        seq: s.seq
-      };
-    }
-    case 'completed': {
-      const c = obj as { output?: unknown; seq?: unknown };
-      if (typeof c.output !== 'string' || typeof c.seq !== 'number') {
-        return undefined;
-      }
-      return { kind: 'completed', output: c.output, seq: c.seq };
-    }
-    case 'failed': {
-      const f = obj as { error?: unknown; seq?: unknown };
-      if (
-        typeof f.error !== 'object' ||
-        f.error === null ||
-        typeof f.seq !== 'number'
-      ) {
-        return undefined;
-      }
-      return {
-        kind: 'failed',
-        error: f.error as TaskError,
-        seq: f.seq
-      };
-    }
-    default:
-      return undefined;
-  }
+  const event = safeParseTaskStreamEvent(json);
+  if (event === undefined) return undefined;
+  // Drop heartbeats — they're observed at the connection layer
+  // (SSE comment frames), not the store layer.
+  if (event.kind === 'heartbeat') return undefined;
+  return event;
 };
 
 /**

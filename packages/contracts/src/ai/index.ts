@@ -7,3 +7,4 @@ export * from './cost-provider.js';
 export * from './filesystem-provider.js';
 export * from './stream-provider.js';
 export * from './task.js';
+export * from './task-stream.js';
