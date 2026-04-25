@@ -15,7 +15,8 @@
         "EXPO_PUBLIC_AUTH_GATEWAY_BASE_URL": "https://operator-auth-gateway-m545sz2isq-ez.a.run.app",
         "EXPO_PUBLIC_USE_MOCKS": "false",
         "EXPO_PUBLIC_CONTROLLED_FALLBACK": "true",
-        "EXPO_PUBLIC_AUTH_MODE": "google"
+        "EXPO_PUBLIC_AUTH_MODE": "google",
+        "EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID": "1016254604177-rgvmifpm5sjr009nie8ga9psnoap69pg.apps.googleusercontent.com"
       }
     },
     "production": {

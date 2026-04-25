@@ -3544,3 +3544,84 @@ the next EAS build with no asset warnings.
 
 - 2026-04-25: filed alongside Phase 3.4 first APK build to
   document the deliberate scope skip.
+
+## TD-053: Production OAuth client separate from dev-named client
+
+Discovered: 2026-04-25 (Phase 3.4 Gate 1 — reuses the existing
+    `operator-os-dev-identity-web` OAuth client for the first
+    APK to avoid Console click-through cost; not the right
+    name for production)
+Type: ops / hygiene
+Priority: P3
+Status: open
+Trigger: when Operator-OS leaves the dev/test phase — typically
+    when (a) a new GCP project for prod (`operator-os-prod`?)
+    is provisioned, OR (b) a Play Store listing is being
+    prepared, OR (c) external beta users start.
+
+### Description
+
+Phase 3.4's first APK uses the OAuth Web Client ID
+`1016254604177-rgvmifpm5sjr009nie8ga9psnoap69pg.apps.googleusercontent.com`
+which is the existing client named
+`operator-os-dev-identity-web` in the `operator-os-dev` project.
+Functionally fine — it's a valid OAuth client and the gateway
+already accepts it via `AUTH_ACCEPTED_GOOGLE_CLIENT_IDS`. But:
+
+- The name `operator-os-dev-identity-web` carries the "-dev"
+  suffix that we don't want surfacing in any production-side
+  log or screen.
+- The OAuth Consent Screen for that client is currently in
+  "Testing" mode with a fixed test-user allowlist (Akmal's
+  three Google accounts). Real users outside that allowlist
+  would be blocked.
+- Mixing a single OAuth client across dev / preview / production
+  builds means revoking it on a security incident takes the dev
+  flow down with it.
+
+### Risk if unaddressed
+
+- Beta users / first real users may hit the "test users only"
+  Consent Screen barrier.
+- Splitting OAuth clients later requires re-issuing existing
+  builds, re-registering SHA-1s, and updating gateway env vars
+  — a coordinated migration that's cheaper to do once early
+  than later.
+
+### Proposed fix
+
+When the trigger condition fires:
+
+1. In `operator-os-prod` (or whichever project hosts production):
+   - Configure OAuth Consent Screen → publishing status "In
+     production" (requires Google verification for some scopes;
+     for our usage `openid profile email` is auto-approved).
+   - Create a new OAuth Web Client ID named
+     `operator-os-prod-identity-web`.
+   - Create matching Android Client(s) for each release-signing
+     SHA-1.
+2. Add the new Web Client ID to the production gateway's
+   `AUTH_ACCEPTED_GOOGLE_CLIENT_IDS` (CSV append).
+3. Set `EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID` to the new ID for the
+   `production` build profile in `apps/mobile/eas.json`.
+4. Keep the old dev client around for the dev / preview build
+   profiles.
+
+### Stale close condition
+
+When the prod-named client lands AND the production build
+profile uses it AND no production-bound build references the
+dev-named client.
+
+### Related
+
+- ADR *Mobile Auth For First APK Build — Real Google Sign-In
+  (Phase 3.4)* — explicitly chose to reuse the existing dev
+  client for the first APK.
+- TD-045 / PR #36 (dev mint endpoint) — alternative auth
+  bypass; will likely stay around for smoke tests indefinitely.
+
+### History
+
+- 2026-04-25: filed alongside Phase 3.4 first APK to flag the
+  dev-named client as a future cleanup item.
