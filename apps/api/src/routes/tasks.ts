@@ -14,6 +14,10 @@ import { z } from 'zod';
 import type { FirestoreOperatorRepository } from '../integrations/firestore.js';
 import type { IdempotencyCache } from '../services/idempotency-cache.js';
 import type { TaskDispatchPublisher } from '../services/task-dispatch-publisher.js';
+import type {
+  TaskEventBus,
+  TaskStreamEvent
+} from '../services/task-event-bus.js';
 
 /**
  * Retention window for TaskRecord.expireAt. Per Gate 3.1.A
@@ -107,6 +111,23 @@ export interface TaskRoutesOptions {
    * record-only.
    */
   readonly dispatchPublisher?: TaskDispatchPublisher;
+
+  /**
+   * Phase 3.3 SSE streaming. When present,
+   * `GET /v1/tasks/:taskId/stream` opens a `text/event-stream`
+   * response and forwards live events from this bus to the client.
+   * Absent in Phase 3.1 / 3.2 tests — handler returns 503 with a
+   * 'stream_unavailable' code when the bus is not wired.
+   */
+  readonly taskEventBus?: TaskEventBus;
+
+  /**
+   * SSE heartbeat interval (ms). Default 25_000 (25s) — under
+   * Cloud Run's 60-min request limit while typical edge proxies
+   * close idle streams at ~30s. Tests pass shorter intervals
+   * (e.g. 10ms) to drive the heartbeat path quickly.
+   */
+  readonly sseHeartbeatMs?: number;
 }
 
 const listQuerySchema = z.object({
@@ -411,16 +432,233 @@ export const registerTaskRoutes = async (
     }
   );
 
-  // GET /v1/tasks/:taskId/stream — Phase 3.1 stub.
-  // No auth check: the stub does not read or emit task data.
-  // Phase 3.3 will replace this handler with the real SSE
-  // implementation (token in query param, snapshot listener on
-  // the task document, etc.).
+  // GET /v1/tasks/:taskId/stream — Phase 3.3 SSE handler.
+  //
+  // Auth: userGuard (preHandler) — same Bearer token Phase 3.1 GETs
+  //       expect. Ownership: getTask(taskId, userId) -> 404 on
+  //       miss/mismatch (Phase 3.1 enumeration-proof pattern).
+  //
+  // Frames (text/event-stream):
+  //   id: <seq>
+  //   event: delta | status | completed | failed
+  //   data: <TaskStreamEvent JSON>
+  //   <blank line>
+  // Comment frames (`: heartbeat <ts>`) every `sseHeartbeatMs` keep
+  // the connection alive under Cloud Run / edge proxies. Clients
+  // that respect the SSE spec discard comments.
+  //
+  // Reconnection: clients re-send `Last-Event-ID: <seq>`. The
+  // handler replays Firestore `outputDeltas[seq > Last-Event-ID]`
+  // before subscribing live, so a network blip does not lose
+  // tokens. (TD-042 caches this replay path for hot reconnects.)
   app.get<{ Params: { taskId: string } }>(
     '/v1/tasks/:taskId/stream',
-    async (_request, reply) => {
-      reply.status(501);
-      return { code: 'not_implemented', phase: '3.3' };
+    { preHandler: options.userGuard },
+    async (request, reply) => {
+      const userId = request.currentUser?.operatorId;
+      if (!userId) {
+        reply.status(401);
+        return apiError(
+          'unauthorized',
+          'User identity not available in request context'
+        );
+      }
+
+      const params = taskIdParamsSchema.safeParse(request.params);
+      if (!params.success) {
+        reply.status(400);
+        return apiError('invalid_taskid', 'taskId must be a UUID', {
+          issues: params.error.issues
+        });
+      }
+      const { taskId } = params.data;
+
+      // Ownership + existence (Phase 3.1 enumeration-proof: any miss
+      // returns 404, never 403, so we don't leak existence of
+      // someone else's task).
+      const task = await options.repository.getTask(taskId, userId);
+      if (task === undefined) {
+        reply.status(404);
+        return apiError('not_found', 'Task not found');
+      }
+
+      if (options.taskEventBus === undefined) {
+        // Bus not wired (test/dev mode). Honest 503.
+        reply.status(503);
+        return apiError(
+          'stream_unavailable',
+          'Task event bus is not configured on this api instance.'
+        );
+      }
+      const bus = options.taskEventBus;
+
+      const heartbeatMs = options.sseHeartbeatMs ?? 25_000;
+      const lastEventIdHeaderRaw = request.headers['last-event-id'];
+      const lastEventIdHeader = Array.isArray(lastEventIdHeaderRaw)
+        ? lastEventIdHeaderRaw[0]
+        : lastEventIdHeaderRaw;
+      const lastEventIdParsed =
+        typeof lastEventIdHeader === 'string'
+          ? Number.parseInt(lastEventIdHeader, 10)
+          : Number.NaN;
+      const replayFrom = Number.isFinite(lastEventIdParsed)
+        ? lastEventIdParsed
+        : 0;
+
+      // Hijack the reply so Fastify does not auto-serialize a JSON
+      // body. From here we own the raw Node response.
+      reply.hijack();
+      const raw = reply.raw;
+      raw.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no'
+      });
+
+      let isClosed = false;
+      const writeQueue: Array<() => void> = [];
+      let isDraining = false;
+
+      const flushQueue = (): void => {
+        while (writeQueue.length > 0 && !isClosed && !isDraining) {
+          const next = writeQueue.shift();
+          next?.();
+        }
+      };
+
+      const enqueueOrWrite = (work: () => void): void => {
+        if (isClosed) return;
+        if (isDraining) {
+          writeQueue.push(work);
+          return;
+        }
+        work();
+        if (raw.writableNeedDrain) {
+          isDraining = true;
+          raw.once('drain', () => {
+            isDraining = false;
+            flushQueue();
+          });
+        }
+      };
+
+      const writeFrame = (event: TaskStreamEvent, id: number): void => {
+        enqueueOrWrite(() => {
+          if (isClosed) return;
+          const payload = `id: ${id}\nevent: ${event.kind}\ndata: ${JSON.stringify(event)}\n\n`;
+          try {
+            raw.write(payload);
+          } catch {
+            // Connection died mid-write; cleanup runs via 'close'.
+          }
+        });
+      };
+
+      const writeHeartbeat = (timestamp: string): void => {
+        enqueueOrWrite(() => {
+          if (isClosed) return;
+          try {
+            raw.write(`: heartbeat ${timestamp}\n\n`);
+          } catch {
+            /* swallow */
+          }
+        });
+      };
+
+      // 1. Replay missed deltas. On first connect (no Last-Event-ID
+      //    header), replayFrom = 0 → entire history streams as
+      //    catchup so the client renders previously-emitted output.
+      let lastSeq = 0;
+      for (const delta of task.outputDeltas) {
+        if (delta.seq > replayFrom) {
+          writeFrame({ kind: 'delta', delta }, delta.seq);
+        }
+        if (delta.seq > lastSeq) lastSeq = delta.seq;
+      }
+
+      // 2. Send current status snapshot.
+      lastSeq += 1;
+      writeFrame({ kind: 'status', status: task.status, seq: lastSeq }, lastSeq);
+
+      // 3. If task is already in a terminal state, emit the terminal
+      //    event and close — no live subscription needed.
+      if (
+        task.status === 'completed' ||
+        task.status === 'failed' ||
+        task.status === 'cancelled'
+      ) {
+        lastSeq += 1;
+        if (task.status === 'failed' && task.error !== null) {
+          writeFrame(
+            { kind: 'failed', error: task.error, seq: lastSeq },
+            lastSeq
+          );
+        } else {
+          writeFrame(
+            {
+              kind: 'completed',
+              output: task.output ?? '',
+              seq: lastSeq
+            },
+            lastSeq
+          );
+        }
+        isClosed = true;
+        try {
+          raw.end();
+        } catch {
+          /* swallow */
+        }
+        return reply;
+      }
+
+      // 4. Subscribe to live events.
+      const unsubscribe = bus.subscribe(taskId, (event) => {
+        if (isClosed) return;
+        if (event.kind === 'heartbeat') {
+          writeHeartbeat(event.timestamp);
+          return;
+        }
+        const id =
+          event.kind === 'delta' ? event.delta.seq : event.seq;
+        writeFrame(event, id);
+        if (event.kind === 'completed' || event.kind === 'failed') {
+          isClosed = true;
+          try {
+            raw.end();
+          } catch {
+            /* swallow */
+          }
+        }
+      });
+
+      // 5. Heartbeat ticker. unref() so the timer does not pin the
+      //    event loop during shutdown.
+      const heartbeatTimer = setInterval(() => {
+        if (isClosed) return;
+        writeHeartbeat(new Date().toISOString());
+      }, heartbeatMs);
+      if (typeof heartbeatTimer.unref === 'function') {
+        heartbeatTimer.unref();
+      }
+
+      // 6. Cleanup on client disconnect.
+      const cleanup = (): void => {
+        if (isClosed) return;
+        isClosed = true;
+        clearInterval(heartbeatTimer);
+        unsubscribe();
+        try {
+          raw.end();
+        } catch {
+          /* swallow */
+        }
+      };
+      raw.on('close', cleanup);
+      raw.on('error', cleanup);
+
+      return reply;
     }
   );
 };
