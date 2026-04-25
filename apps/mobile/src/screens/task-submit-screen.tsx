@@ -18,8 +18,10 @@ import { colors, spacing, typography } from '../theme/tokens';
  * UUID for older runtimes. Idempotency keys do not need to be
  * cryptographically strong — the server's 24h dedup cache holds
  * them; collision odds at MVP scale are negligible either way.
+ *
+ * Exported so c13 tests can verify shape / collision properties.
  */
-const generateIdempotencyKey = (): string => {
+export const generateIdempotencyKey = (): string => {
   const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
   if (c && typeof c.randomUUID === 'function') return c.randomUUID();
   const hex = (len: number): string => {
@@ -31,6 +33,56 @@ const generateIdempotencyKey = (): string => {
   };
   const variant = '89ab'[Math.floor(Math.random() * 4)];
   return `${hex(8)}-${hex(4)}-4${hex(3)}-${variant}${hex(3)}-${hex(12)}`;
+};
+
+/**
+ * Pure-logic task-submit handler. Extracted from the screen so
+ * tests can drive it directly without rendering React Native
+ * components — the project does not include
+ * @testing-library/react-native (per Phase 1.5 SignInScreen
+ * test pattern: "target the extracted hook, not the rendered
+ * tree"). Returns the submitted taskId on success or undefined
+ * on validation-fail / submit-error so tests can assert each
+ * branch deterministically.
+ */
+export interface TaskSubmitFormState {
+  readonly prompt: string;
+  readonly capabilities: ReadonlySet<string>;
+  readonly idempotencyKey: string;
+}
+
+export interface TaskSubmitDeps {
+  readonly submitTask: (input: {
+    readonly prompt: string;
+    readonly capabilities: readonly string[];
+    readonly idempotencyKey: string;
+  }) => Promise<
+    | { readonly taskId: string }
+    | { readonly error: { readonly code: string; readonly message: string } }
+  >;
+  readonly navigation: {
+    navigate(name: 'TaskStream', params: { readonly taskId: string }): void;
+  };
+}
+
+export const performTaskSubmit = async (
+  args: TaskSubmitFormState & TaskSubmitDeps
+): Promise<{ readonly taskId: string } | undefined> => {
+  const trimmedPrompt = args.prompt.trim();
+  if (trimmedPrompt.length === 0) return undefined;
+  if (args.capabilities.size === 0) return undefined;
+
+  const result = await args.submitTask({
+    prompt: trimmedPrompt,
+    capabilities: [...args.capabilities],
+    idempotencyKey: args.idempotencyKey
+  });
+
+  if ('taskId' in result) {
+    args.navigation.navigate('TaskStream', { taskId: result.taskId });
+    return { taskId: result.taskId };
+  }
+  return undefined;
 };
 
 /**
@@ -101,14 +153,13 @@ export function TaskSubmitScreen({ navigation }: TaskSubmitScreenProps) {
 
   const onSubmit = async () => {
     if (!canSubmit) return;
-    const result = await submitTask({
+    await performTaskSubmit({
       prompt: trimmedPrompt,
-      capabilities: [...selectedCapabilities],
-      idempotencyKey
+      capabilities: selectedCapabilities,
+      idempotencyKey,
+      submitTask,
+      navigation
     });
-    if ('taskId' in result) {
-      navigation.navigate('TaskStream', { taskId: result.taskId });
-    }
     // On error the store has already set submissionError; UI
     // re-renders and shows the error block.
   };
