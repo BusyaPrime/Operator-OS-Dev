@@ -2575,6 +2575,23 @@ NOT trigger CD, close as resolved.
 - 2026-04-24: filed after the path-filter trap surfaced during
   Phase 3.2 closure follow-up. Awaiting an infra / CI-cleanup
   PR.
+- 2026-04-24 (later): **severity escalation note.** The
+  path-filter trap caused TWO cancelled-CD races in the same
+  session (`666b576` → race-deployed `00013-2p4`; `2f033d5`
+  → race-deployed `00015-25w`). `gh run cancel` does NOT
+  reliably stop an in-flight Cloud Build job once it has
+  passed the image-push step — the deploy step finishes
+  even though GH Actions reports the run as `cancelled`.
+  Combined with **TD-040** (cloudbuild `--set-env-vars`
+  REPLACE semantics), the second race silently stripped all
+  6 Phase 3.2 env vars from production
+  (`00014-wpd → 00015-25w`). Priority unchanged at P3 for
+  the filter-tightening fix, but the combined urgency with
+  TD-040 means both should land in the same infra-cleanup
+  pass — TD-040 alone is insufficient because the path
+  filter still admits cosmetic deploys, and TD-038 alone is
+  insufficient because the next legitimate code deploy
+  would still strip env vars.
 
 ## TD-039: Pre-lock GCP service regional availability before DP decisions
 
@@ -2684,3 +2701,141 @@ artifact reviewers actually use), close TD-039.
   create`. Region corrected to europe-west1 inline; TD
   captures the process gap (DP accepted without availability
   verification) so it does not recur.
+
+## TD-040: `cloudbuild.yaml --set-env-vars` REPLACE clobbers post-merge env additions
+
+Discovered: 2026-04-24 (Phase 3.2 manual setup — second
+    cancelled-CD race redeployed `00015-25w` ~90s after the
+    `gcloud run services update --update-env-vars` that
+    placed Phase 3.2 vars on `00014-wpd`, and `00015-25w`
+    came up with all 6 Phase 3.2 vars STRIPPED)
+Type: deployment · regression-trap
+Priority: **P1**
+Status: open (production-impacting; reproduced today)
+Trigger for action: NOW. This is structural and silent —
+    every CD-driven deploy after an out-of-band env-var
+    addition will revert that addition with no error.
+
+### Description
+
+`infra/cloudbuild/api.cloudbuild.yaml` and
+`infra/cloudbuild/auth-gateway.cloudbuild.yaml` both invoke
+`gcloud run deploy --set-env-vars="..."`. The
+`--set-env-vars` flag has **REPLACE** semantics — it sets
+the container's env-var list to exactly the supplied
+key=value pairs and discards anything else previously set
+on the service.
+
+This means: any env var added out-of-band via
+`gcloud run services update --update-env-vars` (the standard
+ops pattern for adding configuration that doesn't belong in
+the deploy YAML) survives until the next CD-driven deploy,
+at which point it is silently dropped.
+
+The Phase 3.2 incident on 2026-04-24:
+
+1. Phase 3.2 deploy via PR #34 merge brought api code
+   (`registerInternalPubsubRoutes` etc.) live on revision
+   `00012-zrk`, but those routes are gated on
+   `PUBSUB_PUSH_AUDIENCE`.
+2. Manual `gcloud run services update --update-env-vars=...`
+   added all 6 Phase 3.2 env vars to the service on revision
+   `00014-wpd`.
+3. ~90s later a cancelled-CD race (TD-038) deployed source
+   commit `2f033d5` via Cloud Build, producing revision
+   `00015-25w`. Cloud Build's deploy step issued
+   `--set-env-vars=...` with only the 9 baseline vars,
+   stripping all 6 Phase 3.2 additions.
+4. `00015-25w` took 100% traffic. `/v1/internal/pubsub/*`
+   routes silently un-registered (PUBSUB_PUSH_AUDIENCE
+   absent ⇒ route registration skipped per the gated
+   pattern in `app.ts`). Pub/Sub push messages would 404
+   silently. The dispatch pipeline went **offline
+   end-to-end** with no health-check failure — `/health`
+   stayed 200, `/ready` stayed 503-honest, Phase 3.1 routes
+   stayed up.
+
+### Risk if unaddressed
+
+- **Silent regression on every code deploy.** Any future
+  env-var addition (Phase 3.3 needs at least one for the
+  SSE-streaming endpoint URL; secrets rotation may add
+  more) will be wiped by the next CD without warning.
+- **No log signal.** `--set-env-vars` does not emit a
+  warning when it removes a previously-set var. The drift
+  is only visible by reading the new revision's env-var
+  list and comparing against expectation.
+- **Affects auth-gateway equally** — same pattern in
+  `auth-gateway.cloudbuild.yaml`. Phase 1.5 + Phase 2 added
+  several env vars there; if anyone has set additional
+  Google client IDs or tweaked TTLs out-of-band, those are
+  also at risk on the next auth-gateway redeploy.
+
+### Proposed fix
+
+**Option 1 (preferred, applied in this PR):** switch to
+`--update-env-vars` in both files. Merge semantics: the
+deploy's listed vars are upserted into the existing service
+config; previously-set vars (including ops-set additions)
+survive.
+
+```diff
+-          --set-env-vars="NODE_ENV=production,..."
++          --update-env-vars="NODE_ENV=production,..."
+```
+
+Applied to:
+
+- `infra/cloudbuild/api.cloudbuild.yaml`
+- `infra/cloudbuild/auth-gateway.cloudbuild.yaml`
+
+**Option 2 (rejected):** keep `--set-env-vars` and embed
+all env vars in the YAML. Drawback: every new env var
+needs a cloudbuild.yaml change before it can be deployed,
+including secrets / per-env tweaks that don't belong in
+versioned config. Couples runtime config to CI YAML and
+makes ops harder.
+
+### Stale close condition
+
+When the patched cloudbuild.yaml has been confirmed via at
+least one CD redeploy + post-deploy env-var presence check
+(out-of-band-set vars survive), close TD-040.
+
+### Evidence trail
+
+- Manual setup commit: `2f033d5` (Cloud Tasks region fix +
+  TD-039) triggered CD run `24912309788` (cancelled but
+  raced through deploy).
+- Revision `00014-wpd` (manual env-var set): had all 6
+  Phase 3.2 vars — verified via
+  `gcloud run revisions describe --format='yaml(spec.containers[0].env)'`.
+- Revision `00015-25w` (CD race-redeploy): has 0 of 6 Phase
+  3.2 vars — verified the same way.
+- Current `apps/api/src/app.ts` route-registration logic:
+  `if (config.PUBSUB_PUSH_AUDIENCE) { registerInternalPubsubRoutes(...) }`
+  — gating means absent env var ⇒ routes absent.
+- Confirmation probe:
+  `POST /v1/internal/pubsub/task-dispatch` → 404 on
+  `00015-25w`; same call returned 401 on `00014-wpd`.
+
+### Related
+
+- **TD-038** (path-filter trap) — see its severity-escalation
+  note. Both TDs together caused this incident; both should
+  land in the same infra-cleanup pass.
+- ADR *Task Dispatch — Pub/Sub Push + Cloud Tasks Retry*
+  (2026-04-24) — defines the env vars that got stripped.
+- TD-011 (Cloud Run reserved env-var pattern) — adjacent
+  cloudbuild.yaml hardening; reserved-name handling in
+  auth-gateway already documents the `PORT` carve-out.
+
+### History
+
+- 2026-04-24: filed when revision `00015-25w` was
+  observed to have stripped the Phase 3.2 vars set on
+  `00014-wpd`. Fix applied in the same docs-and-config
+  commit (this entry's filing PR also patches both
+  `cloudbuild.yaml` files); fix confirmation lands when the
+  next legitimate code-touching CD redeploys without
+  stripping.
