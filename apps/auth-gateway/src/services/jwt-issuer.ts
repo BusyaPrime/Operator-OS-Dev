@@ -28,10 +28,16 @@ export class JwtIssuer {
     this.#secretLoader = secretLoader;
   }
 
-  async issue(user: OperatorUser, scopes: string[] = []): Promise<IssuedAccessToken> {
+  async issue(
+    user: OperatorUser,
+    scopes: string[] = [],
+    ttlSecondsOverride?: number
+  ): Promise<IssuedAccessToken> {
     const secret = await this.#secretLoader.load();
     const now = Math.floor(Date.now() / 1000);
-    const exp = now + this.#config.AUTH_ACCESS_TOKEN_TTL_SECONDS;
+    const ttlSeconds =
+      ttlSecondsOverride ?? this.#config.AUTH_ACCESS_TOKEN_TTL_SECONDS;
+    const exp = now + ttlSeconds;
 
     const payload = accessTokenPayloadSchema.parse({
       sub: user.id,

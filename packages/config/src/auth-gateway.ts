@@ -48,7 +48,23 @@ export const authGatewayEnvSchema = z.object({
     .string()
     .min(1)
     .default('refreshTokens'),
-  READINESS_STRICT: booleanFromString(false)
+  READINESS_STRICT: booleanFromString(false),
+  /**
+   * When `true`, the auth-gateway exposes a privileged
+   * `POST /v1/dev/mint-test-token` endpoint that issues operator
+   * access tokens without going through Google sign-in. Used for
+   * smoke tests, local-dev integration tests, and one-off probes
+   * of the live API. MUST be left at the default `false` outside
+   * of explicit smoke-test windows; flipping it on opens a path
+   * to mint a token for any userId, which would let an attacker
+   * impersonate users wholesale.
+   *
+   * Disabled-state semantics: the route is not registered at
+   * all (404), so a misconfigured probe is indistinguishable
+   * from a 4xx on a non-existent path. There is no separate
+   * "feature off" body to leak the route's existence.
+   */
+  AUTH_DEV_MINT_ENABLED: booleanFromString(false)
 });
 
 export type AuthGatewayEnv = z.infer<typeof authGatewayEnvSchema>;
