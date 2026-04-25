@@ -2046,11 +2046,36 @@ registration order.
 
 ### Updated hypothesis (post-incident 2)
 
+*Superseded by the 2026-04-25 revision below — kept for
+historical reference.*
+
 - **H1 (~65%)** — Cloud Run edge routing cache / state inconsistency during or immediately after a revision swap, scoped to this one endpoint path. Pattern support: both incidents occurred minutes-to-hours of a fresh revision going live; both produced zero application logs; other endpoints on the same revision at the same time responded normally.
 - **H2 (~20%)** — Network-path / TLS edge transient that varies per day. Pattern support: Phase 3.1 resolved spontaneously; weak time-of-day correlation; N=2 is too small to conclude.
 - **H3 (~5%)** — Code regression. Pattern against: diff-empty between Phase 2 merge (`02898c1`) and Phase 3.2 merge (`751c9c3`) on the agent route file; other endpoints on the new revision respond normally.
 - **H4 (~5%)** — Agent-side / client-local issue. Pattern against: same `curl` binary, same TLS session, same client box successfully probed other endpoints in the same minute.
 - **H5 (~5%)** — Regional / project-wide Cloud Run anomaly. Pattern against: endpoint-specific scope; no other services in the project report similar behavior.
+
+### Hypothesis revision 2026-04-25 (post-incident 2 + 5 fresh revisions observed)
+
+Five new revisions deployed over the 24h after incident 2
+(`00013-2p4`, `00014-wpd`, `00015-25w`, `00016-s2b`,
+`00017-t59`). Heartbeat probed on the latest two: 3 of 3
+returned 401 normally on `00017-t59` within ~2 min of
+revision creation. **No new TD-030 incident.** This shifts
+the hypothesis distribution materially.
+
+- **H1 (~35%, was 65%)** — Cloud Run edge routing cache during revision swap. **WEAKENED.** If H1 were dominant, the post-deploy window of 5 fresh revisions in 24h should have produced more 000 incidents; only `00012-zrk` (incident 2) did. The mechanism may still exist but the trigger is rarer and not deterministic per-deploy.
+- **H2 (~50%, was 20%)** — Network-path / TLS edge transient with day-of-week or load variance. **STRENGTHENED.** Both observed incidents occurred ~22:00 UTC during low-traffic windows. Could be Google edge-layer batching / cleanup / cert-rotation artifact that fires on a much longer-than-revision cadence.
+- **H3 (~5%, unchanged)** — Code regression. Diff-empty evidence holds across all 5 fresh revisions; no code-path change to heartbeat handler in any of them.
+- **H4 (~5%, unchanged)** — Agent-side / client-local. Pattern against unchanged.
+- **H5 (~5%, unchanged)** — Regional / project-wide Cloud Run anomaly. Endpoint-specific scope unchanged.
+
+**Action threshold revision:** file a Cloud Run support case
+ONLY on incident #3 with a reproducible pattern. Two
+incidents within 100+ revision-swap-class events does NOT
+establish a strong reproducible pattern by Google's bar.
+Continue passive monitoring via
+`apps/api/scripts/heartbeat-probe.sh`.
 
 ### Action on recurrence
 
@@ -2301,11 +2326,11 @@ rates, equal treatment becomes wasteful.
 
 Discovered: 2026-04-24 (Phase 3.2 c1 — new retry queue pinned to
     europe-west4 per stop rule #11; legacy queues stay europe-west1)
+Closed:     2026-04-25 (superseded — see "Closure" below)
 Type: infrastructure
 Priority: P3
-Status: open
-Trigger: when the legacy queues are touched for any reason, or
-    during the next ops-hygiene pass.
+Status: **CLOSED — superseded by architectural reality**
+Trigger: N/A (closed)
 
 ### Description
 
@@ -2346,6 +2371,51 @@ compounded by a principled new choice.
 
 - 2026-04-24: filed at Phase 3.2 c1 when the region asymmetry
   landed. Deferred to the next infrastructure-touching PR.
+- 2026-04-25: closed as superseded — see "Closure" below.
+
+### Closure 2026-04-25
+
+Resolution: **superseded.** Cloud Tasks does NOT support
+`europe-west4` (the api's Cloud Run region). The discovery
+landed during Phase 3.2 manual setup when
+`gcloud tasks queues create --location=europe-west4` failed
+with `Location 'europe-west4' is not a valid location for
+Cloud Tasks.` See TD-039 for the process gap.
+
+The TD's original goal — region uniformity for all Cloud
+Tasks queues — was achieved by the inverse path: deploying
+the NEW Phase 3.2 queue (`task-dispatch-retry-dev`) in
+`europe-west1`, co-located with the existing legacy queues
+(`commands`, `approvals`, `exports`). All Cloud Tasks
+queues in the project now live in `europe-west1`. The api
+remains in `europe-west4` (Cloud Run-only); a small
+cross-region hop on each retry-task dispatch (~5–10ms) is
+the cost of regional-uniformity-by-co-location.
+
+Evidence:
+- `gcloud tasks locations list --project=operator-os-dev`
+  output (2026-04-24): EU regions are
+  `europe-central2`, `europe-west1`, `europe-west2`,
+  `europe-west3`, `europe-west6`. **No `europe-west4`.**
+- `gcloud tasks queues describe task-dispatch-retry-dev
+  --location=europe-west1` returns RUNNING.
+- TD-039 documents the process gap (DP-1 region locked
+  without service-availability check).
+- Phase 3.2 manual setup chose `europe-west1` autonomously
+  at Checkpoint 1; rationale captured in `decisions.md`
+  entry 2026-04-25-0635.
+
+Stop-rule revision: stop rule #11 was originally written
+"Cloud Tasks queue must match europe-west4 api". The
+revised effective rule, applied for the rest of the project:
+"Cloud Tasks queue in the closest supported EU region to
+the api (currently `europe-west1`)."
+
+This closure is **actionable**, not stale — the situation
+changed, the goal was met by a different mechanism, no work
+remains. If `europe-west4` becomes a Cloud Tasks region in
+the future, a new TD can re-open the unification question
+on its merits at that time.
 
 ## TD-035: Internal routes path migration (`/internal/*` → `/v1/internal/*`)
 
