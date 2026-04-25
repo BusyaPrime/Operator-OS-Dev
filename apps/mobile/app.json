@@ -24,6 +24,12 @@
       [
         "@react-native-google-signin/google-signin"
       ]
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "6dad7fe2-b561-43d1-9e52-45127a829f41"
+      }
+    },
+    "owner": "busyaprime"
   }
 }
