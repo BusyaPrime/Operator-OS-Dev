@@ -9,12 +9,23 @@ coverage/
 .env
 .env.local
 .env.*.local
+.env.production
+.env.preview
+.env.development
 *.log
 *.tsbuildinfo
 pnpm-debug.log*
 web-build/
 .DS_Store
 Thumbs.db
+
+# Mobile build artefacts + signing material — never commit
+*.keystore
+*.jks
+*.apk
+*.aab
+google-services.json
+GoogleService-Info.plist
 
 # Claude Code local harness state (not part of repo)
 .claude/

@@ -3481,3 +3481,66 @@ matters).
 
 - 2026-04-25: filed when the smoke test caught a 201 → 404
   inconsistency on a fresh production submit.
+
+## TD-052: Mobile branding (icon, splash, color scheme)
+
+Discovered: 2026-04-25 (Phase 3.4 Part 2 — first APK build skips
+    branding to keep scope tight on the smoke test)
+Type: design / polish
+Priority: P2
+Status: open
+Trigger: before any external user (beta program / Play Store
+    listing) sees the app.
+
+### Description
+
+Phase 3.4 first build deliberately skips icon + splash assets:
+the `apps/mobile/` workspace has no `assets/` directory and the
+`app.json` does not reference `icon` or `splash.image`. Expo
+provides defaults (the Expo logo on launch, a generic app icon)
+which is functional for smoke-testing the runtime path but not
+appropriate for any user-facing distribution.
+
+### Risk if unaddressed
+
+- Default Expo branding visible on the launcher and the splash
+  screen — confusing for non-developer users.
+- No visual identity for the project; recognisability suffers
+  when multiple Operator-OS-related artifacts (TestFlight
+  builds, Play Store listing, marketing site) need consistent
+  branding.
+
+### Proposed fix
+
+1. **Icon** — 1024×1024 PNG, `apps/mobile/assets/icon.png`.
+   Reference in `app.json` → `expo.icon`. Expo auto-generates
+   adaptive icon variants for Android.
+2. **Adaptive icon (Android)** — 1024×1024 foreground PNG plus a
+   solid background colour. Reference under
+   `expo.android.adaptiveIcon.foregroundImage` and
+   `backgroundColor`.
+3. **Splash image** — 1242×2436 PNG (or the size Expo
+   recommends), `apps/mobile/assets/splash.png`. Reference under
+   `expo.splash.image`.
+4. **Color scheme** — pick a primary palette consistent with
+   `apps/mobile/src/theme/tokens.ts` (already has `colors.copperDeep`,
+   `colors.canvas`, `colors.ink`). Apply to splash background and
+   adaptive icon background.
+
+### Stale close condition
+
+Branding assets exist, are referenced from `app.json`, and pass
+the next EAS build with no asset warnings.
+
+### Related
+
+- ADR *Mobile Auth For First APK Build — Real Google Sign-In
+  (Phase 3.4)* — splash skip is a deliberate scope choice
+  documented there.
+- `apps/mobile/src/theme/tokens.ts` — existing colour palette to
+  build the visual identity around.
+
+### History
+
+- 2026-04-25: filed alongside Phase 3.4 first APK build to
+  document the deliberate scope skip.

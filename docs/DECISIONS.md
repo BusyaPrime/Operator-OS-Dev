@@ -2890,3 +2890,148 @@ Jotai
   Not Rewrite Navigation*.
 - c12-fix commit 729a762 — vi.mock pattern for stores that
   pull RN-only modules through their singleton.
+
+## Mobile Auth For First APK Build — Real Google Sign-In (Phase 3.4)
+
+### Context
+
+Phase 3.4 produces the first installable APK of the Operator-OS
+mobile shell and runs the first manual smoke test on a real
+Android device. The Phase 1.5 + Phase 3.3 mobile code already
+implements the full Google Sign-In path end-to-end (`SignInScreen`
+→ `googleSignIn.signIn()` → `authClient.signin(idToken)` →
+auth-gateway `/v1/auth/signin` → HS256 access + refresh tokens).
+What's missing is the production-side wiring: the OAuth Web
+Client ID provisioned in Google Cloud Console, registered as an
+accepted audience in the gateway's `AUTH_ACCEPTED_GOOGLE_CLIENT_IDS`,
+and the APK signing-key SHA-1 attached to that OAuth client.
+
+Three options were on the table at Gate 3.4 (per Phase 3.4 Part 1
+survey blockers B-4):
+
+- **B.1 Real Google Sign-In** — provision the Web Client ID, do
+  the two-pass build dance (build → capture EAS-managed signing
+  SHA-1 → register → rebuild → auth works), test against the
+  real auth path.
+- **B.2 Dev mint shortcut** — patch the mobile temporarily with a
+  hardcoded "Sign in (dev)" button that calls the auth-gateway's
+  `/v1/dev/mint-test-token` (TD-045 / PR #36) and stores the
+  returned operator-HS256 token. Bypasses Google entirely.
+- **B.3 Hybrid** — keep real auth flow, fall back to dev mint
+  button when `EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID` is absent.
+
+### Decision
+
+**B.1 — Real Google Sign-In on first APK build.**
+
+Provision the OAuth Web Client ID in `operator-os-dev` Google
+Cloud Console; set `EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID` in
+`apps/mobile/.env.production`; do two EAS builds (Pass 1 to learn
+the signing SHA-1; register; Pass 2 to install on the device with
+working sign-in).
+
+### Rationale
+
+Phase 3.4's value is verifying the mobile UX *as it will look to
+real users*. The dev mint shortcut would only verify the
+TaskSubmit / TaskStream rendering paths — important, but the
+sign-in flow is the user's first interaction with the app and the
+dominant Phase 1.5 deliverable. Skipping it means the first
+real-device verification of sign-in slides to Phase 4+. A
+verification we plan to do anyway is best done now while the
+context is fresh, before more code lands on top.
+
+The two-pass build dance is a known Android cost: every Android
+OAuth client is keyed by package name + SHA-1. EAS-managed
+signing produces the SHA-1 only on first build. Either we eat
+the dance now or we eat it on the first user-facing build later.
+Taking the hit now in Phase 3.4 means the rest of the project
+runs on a known-working signing setup.
+
+### Consequences
+
+Positive
+- The first manual smoke test exercises the production sign-in
+  surface, not a dev-only impostor. The TaskSubmit / TaskStream
+  flows that follow are tested by a session that came in via the
+  same path a real user would.
+- The OAuth Web Client ID provisioned now is durable: the same
+  client ID covers the dev / preview / production EAS profiles.
+  When Phase 4 lands a Play Store build with a different signing
+  key, only the SHA-1 differs — the client ID stays.
+- The gateway's `AUTH_ACCEPTED_GOOGLE_CLIENT_IDS` env var gets
+  its first non-empty value, exercising a code path that has been
+  dormant since Phase 1.5.
+
+Negative
+- Two EAS builds for the smoke test (~10-20 min each on EAS's
+  free tier), versus one build with B.2.
+- The provisioning involves a manual click-through in Google
+  Cloud Console: create OAuth client → name → add SHA-1 → add
+  package name. Must be done by Akmal on his account; cannot be
+  automated from this side. The TZ Operations Notes section
+  (Phase 3.4 Part 8 R23++) documents the exact clicks for
+  reproducibility.
+- The dev mint endpoint (TD-045 / PR #36) goes unused for this
+  smoke. It will be exercised on the next smoke window when the
+  real sign-in is the suspect being debugged.
+
+Mitigations
+- Operations notes in the Phase 3.4 R23++ report capture the
+  clicks so the next time we add a build profile (or migrate to
+  Play Store signing), the steps are documented.
+- TD-053 candidate (filed if first smoke surfaces sign-in
+  problems): "Mobile auth bootstrap script for new build
+  profiles" — a script that prompts for the SHA-1 + package +
+  client ID and adds the OAuth credential via gcloud where
+  possible.
+
+### Alternatives considered
+
+B.2 — Dev mint shortcut
+- Pros: zero Google Cloud Console work; one EAS build; lowest
+  time-to-installable-APK.
+- Cons: doesn't exercise the production sign-in path; adds a
+  dev-only "Sign in (dev)" button that has to be removed before
+  any real user touch the build. Forgetting that removal is a
+  real risk.
+- Rejected for Phase 3.4 first smoke. May be useful later when
+  smoke-testing TaskSubmit/TaskStream UX without re-going
+  through sign-in every time.
+
+B.3 — Hybrid (real + dev mint fallback)
+- Pros: keeps the dev escape hatch indefinitely.
+- Cons: adds a code path to production builds that is
+  intentionally insecure; an Android user who bypasses the
+  Google flow could trick the app via env-var manipulation or
+  reverse engineering. The blast radius is small (the dev mint
+  endpoint is still gated server-side by `AUTH_DEV_MINT_ENABLED`
+  on the gateway), but the principle of "no dev paths in
+  production" is worth honouring.
+- Rejected on the same "fewest-paths" principle.
+
+### Implementation
+
+- `apps/mobile/.env.production` (gitignored) — sets
+  `EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID` to the value Akmal pastes
+  after provisioning.
+- `apps/mobile/eas.json` — `preview` profile with
+  `buildType: apk`, `distribution: internal`, channel `preview`.
+  EAS picks up `.env.production` automatically when
+  `EAS_PROFILE=preview` is in the build invocation.
+- `apps/mobile/app.json` — `android.package =
+  "com.operatoros.app"`, `android.versionCode = 1`. The
+  `extra.eas.projectId` is added by `eas init` on first run.
+- Gateway env: `AUTH_ACCEPTED_GOOGLE_CLIENT_IDS` updated to
+  include the new Web Client ID. Out-of-band update;
+  `--update-env-vars` (TD-040 fix preserves other env vars).
+
+### References
+
+- Phase 1.5 ADR: *Mobile Phase 1.5 Adds Auth Alongside, Does
+  Not Rewrite Navigation* — the original sign-in implementation.
+- TD-045 / PR #36: dev mint endpoint (the alternative we
+  rejected for first smoke, kept for future targeted testing).
+- @react-native-google-signin/google-signin v13+ Credential
+  Manager docs: webClientId + Android signing SHA-1 are the only
+  required production-side configuration.

@@ -9,6 +9,21 @@
       "resizeMode": "contain",
       "backgroundColor": "#0f1720"
     },
-    "assetBundlePatterns": ["**/*"]
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "android": {
+      "package": "com.operatoros.app",
+      "versionCode": 1,
+      "permissions": [
+        "INTERNET"
+      ]
+    },
+    "plugins": [
+      "expo-secure-store",
+      [
+        "@react-native-google-signin/google-signin"
+      ]
+    ]
   }
 }
