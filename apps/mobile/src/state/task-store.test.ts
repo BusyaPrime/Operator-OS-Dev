@@ -1,5 +1,37 @@
 import { describe, expect, it, vi } from 'vitest';
 
+// task-store.ts wires a default singleton at the bottom that
+// transitively imports react-native-only modules (expo-secure-store
+// via tokenStorage, @react-native-google-signin via auth-store).
+// Mock both at the module level so vitest (Node) doesn't choke on
+// the Flow-syntax react-native/index.js. Mirrors the auth-store
+// test pattern.
+vi.mock('@react-native-google-signin/google-signin', () => ({
+  statusCodes: {
+    SIGN_IN_CANCELLED: 'SIGN_IN_CANCELLED',
+    IN_PROGRESS: 'IN_PROGRESS',
+    PLAY_SERVICES_NOT_AVAILABLE: 'PLAY_SERVICES_NOT_AVAILABLE',
+    SIGN_IN_REQUIRED: 'SIGN_IN_REQUIRED',
+    NULL_PRESENTER: 'NULL_PRESENTER'
+  },
+  GoogleSignin: {
+    configure: vi.fn(),
+    hasPlayServices: vi.fn(),
+    signIn: vi.fn(),
+    signOut: vi.fn()
+  },
+  isErrorWithCode: (err: unknown): err is { code: string; message: string } =>
+    typeof err === 'object' &&
+    err !== null &&
+    'code' in err &&
+    typeof (err as { code: unknown }).code === 'string'
+}));
+vi.mock('expo-secure-store', () => ({
+  getItemAsync: vi.fn().mockResolvedValue(null),
+  setItemAsync: vi.fn().mockResolvedValue(undefined),
+  deleteItemAsync: vi.fn().mockResolvedValue(undefined)
+}));
+
 import {
   TaskApiClientError,
   type TaskApiClient
