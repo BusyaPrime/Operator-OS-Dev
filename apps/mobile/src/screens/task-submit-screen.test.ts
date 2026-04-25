@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   generateIdempotencyKey,
   performTaskSubmit
-} from './task-submit-screen';
+} from './task-submit-helpers.js';
 
 const TASK_UUID = '12345678-1234-4234-8234-123456789012';
 
