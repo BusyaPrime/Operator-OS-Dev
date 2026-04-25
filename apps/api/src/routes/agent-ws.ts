@@ -152,6 +152,30 @@ export interface AgentWsTaskCallbacks {
     readonly taskId: string;
     readonly reason?: string;
   }): Promise<void> | void;
+
+  /** Phase 3.3 — agent emits an output fragment (token / chunk). */
+  onTaskDelta?(params: {
+    readonly sessionId: string;
+    readonly agentId: string;
+    readonly taskId: string;
+    readonly delta: unknown;
+  }): Promise<void> | void;
+
+  /** Phase 3.3 — agent reports terminal success. */
+  onTaskCompleted?(params: {
+    readonly sessionId: string;
+    readonly agentId: string;
+    readonly taskId: string;
+    readonly output: unknown;
+  }): Promise<void> | void;
+
+  /** Phase 3.3 — agent reports terminal failure. */
+  onTaskFailed?(params: {
+    readonly sessionId: string;
+    readonly agentId: string;
+    readonly taskId: string;
+    readonly error: unknown;
+  }): Promise<void> | void;
 }
 
 export interface AgentWsRouteOptions {
@@ -427,21 +451,87 @@ export const registerAgentWsRoute = async (
             }
             return;
           }
-          case 'task-progress':
-          case 'task-delta':
-          case 'task-completed':
-          case 'task-failed':
-            // Phase 3.3 scope: persist streaming / terminal state.
-            // Phase 3.2 logs only; see "End-to-end Task Flow" doc.
+          case 'task-progress': {
+            // No callback hook in Phase 3.3 — task-progress is a
+            // free-form heartbeat from the agent and is not part of
+            // the SSE stream contract. TD candidate (TD-044) for
+            // upgrading to a structured progress channel later.
             logger.info(
               {
                 sessionId,
-                messageType: parsed.data.type,
+                messageType: 'task-progress',
                 taskId: parsed.data.taskId
               },
-              'task-channel message received (logged only in Phase 3.2)'
+              'task-progress received (logged only)'
             );
             return;
+          }
+          case 'task-delta': {
+            const deltaTaskId = parsed.data.taskId;
+            const deltaPayload = parsed.data.delta;
+            if (options.taskCallbacks?.onTaskDelta) {
+              const session = options.sessionRegistry.byId(sessionId);
+              const agentId = session?.agentId ?? 'unknown';
+              void Promise.resolve(
+                options.taskCallbacks.onTaskDelta({
+                  sessionId,
+                  agentId,
+                  taskId: deltaTaskId,
+                  delta: deltaPayload
+                })
+              ).catch((err) => {
+                logger.warn(
+                  { err, sessionId, taskId: deltaTaskId },
+                  'onTaskDelta callback threw'
+                );
+              });
+            }
+            return;
+          }
+          case 'task-completed': {
+            const completedTaskId = parsed.data.taskId;
+            const completedOutput = parsed.data.output;
+            if (options.taskCallbacks?.onTaskCompleted) {
+              const session = options.sessionRegistry.byId(sessionId);
+              const agentId = session?.agentId ?? 'unknown';
+              void Promise.resolve(
+                options.taskCallbacks.onTaskCompleted({
+                  sessionId,
+                  agentId,
+                  taskId: completedTaskId,
+                  output: completedOutput
+                })
+              ).catch((err) => {
+                logger.warn(
+                  { err, sessionId, taskId: completedTaskId },
+                  'onTaskCompleted callback threw'
+                );
+              });
+            }
+            return;
+          }
+          case 'task-failed': {
+            const failedTaskId = parsed.data.taskId;
+            const failedError = parsed.data.error;
+            if (options.taskCallbacks?.onTaskFailed) {
+              const session = options.sessionRegistry.byId(sessionId);
+              const agentId = session?.agentId ?? 'unknown';
+              void Promise.resolve(
+                options.taskCallbacks.onTaskFailed({
+                  sessionId,
+                  agentId,
+                  taskId: failedTaskId,
+                  error: failedError
+                })
+              ).catch((err) => {
+                logger.warn(
+                  { err, sessionId, taskId: failedTaskId },
+                  'onTaskFailed callback threw'
+                );
+              });
+            }
+            return;
+          }
           default:
             // Exhaustiveness check — TS ensures we covered the union.
             exhaustive(parsed.data);
