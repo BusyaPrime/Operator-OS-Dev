@@ -7,7 +7,8 @@
     "dev": "pnpm exec expo start --clear",
     "lint": "pnpm exec eslint \"./**/*.{ts,tsx}\" --ignore-pattern \"src/**/*.test.ts\" --ignore-pattern \"src/**/*.test.tsx\"",
     "test": "pnpm exec vitest run",
-    "typecheck": "pnpm exec tsc -p tsconfig.json --noEmit"
+    "typecheck": "pnpm exec tsc -p tsconfig.json --noEmit",
+    "eas-build-post-install": "cd ../.. && pnpm --filter @operator-os/config build && pnpm --filter @operator-os/contracts build && test -f packages/config/dist/index.js && test -f packages/contracts/dist/index.js && echo 'workspace TS libs built'"
   },
   "dependencies": {
     "@microsoft/fetch-event-source": "^2.0.1",
