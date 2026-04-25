@@ -2550,3 +2550,343 @@ Agent pull model (agents claim tasks from a queue)
   Tasks Retry*, *Internal Route Authentication — Google OIDC
   ID Token*.
 - TD-031 (Redis round-robin), TD-033 (reliability scoring).
+
+## Mobile-To-Api Streaming — SSE (Phase 3.3)
+
+### Context
+
+Phase 3.3 needs server-to-mobile streaming so the user sees live
+agent output as it is produced. Phase 3.2 already runs a
+WebSocket between the api and the desktop-agent (control channel
++ task dispatch); the question is whether to reuse that protocol
+for the mobile → api leg or pick something new.
+
+The mobile leg is one-directional (server → client) once the
+task is submitted, and the client is on a battery-constrained
+device behind possibly-flaky networks. Cloud Run terminates HTTP
+requests at 60 minutes; long-running streams have to handle that
+boundary explicitly.
+
+### Decision
+
+Server-Sent Events (SSE) for the mobile → api streaming leg.
+
+The api emits frames over `GET /v1/tasks/:taskId/stream` with the
+standard `id:` / `event:` / `data:` lines. The client uses
+`@microsoft/fetch-event-source` (DP-1) so it can attach a Bearer
+token — the EventSource standard does not allow custom headers,
+which makes it unusable with our auth model.
+
+The bus → SSE handler in `apps/api/src/routes/tasks.ts` is the
+seam: it subscribes to `taskEventBus`, replays the
+Firestore-recorded deltas above the inbound `Last-Event-ID`, then
+forwards live events. Heartbeat comment frames go out every 25s
+(DP-3) so the Cloud Run idle timer never triggers mid-stream.
+
+### Consequences
+
+Positive
+- One-way streaming → simpler client. The library is ~200 LOC
+  and reconnects automatically on ECONNRESET.
+- Last-Event-ID is the standard SSE resume mechanism. Our `seq`
+  numbering doubles as the resume cursor, so reconnect = "skip
+  what you already have, replay the rest."
+- HTTP semantics: bearer auth, CORS, proxies, cloud Run
+  observability — all work without special handling.
+- The bus boundary is symmetric with the agent → api WS leg.
+  Both feed `taskEventBus` and never know about each other.
+
+Negative
+- Cloud Run 60-minute hard limit. Streams that exceed that
+  window need a client-driven reconnect (we pre-emptively
+  reconnect at 55 min). The c14 sse-client wrapper handles
+  this transparently.
+- `EventSource` doesn't carry a Bearer header, so we add a
+  third-party library (`@microsoft/fetch-event-source`). One
+  more npm dep on the mobile side. TD-043 tracks the
+  consolidation when the RN ecosystem catches up.
+- 401 mid-stream needs a 4th close reason (`reauth-needed`)
+  beyond the SSE library's natural `server-end | fatal |
+  aborted` so the screen can rotate the bearer and reconnect
+  with the same `Last-Event-ID`. Documented in the c14
+  wrapper.
+- In-memory event bus → multi-instance replay would lose
+  subscribers. TD-041 tracks the Redis migration trigger.
+
+### Alternatives considered
+
+WebSocket (the agent ↔ api protocol)
+- Pros: bidirectional already in the codebase; one transport
+  pattern across all surfaces; no Cloud Run timeout (well,
+  same limit applies).
+- Cons: bidirectional is overkill for the mobile read leg.
+  Reconnect state management is more complex than SSE's
+  Last-Event-ID. Auth handshake involves a custom subprotocol
+  or query-param bearer (CORS-fragile in browsers; Expo Web
+  hits this).
+- Rejected: simpler protocol matches simpler requirement; the
+  overlap with the agent leg isn't worth the extra surface.
+
+Long polling (`GET /v1/tasks/:taskId/output?since=<seq>`)
+- Pros: trivial protocol; works on every HTTP client; no
+  special server primitives.
+- Cons: latency is bounded below by the poll interval. At a
+  1-second poll, token-by-token streaming feels janky. At
+  100ms polling, the request rate kills mobile battery and
+  doubles the api QPS.
+- Rejected: latency unacceptable for the live-token UX.
+
+gRPC server streaming
+- Pros: strongly typed; multiplexed; the server-streaming RPC
+  primitive matches our use case exactly.
+- Cons: React Native ecosystem support for gRPC-Web is
+  fragile (no expo-managed package); adds a second transport
+  stack on the mobile side; tooling isn't where SSE/WebSocket
+  tooling is.
+- Rejected: ecosystem maturity gap.
+
+HTTP/2 server push
+- Pros: standard; multiplexed.
+- Cons: client APIs are limited (browsers + RN don't expose
+  push streams to user code in a usable way); Cloud Run edge
+  support is uneven; the standard is effectively dead in
+  browser-land.
+- Rejected: client-side support gap.
+
+### Implementation
+
+- `apps/api/src/services/task-event-bus.ts` (c1) — in-memory
+  fan-out bus.
+- `apps/api/src/routes/tasks.ts` (c3) — `reply.hijack()` SSE
+  handler with backpressure-safe writeQueue, heartbeat ticker,
+  and Firestore replay above Last-Event-ID.
+- `apps/api/src/app.ts` (c5) — task-callback bridge from the
+  agent-ws layer into the bus.
+- `apps/mobile/src/services/sse-client.ts` (c14) —
+  `connectSse()` wrapper over `@microsoft/fetch-event-source`
+  with the `'reauth-needed'` close reason for mid-stream
+  bearer rotation.
+- `apps/mobile/src/screens/task-stream-screen.tsx` (c14) —
+  drives connect / reconnect / Last-Event-ID forwarding from
+  store state.
+- `packages/contracts/src/ai/task-stream.ts` (c17) — single
+  source of truth for the on-the-wire frame shape.
+
+### References
+
+- DP-1: `@microsoft/fetch-event-source ^2.0.1`.
+- DP-2: in-memory event bus (TD-041 multi-instance migration).
+- DP-3: 25s heartbeat (Cloud Run 60-min boundary).
+- TD-041 (multi-instance event bus), TD-042 (Last-Event-ID
+  replay caching), TD-043 (mobile SSE polyfill consolidation).
+
+## ClaudeCodeAgent Integration — Phase 1.4 + Thin Adapter (Phase 3.3)
+
+### Context
+
+Phase 3.3 must turn the dispatch pipeline (Phase 3.2 — task lands
+on an agent) into actual model output. The desktop-agent already
+ships a `ClaudeCodeAgent` from Phase 1.4 that subprocess-spawns
+the `claude` CLI via execa, with a state machine, capability
+manifest, cost estimation, and a passing test suite. The choice
+is whether to use that, or to introduce a different execution
+strategy now.
+
+### Decision
+
+Use the existing Phase 1.4 `ClaudeCodeAgent` behind a thin
+TaskExecutor adapter. The adapter (~280 LOC) bridges the
+`AIAgent.executeTask` interface to the `ControlChannelWs`
+`TaskExecutor` interface that Phase 3.2 expects. The only
+addition to Phase 1.4 is a single public `awaitSettled()` method
+already present on the agent (no behaviour change, just exposure).
+
+A `CapturingStreamProvider` slots in front of the agent's
+existing `StreamProvider` contract: when the agent emits via
+`StreamProvider.createStream(...)`, the capture provider forwards
+each chunk to the WS task-delta sender for that task. No edits to
+Phase 1.4's emit path.
+
+A `DESKTOP_AGENT_EXECUTOR` env flag lets the dev / test
+environments fall back to an echo stub when no Anthropic API key
+is present, keeping the unit-test cycle independent of network +
+CLI install.
+
+### Consequences
+
+Positive
+- Phase 1.4 is already battle-tested. Re-using it preserves
+  the spawn / state-machine / capability work and keeps the
+  Phase 3.3 diff focused on integration.
+- The adapter is mechanical mapping. The risky moving parts
+  (subprocess, streaming, error normalization) stay in the
+  Phase 1.4 layer where they have unit coverage.
+- Echo-stub fallback decouples the test path from the real
+  Anthropic dependency. CI / dev never need an API key.
+- Phase 1.4's StreamProvider abstraction was designed for
+  capture-style integration — the c7 adapter slot was a
+  prediction Phase 1.4 made.
+
+Negative
+- Subprocess overhead per task (spawn + claude CLI startup ≈
+  300-800ms cold). Acceptable for MVP — most user-perceived
+  latency is the model itself.
+- Anthropic API key lives on the agent host, not on the api
+  side. Provisioning is a desktop concern (`.env` file), which
+  is fine for the operator-owned desktop architecture but
+  shifts the secret to the user's machine.
+- The Phase 1.4 contract surfaces a non-trivial `executeTask`
+  interface (manifest, capability descriptors, cost provider).
+  The adapter has to fabricate plausible defaults for fields
+  the dispatch layer doesn't know about (e.g., providerId).
+
+### Alternatives considered
+
+Embedded SDK call (`@anthropic-ai/sdk` directly from the agent)
+- Pros: no subprocess; first-class TypeScript types; tool-use
+  orchestration is server-controlled.
+- Cons: re-implements what the `claude` CLI already does
+  (file I/O sandboxing, MCP server orchestration,
+  conversation state). Loses the operator's expectation that
+  the agent uses the same `claude` they use interactively.
+- Rejected: feature regression vs Phase 1.4.
+
+REST direct call (skip the CLI; call the Anthropic API directly
+from the api server)
+- Pros: simplest dependency tree on the agent host (no CLI
+  install).
+- Cons: contradicts the operator-owned architecture — the
+  whole point of the desktop agent is that the *user's
+  machine* runs the agent and holds the API key. Cloud-side
+  execution turns the project into a SaaS proxy.
+- Rejected: violates trust model.
+
+WASM-bundled `claude`
+- Pros: a single binary cross-platform; no install step.
+- Cons: doesn't exist; not actionable; would require Anthropic
+  to publish a WASM build of the CLI.
+- Rejected: not actionable.
+
+Cloud-side execution (Cloud Run runs `claude`)
+- Pros: scalable; no local agent.
+- Cons: the API key would have to live in Cloud Run's secret
+  manager; the operator no longer owns execution; latency
+  goes up by one extra hop; the Phase 1 architectural
+  premise (operator's local box runs the agent) is violated.
+- Rejected: contradicts the project model.
+
+### Implementation
+
+- `apps/desktop-agent/src/agents/claude-code-agent/
+  task-executor-adapter.ts` (c7) — `CapturingStreamProvider` +
+  `createClaudeCodeAgentExecutor` factory.
+- `apps/desktop-agent/src/agents/claude-code-agent/
+  __tests__/task-executor-adapter.test.ts` (c8) — 6 tests for
+  the adapter.
+- `apps/desktop-agent/src/main.ts` (c9) —
+  `DESKTOP_AGENT_EXECUTOR` env flag with `claude-code` default
+  and `echo-stub` fallback. Top-level await constructs the
+  executor with `NodeFileSystemProvider` + `ApiCostProvider` +
+  `CapturingStreamProvider`.
+
+### References
+
+- Phase 1.4 ADR: *Desktop Agent Phase 1.4 Uses Incremental
+  Migration, Not Rewrite*.
+- TD-044 (future agent execution control hooks — cancel /
+  pause / resume).
+
+## Mobile State Management — Zustand (Phase 3.3 Confirmation)
+
+### Context
+
+Phase 1.5 chose Zustand for `useAuthStore`. Phase 3.3 adds
+`useTaskStore` (Phase 3.3 c10) and `useOperatorStore` was added
+earlier. Re-confirming Zustand for the new store happens at this
+gate so the choice is documented for the next contributor and so
+any pivot to RTK / Riverpod / Jotai is a deliberate decision
+rather than drift.
+
+### Decision
+
+Zustand for all mobile state stores. New stores follow the
+auth-store pattern: `createXxxStore(deps)` factory that the test
+exercises directly, plus a default singleton at the bottom of
+the module wired against the production deps.
+
+### Consequences
+
+Positive
+- One mental model across stores. Auth, operator, and task
+  stores share idioms (selectors, factory shape, singleton
+  wiring).
+- Tiny bundle (~1 kB gzipped) — important on Expo's bridge.
+- Hooks-friendly with no provider wrapping. Components select
+  with `useStore(s => s.field)` and re-render only on the
+  selected slice.
+- The factory + singleton split is testable. Tests build
+  isolated stores via `createTaskStore({...})`; production
+  uses the wired singleton.
+
+Negative
+- Singleton wiring at module top-level pulls react-native-only
+  modules (`expo-secure-store`, `@react-native-google-signin`)
+  through tokenStorage and the auth-store import chain. Test
+  files have to `vi.mock(...)` those modules at the top of the
+  file, which is one more thing to remember. The c12-fix
+  commit (729a762) is the canonical example.
+- No built-in middleware ecosystem like Redux Toolkit.
+  Time-travel debugging, persistence, optimistic updates etc.
+  are user-built. We have not needed any of these at MVP scale.
+
+### Alternatives considered
+
+Redux Toolkit
+- Pros: time-travel debug; RTK Query for HTTP caching;
+  enormous ecosystem; great DevTools.
+- Cons: more boilerplate (`createSlice`, action creators,
+  reducers); the auth-store work would have to be migrated;
+  the boilerplate vs Zustand is real.
+- Rejected: the existing Zustand store is the precedent and
+  the boilerplate cost isn't justified at MVP.
+
+Riverpod (or any DI-flavoured provider library)
+- Pros: provider scoping; explicit dependency injection;
+  excellent for medium / large apps.
+- Cons: requires migration of the existing stores; steeper
+  learning curve for contributors who know Redux/Zustand;
+  ecosystem on RN is smaller than Zustand's.
+- Rejected: migration cost without clear MVP benefit.
+
+`React.Context` + `useReducer`
+- Pros: zero deps; native React; sufficient for tiny apps.
+- Cons: re-render perf at scale (no selector model); manual
+  memoization; worse DX than Zustand selectors. Not enough
+  ceiling for an app with auth + operator + task views.
+- Rejected: insufficient for the medium-app posture.
+
+Jotai
+- Pros: atomic state; minimal API; reactive composition.
+- Cons: different mental model from the existing Zustand
+  stores; would create a mixed paradigm in the codebase.
+- Rejected: consistency wins.
+
+### Implementation
+
+- `apps/mobile/src/state/auth-store.ts` (Phase 1.5) — original
+  Zustand store + factory + singleton pattern.
+- `apps/mobile/src/state/task-store.ts` (Phase 3.3 c10) —
+  follows the same pattern. Tracks `submissionStatus`,
+  per-task view models, delta-idempotent `appendDelta`,
+  terminal `completeTask` / `failTask`.
+- `apps/mobile/src/state/task-store.test.ts` — same vi.mock
+  pattern as auth-store.test.ts so the singleton wiring
+  doesn't crash vitest's rolldown parser on react-native's
+  Flow-syntax index.
+
+### References
+
+- Phase 1.5 ADR: *Mobile Phase 1.5 Adds Auth Alongside, Does
+  Not Rewrite Navigation*.
+- c12-fix commit 729a762 — vi.mock pattern for stores that
+  pull RN-only modules through their singleton.
