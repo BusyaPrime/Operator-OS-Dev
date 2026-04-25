@@ -350,17 +350,19 @@ describe('GET /v1/tasks (list)', () => {
   });
 });
 
-describe('GET /v1/tasks/:taskId/stream (Phase 3.1 stub)', () => {
-  it('returns 501 with the not-implemented marker body', async () => {
+describe('GET /v1/tasks/:taskId/stream — Phase 3.3', () => {
+  it('rejects an unauthenticated request with 401 (real handler replaced the Phase 3.1 501 stub)', async () => {
+    // Phase 3.1 had a 501 stub here. Phase 3.3 c3 replaced it with
+    // the real SSE handler, which is gated by userGuard. The 501 +
+    // not-implemented marker body no longer exist; an unauthenticated
+    // GET hits the auth boundary first and returns 401. Full SSE
+    // behaviour is covered in `tasks-stream.test.ts`.
     const app = buildServer(buildEnv());
     const response = await app.inject({
       method: 'GET',
       url: `/v1/tasks/${randomUUID()}/stream`
     });
-    expect(response.statusCode).toBe(501);
-    const body = response.json();
-    expect(body.code).toBe('not_implemented');
-    expect(body.phase).toBe('3.3');
+    expect(response.statusCode).toBe(401);
     await app.close();
   });
 });
