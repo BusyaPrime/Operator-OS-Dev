@@ -6,6 +6,7 @@ import { IntegrationError } from './integrations/runtime.js';
 import { SigningSecretLoader } from './integrations/signing-secret.js';
 import { buildReadinessResponse } from './readiness.js';
 import { registerAuthRoutes } from './routes/auth.js';
+import { registerDevMintRoutes } from './routes/dev-mint.js';
 import { registerHealthRoutes } from './routes/health.js';
 import { GoogleIdTokenVerifier } from './services/google-id-token-verifier.js';
 import { JwtIssuer } from './services/jwt-issuer.js';
@@ -124,6 +125,10 @@ export const buildServer = (
     refreshService,
     signinService,
     signoutService
+  });
+  void registerDevMintRoutes(app, {
+    config,
+    jwtIssuer
   });
 
   return app;
