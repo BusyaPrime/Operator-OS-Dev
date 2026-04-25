@@ -9,6 +9,7 @@ import {
 
 import { ScreenShell } from '../components/screen-shell';
 import { SectionCard } from '../components/section-card';
+import type { TasksStackParamList } from '../navigation/types';
 import { useTaskStore } from '../state/task-store';
 import { colors, spacing, typography } from '../theme/tokens';
 
@@ -16,6 +17,8 @@ import {
   generateIdempotencyKey,
   performTaskSubmit
 } from './task-submit-helpers.js';
+
+import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 
 /**
  * Capability chips offered to the user. Subset of
@@ -35,13 +38,16 @@ const CAPABILITY_OPTIONS: readonly string[] = [
 
 const PROMPT_MAX_CHARS = 50_000;
 
-interface NavigationLike {
-  navigate(name: 'TaskStream', params: { readonly taskId: string }): void;
-}
-
-export interface TaskSubmitScreenProps {
-  readonly navigation: NavigationLike;
-}
+/**
+ * Strict navigator-supplied props. The screen only ever calls
+ * `navigation.navigate('TaskStream', { taskId })` — but we accept
+ * the full props shape so React Navigation's type-checker is
+ * satisfied at the navigator wire-up.
+ */
+export type TaskSubmitScreenProps = NativeStackScreenProps<
+  TasksStackParamList,
+  'TaskSubmit'
+>;
 
 export function TaskSubmitScreen({ navigation }: TaskSubmitScreenProps) {
   const submitTask = useTaskStore((s) => s.submitTask);

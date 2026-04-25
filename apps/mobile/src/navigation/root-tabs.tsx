@@ -7,6 +7,8 @@ import { SessionsScreen } from '../screens/sessions-screen';
 import { SettingsScreen } from '../screens/settings-screen';
 import { colors } from '../theme/tokens';
 
+import { TasksStack } from './tasks-stack';
+
 const Tab = createBottomTabNavigator();
 
 export function RootTabs() {
@@ -26,6 +28,7 @@ export function RootTabs() {
       }}
     >
       <Tab.Screen component={HomeScreen} name="Home" />
+      <Tab.Screen component={TasksStack} name="Tasks" />
       <Tab.Screen component={DevicesScreen} name="Devices" />
       <Tab.Screen component={SessionsScreen} name="Sessions" />
       <Tab.Screen component={CostsScreen} name="Costs" />

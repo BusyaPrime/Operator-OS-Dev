@@ -13,6 +13,7 @@ import { ScreenShell } from '../components/screen-shell';
 import { SectionCard } from '../components/section-card';
 import { StatusPill } from '../components/status-pill';
 import { tokenStorage } from '../auth/token-storage.js';
+import type { TasksStackParamList } from '../navigation/types';
 import { connectSse, type SseConnection } from '../services/sse-client.js';
 import { createAuthClient } from '../services/auth-client.js';
 import { useAuthStore } from '../state/auth-store.js';
@@ -21,14 +22,16 @@ import { colors, spacing, typography } from '../theme/tokens';
 
 import { processStreamMessage } from './task-stream-helpers.js';
 
-interface NavigationLike {
-  goBack(): void;
-}
+import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 
-export interface TaskStreamScreenProps {
-  readonly navigation: NavigationLike;
-  readonly route: { readonly params: { readonly taskId: string } };
-}
+/**
+ * Strict navigator-supplied props. The screen reads
+ * `route.params.taskId` and calls `navigation.goBack()`.
+ */
+export type TaskStreamScreenProps = NativeStackScreenProps<
+  TasksStackParamList,
+  'TaskStream'
+>;
 
 const STATUS_TONE: Record<
   string,
