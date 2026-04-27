@@ -3066,7 +3066,7 @@ Discovered: 2026-04-25 (Phase 3.3 c14 — DP-1 added
     `@microsoft/fetch-event-source ^2.0.1`)
 Type: dependency / cleanup
 Priority: P3
-Status: open
+Status: closed (superseded by TD-054 fix)
 Trigger: when the React Native ecosystem adds native
     `EventSource` support with custom-header attachment, OR
     when `@microsoft/fetch-event-source` becomes unmaintained.
@@ -3635,7 +3635,7 @@ Discovered: 2026-04-25 (Phase 3.4 R23 end-to-end smoke test —
     "Cannot read property 'getReader' of undefined")
 Type: dependency / runtime crash
 Priority: P1
-Status: open
+Status: closed
 Trigger: P1 — blocks the mobile streaming display; backend pipe
     is fully proven so this is the only mobile-side gap left
     before the manual smoke is fully green.
@@ -3722,6 +3722,12 @@ a real task, AND `@microsoft/fetch-event-source` is gone from
 
 - 2026-04-25: filed at Phase 3.4 close after end-to-end smoke
   exposed the runtime crash.
+- 2026-04-27: closed by `BusyaPrime/operator-os-mobapp@0708760`
+  (`fix(sse): swap to react-native-sse from
+  @microsoft/fetch-event-source`). 118/118 mobile tests pass on
+  main. Mobile UI streams the agent reply end-to-end; the
+  parent TD-043 ("audit @microsoft/fetch-event-source eventually")
+  also closes since the dep is gone.
 
 ## TD-055: Rotate `ANTHROPIC_API_KEY` (transcript leak)
 
