@@ -27,5 +27,13 @@ Thumbs.db
 google-services.json
 GoogleService-Info.plist
 
+# Expo prebuild output for the in-repo apps/mobile/* path —
+# generated locally, never committed. The standalone mobile
+# repo (BusyaPrime/operator-os-mobapp) handles real builds via
+# EAS, so this dir is purely a transient artefact when someone
+# runs `expo prebuild` against the monorepo mobile app.
+apps/mobile/android/
+apps/mobile/ios/
+
 # Claude Code local harness state (not part of repo)
 .claude/

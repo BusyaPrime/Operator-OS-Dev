@@ -16,6 +16,7 @@
     "@google-cloud/vertexai": "^1.10.0",
     "@operator-os/config": "workspace:*",
     "@operator-os/contracts": "workspace:*",
+    "bcryptjs": "^3.0.3",
     "dotenv": "^17.2.3",
     "fastify": "^5.6.1",
     "firebase-admin": "^13.8.0",
@@ -33,6 +34,7 @@
     "typecheck": "pnpm exec tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {
+    "@types/bcryptjs": "^3.0.0",
     "@types/ws": "^8.18.1"
   }
 }

@@ -6,7 +6,13 @@ import { AccessTokenSecretLoader } from './integrations/signing-secret.js';
 import { AccessTokenVerifier } from './integrations/access-token-verifier.js';
 import { BigQueryAnalyticsWriter } from './integrations/bigquery.js';
 import { FirebaseAuthService } from './integrations/auth.js';
+import { createAgentTokenGuard } from './integrations/agent-token-guard.js';
+import { LoggingAuditWriter } from './integrations/audit-log.js';
 import { FirestoreOperatorRepository } from './integrations/firestore.js';
+import {
+  FirestoreAgentRepository,
+  type AgentRepository
+} from './integrations/firestore-agent-repository.js';
 import { PubSubPublisher } from './integrations/pubsub.js';
 import { SecretManagerAccessor } from './integrations/secrets.js';
 import { GcsStorageService } from './integrations/storage.js';
@@ -26,6 +32,7 @@ import {
   registerInternalTasksRoutes,
   type DispatchHandler
 } from './routes/internal-tasks.js';
+import { registerAgentRegistrationRoutes } from './routes/agent-registration.js';
 import { registerOperatorRoutes } from './routes/operator.js';
 import { registerTaskRoutes } from './routes/tasks.js';
 import {
@@ -58,6 +65,13 @@ interface BuildServerOptions {
    * wants it on (Cloud Run terminates TLS upstream).
    */
   trustProxy?: boolean;
+  /**
+   * Phase 4.0 agent registration injection seam. Tests pass an
+   * in-memory fake; production omits to take the real
+   * FirestoreAgentRepository (which has no fallback because
+   * agents are auth root-of-trust).
+   */
+  agentRepository?: AgentRepository;
 }
 
 export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) => {
@@ -496,6 +510,28 @@ export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) =>
     apiBaseUrl: agentAudience,
     dispatchPublisher: taskDispatchPublisher,
     taskEventBus
+  });
+
+  // Phase 4.0 Part 3 — agent registration routes. Plugs the
+  // FirestoreAgentRepository into the same auth-service path
+  // the user routes use for the userGuard, and an
+  // agent-token guard backed by the same repository for the
+  // agent-only rotate-token route. Audit emit goes through
+  // the LoggingAuditWriter stub (TD-057 swaps in BigQuery).
+  const agentRepository: AgentRepository =
+    options.agentRepository ?? new FirestoreAgentRepository(config, app.log);
+  const agentAuditWriter = new LoggingAuditWriter(app.log);
+  const agentTokenGuard = createAgentTokenGuard({
+    repository: agentRepository,
+    audit: agentAuditWriter
+  });
+  void registerAgentRegistrationRoutes(app, {
+    lifecycleRepository: agentRepository,
+    audit: agentAuditWriter,
+    userGuard: authService.createRequiredGuard(),
+    agentTokenGuard: agentTokenGuard.preHandler,
+    invalidateAgentTokenCache: agentTokenGuard.invalidateAgent,
+    currentAgentVersion: config.API_SERVICE_VERSION
   });
   void registerInternalTasksRoutes(app);
 
