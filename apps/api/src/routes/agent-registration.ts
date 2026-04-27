@@ -6,7 +6,6 @@ import {
   agentListResponseSchema,
   agentRegisterRequestSchema,
   agentRegisterResponseSchema,
-  agentRevokeResponseSchema,
   agentRotateTokenResponseSchema,
   agentStatusResponseSchema,
   type AgentRecord,
@@ -106,9 +105,6 @@ export const registerAgentRegistrationRoutes = async (
   // Suppress lint warnings for currently-unused options that
   // the next route commits will pick up. They're here in the
   // interface so 3.D, 3.E, 3.F, 3.G can share one wiring point.
-  void options.currentAgentVersion;
-  void agentRevokeResponseSchema;
-  void agentLatestVersionResponseSchema;
 
   // POST /v1/agent/register — bind a desktop agent identity to
   // the authenticated user, mint the opaque token, and persist
@@ -400,4 +396,103 @@ export const registerAgentRegistrationRoutes = async (
       );
     }
   );
+
+  // DELETE /v1/agent/:agentId — revoke. Owner-only; the
+  // agent's existing WS connection (if any) gets disconnected
+  // by the next failed auth check in the guard's cache TTL
+  // window. The revoke is a Firestore field flip: tokenHash
+  // stays so audit forensics can correlate post-revoke
+  // attempts to the token they were using.
+  app.delete(
+    '/v1/agent/:agentId',
+    { preHandler: options.userGuard },
+    async (request, reply) => {
+      const userId = request.authSession?.currentUser?.operatorId;
+      if (userId === undefined || userId.length === 0) {
+        reply.status(401);
+        return routeError(
+          'unauthorized',
+          'Authenticated session required'
+        );
+      }
+
+      const params = request.params as { agentId?: string };
+      const agentId = params.agentId;
+      if (typeof agentId !== 'string' || agentId.length === 0) {
+        reply.status(400);
+        return routeError('bad_request', 'agentId path param is required');
+      }
+
+      const existing = await options.lifecycleRepository.getById(agentId);
+      if (existing === undefined || existing.userId !== userId) {
+        reply.status(404);
+        return routeError('agent_not_found', `Agent ${agentId} not found`);
+      }
+
+      const startedAt = Date.now();
+      try {
+        await options.lifecycleRepository.markRevoked(
+          agentId,
+          'user-initiated revoke from /v1/agent/:agentId DELETE'
+        );
+
+        try {
+          await options.audit.record({
+            agentId,
+            userId,
+            eventType: 'agent_revoked',
+            latencyMs: Date.now() - startedAt,
+            ip: request.ip,
+            userAgent:
+              typeof request.headers['user-agent'] === 'string'
+                ? request.headers['user-agent']
+                : undefined
+          });
+        } catch {
+          /* swallowed — audit is best-effort */
+        }
+
+        reply.status(204);
+        return reply.send();
+      } catch (err) {
+        if (err instanceof AgentsCollectionUnavailableError) {
+          if (err.code === 'AGENT_NOT_FOUND') {
+            reply.status(404);
+            return routeError('agent_not_found', err.message);
+          }
+          reply.status(503);
+          return routeError(
+            'agents_collection_unavailable',
+            err.message,
+            { code: err.code }
+          );
+        }
+        request.log.error(
+          { err, agentId, userId },
+          'agent revoke failed'
+        );
+        reply.status(503);
+        return routeError(
+          'agents_collection_unavailable',
+          'Agent revoke failed'
+        );
+      }
+    }
+  );
+
+  // GET /v1/agent/latest-version — public endpoint the
+  // desktop agent's update loop hits daily. Phase 4.0 ships
+  // a stub: downloadUrl + signature both null, so the
+  // agent-side update logic is a no-op. The real signed-
+  // update pipeline is TD-059 (deferred past Phase 4.0).
+  app.get('/v1/agent/latest-version', async () => {
+    const response = {
+      version: options.currentAgentVersion,
+      downloadUrl: null,
+      signature: null,
+      releaseNotes:
+        'Phase 4.0 ships with self-update disabled. See TD-059 for the signed-update pipeline.'
+    };
+    return agentLatestVersionResponseSchema.parse(response);
+  });
 };

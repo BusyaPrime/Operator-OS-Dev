@@ -1029,6 +1029,248 @@ describe('GET /v1/agent/:agentId/status', () => {
   });
 });
 
+// --- Part 3.G: revoke + latest-version --------------------------------
+
+describe('DELETE /v1/agent/:agentId — happy path', () => {
+  it('marks the record revoked, returns 204, emits agent_revoked audit', async () => {
+    const existing = buildAgentRecord();
+    const app = Fastify({ logger: false });
+    const repoState: FakeRepoState = {
+      records: new Map([[FIXTURE_AGENT_ID, existing]]),
+      createCalls: []
+    };
+    const repo = buildFakeLifecycleRepository(repoState);
+    repo.markRevoked = async (agentId, reason) => {
+      const before = repoState.records.get(agentId);
+      if (!before) {
+        throw new AgentsCollectionUnavailableError(
+          'AGENT_NOT_FOUND',
+          `Agent ${agentId} not found`
+        );
+      }
+      const now = FIXTURE_NOW.toISOString();
+      const updated: AgentRecord = {
+        ...before,
+        revoked: true,
+        revokedAt: now,
+        revokedReason: reason,
+        updatedAt: now
+      };
+      repoState.records.set(agentId, updated);
+      return updated;
+    };
+    const audit = buildAuditSpy();
+    const userGuard = async (
+      request: Parameters<Parameters<typeof app.addHook>[1]>[0]
+    ): Promise<void> => {
+      (request as unknown as {
+        authSession?: { currentUser?: { operatorId: string } };
+        currentUser?: { operatorId: string };
+      }).authSession = { currentUser: { operatorId: FIXTURE_USER_ID } };
+    };
+    await registerAgentRegistrationRoutes(app, {
+      lifecycleRepository: repo,
+      audit,
+      userGuard,
+      agentTokenGuard: async () => {
+        /* unused */
+      },
+      currentAgentVersion: '0.1.0',
+      now: () => FIXTURE_NOW,
+      generateRawToken: () => 'unused'
+    });
+
+    const response = await app.inject({
+      method: 'DELETE',
+      url: `/v1/agent/${FIXTURE_AGENT_ID}`
+    });
+
+    expect(response.statusCode).toBe(204);
+    // 204 must have no body.
+    expect(response.body).toBe('');
+
+    const persisted = repoState.records.get(FIXTURE_AGENT_ID)!;
+    expect(persisted.revoked).toBe(true);
+    expect(persisted.revokedAt).toBe(FIXTURE_NOW.toISOString());
+    expect(persisted.revokedReason).toMatch(/user-initiated revoke/);
+
+    expect(audit.events).toHaveLength(1);
+    expect(audit.events[0]).toMatchObject({
+      agentId: FIXTURE_AGENT_ID,
+      userId: FIXTURE_USER_ID,
+      eventType: 'agent_revoked'
+    });
+
+    await app.close();
+  });
+});
+
+describe('DELETE /v1/agent/:agentId — auth + ownership + errors', () => {
+  it('returns 401 when no operator session is present', async () => {
+    const { app } = await buildReadApp([buildAgentRecord()], {
+      operatorId: undefined
+    });
+    const response = await app.inject({
+      method: 'DELETE',
+      url: `/v1/agent/${FIXTURE_AGENT_ID}`
+    });
+    expect(response.statusCode).toBe(401);
+    await app.close();
+  });
+
+  it('returns 404 when the agent does not exist', async () => {
+    const { app } = await buildReadApp([], {
+      operatorId: FIXTURE_USER_ID
+    });
+    const response = await app.inject({
+      method: 'DELETE',
+      url: '/v1/agent/99999999-9999-4999-8999-999999999999'
+    });
+    expect(response.statusCode).toBe(404);
+    await app.close();
+  });
+
+  it('returns 404 when the agent is owned by a different user (no leak)', async () => {
+    const theirs = buildAgentRecord({ userId: 'someone-else' });
+    const { app } = await buildReadApp([theirs], {
+      operatorId: FIXTURE_USER_ID
+    });
+
+    const response = await app.inject({
+      method: 'DELETE',
+      url: `/v1/agent/${FIXTURE_AGENT_ID}`
+    });
+    expect(response.statusCode).toBe(404);
+    expect(response.json()).toMatchObject({ code: 'agent_not_found' });
+
+    await app.close();
+  });
+
+  it('returns 503 when markRevoked surfaces FIRESTORE_UNAVAILABLE', async () => {
+    const existing = buildAgentRecord();
+    const app = Fastify({ logger: false });
+    const repoState: FakeRepoState = {
+      records: new Map([[FIXTURE_AGENT_ID, existing]]),
+      createCalls: []
+    };
+    const repo = buildFakeLifecycleRepository(repoState);
+    repo.markRevoked = async () => {
+      throw new AgentsCollectionUnavailableError(
+        'FIRESTORE_UNAVAILABLE',
+        'Firestore down'
+      );
+    };
+    const userGuard = async (
+      request: Parameters<Parameters<typeof app.addHook>[1]>[0]
+    ): Promise<void> => {
+      (request as unknown as {
+        authSession?: { currentUser?: { operatorId: string } };
+      }).authSession = { currentUser: { operatorId: FIXTURE_USER_ID } };
+    };
+    await registerAgentRegistrationRoutes(app, {
+      lifecycleRepository: repo,
+      audit: buildAuditSpy(),
+      userGuard,
+      agentTokenGuard: async () => {
+        /* unused */
+      },
+      currentAgentVersion: '0.1.0',
+      now: () => FIXTURE_NOW,
+      generateRawToken: () => 'unused'
+    });
+
+    const response = await app.inject({
+      method: 'DELETE',
+      url: `/v1/agent/${FIXTURE_AGENT_ID}`
+    });
+    expect(response.statusCode).toBe(503);
+    expect(response.json().details?.code).toBe('FIRESTORE_UNAVAILABLE');
+
+    await app.close();
+  });
+
+  it('returns 503 generic when markRevoked throws an unknown Error', async () => {
+    const existing = buildAgentRecord();
+    const app = Fastify({ logger: false });
+    const repoState: FakeRepoState = {
+      records: new Map([[FIXTURE_AGENT_ID, existing]]),
+      createCalls: []
+    };
+    const repo = buildFakeLifecycleRepository(repoState);
+    repo.markRevoked = async () => {
+      throw new Error('totally unknown disaster');
+    };
+    const userGuard = async (
+      request: Parameters<Parameters<typeof app.addHook>[1]>[0]
+    ): Promise<void> => {
+      (request as unknown as {
+        authSession?: { currentUser?: { operatorId: string } };
+      }).authSession = { currentUser: { operatorId: FIXTURE_USER_ID } };
+    };
+    await registerAgentRegistrationRoutes(app, {
+      lifecycleRepository: repo,
+      audit: buildAuditSpy(),
+      userGuard,
+      agentTokenGuard: async () => {
+        /* unused */
+      },
+      currentAgentVersion: '0.1.0',
+      now: () => FIXTURE_NOW,
+      generateRawToken: () => 'unused'
+    });
+
+    const response = await app.inject({
+      method: 'DELETE',
+      url: `/v1/agent/${FIXTURE_AGENT_ID}`
+    });
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toMatchObject({
+      code: 'agents_collection_unavailable',
+      message: 'Agent revoke failed'
+    });
+
+    await app.close();
+  });
+});
+
+describe('GET /v1/agent/latest-version', () => {
+  it('returns 200 with the stub shape (downloadUrl + signature null)', async () => {
+    const { app } = await buildReadApp([], { operatorId: FIXTURE_USER_ID });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/v1/agent/latest-version'
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.version).toBe('0.1.0');
+    expect(body.downloadUrl).toBeNull();
+    expect(body.signature).toBeNull();
+    expect(body.releaseNotes).toMatch(/TD-059/);
+
+    await app.close();
+  });
+
+  it('is reachable without authentication (public endpoint)', async () => {
+    // No userGuard / no agent token — the route itself doesn't
+    // attach a preHandler. Verify the unauthenticated path
+    // returns 200, not 401.
+    const { app } = await buildReadApp([], {
+      operatorId: undefined
+    });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/v1/agent/latest-version'
+    });
+
+    expect(response.statusCode).toBe(200);
+
+    await app.close();
+  });
+});
+
 describe('POST /v1/agent/register — audit resilience', () => {
   it('still returns 201 when the audit writer throws', async () => {
     const app = Fastify({ logger: false });
