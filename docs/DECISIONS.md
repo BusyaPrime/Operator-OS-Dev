@@ -3035,3 +3035,460 @@ B.3 — Hybrid (real + dev mint fallback)
 - @react-native-google-signin/google-signin v13+ Credential
   Manager docs: webClientId + Android signing SHA-1 are the only
   required production-side configuration.
+
+## Agent Productionization — Auth, Online Status, Startup, Legacy Sunset (Phase 4.0)
+
+### Context
+
+Phase 3.3 / Phase 3.4 / Phase 3.4.1 closed the mobile streaming
+loop end-to-end: a real user signs in via Google, submits a task,
+and watches a live SSE stream of Claude execution. The desktop
+agent that does the actual execution, however, is still in
+development posture per the Phase 4.0 Part 1 survey
+(2026-04-27):
+
+- The agent connects to the api WS using a one-hour user JWT
+  pulled out of the mobile keychain (or, post-3.4.1, minted
+  locally from the gateway signing secret). The token expires
+  hourly. Manual refresh is required. PC reboot loses the
+  process.
+- The REST agent surface
+  (`POST /v1/agent/heartbeat`, `POST /v1/agent/heartbeat/agent`,
+  `GET /v1/agent/commands`) sends no `Authorization` header at
+  all, so every tick currently fails with 401 (TD-056). Only
+  the WS path is functionally wired.
+- The Claude CLI on the host is already authenticated against
+  the Max OAuth session
+  (`~/.claude/.credentials.json` → `claudeAiOauth`). The
+  subprocess the agent spawns inherits the parent process's
+  env, so it picks up Max session OAuth automatically — but
+  the dead `ANTHROPIC_API_KEY` line in the agent `.env` could
+  silently switch behaviour if anyone ever passed `--bare`.
+- The api's in-memory `AgentSessionRegistry` (per Phase 3.2 ADR
+  *Agent WebSocket Sessions Are In-Memory*) means a Cloud Run
+  cold-start or scale-to-zero loses every agent's session — for
+  Phase 3 single-user dev that was acceptable, but always-on
+  agents need durable identity.
+- There is no Windows boot integration. Agent restart on PC
+  reboot or crash requires a manual terminal session.
+
+For a production-grade always-on agent we need: durable
+identity, long-lived auth, hands-off boot integration, mobile-
+visible online status, and a clear sunset path for the legacy
+REST endpoints that nothing actually uses.
+
+The Part 1 survey produced four decisions (D1–D4 below) and an
+R12 halt for confirmation. Akmal confirmed all four with hard-
+mode enhancements (rotation + audit + scoping for D1; trichotomy
++ Pub/Sub fan-out for D2; crash recovery + self-update for D3;
+30-day deprecation window for D4).
+
+### Decision
+
+**D1 — Per-machine opaque token, registered once, stored in
+Windows Credential Manager.**
+
+- 32-byte random token, base64url encoded, presented as
+  `Authorization: Bearer <token>` on every request (WS upgrade
+  + REST).
+- Server stores `bcrypt(token, cost=12)` in a new Firestore
+  collection `agents/{agentId}` alongside the agent's user
+  binding, machine name, capabilities, online state, and
+  rotation metadata.
+- Client stores the raw token in Windows Credential Manager
+  under target `OperatorOS:agent-token` (DPAPI-protected per-
+  user blob; no plaintext on disk).
+- Bootstrap is a one-time CLI flow:
+  `pnpm --filter desktop-agent register` — the agent prompts
+  for a user JWT (paste from mobile or gateway sign-in), calls
+  `POST /v1/agent/register`, stores the returned raw token,
+  and self-tests by connecting the WS once.
+- Rotation: server hints at rotation when the token's age
+  crosses 30 days **or** its bcrypt-counter use-count crosses
+  100K. Agent calls `POST /v1/agent/rotate-token` proactively;
+  the old token stays valid for a 24h overlap window so a
+  rolling fleet of agents never sees a transient 401.
+- Audit: every auth event (success / failure / rotation /
+  revocation) is appended to BigQuery dataset
+  `operator_os_dev_audit.agent_auth` with timestamp + agent_id +
+  event_type + ip + user_agent + success + latency_ms +
+  optional error_code.
+- Scoping: token claims include the agent's declared
+  capabilities array; the server enforces per-action
+  permissions on the WS task-assign path (an agent that only
+  declared `code-generation` can't accept `shell-execution`).
+- Revocation: user calls `DELETE /v1/agent/{id}` from the
+  mobile UI; the server flips `revoked=true` in the Firestore
+  doc, and the next auth check returns 401, which the agent
+  treats as fatal-exit (user must re-register on the host).
+
+**D2 — Online status is derived from the WS connection itself,
+not a separate REST heartbeat.**
+
+- The api sets `agents/{id}.online=true` and updates
+  `lastConnectAt` on every successful WS welcome.
+- The existing 30-second WS server-side ping (`agent-ws.ts:195`)
+  doubles as the heartbeat: each pong updates
+  `lastHeartbeatAt` in Firestore.
+- WS close → `online=false`, `lastDisconnectAt` recorded,
+  category captured (network / server / client / intentional).
+- Mobile derives a trichotomy:
+  - `online`     if `lastHeartbeatAt > now - 90s`
+  - `degraded`   if online AND `p95(rtt_5min) > 200ms`
+  - `offline`    if `lastHeartbeatAt < now - 90s`
+- Cross-instance coordination: every Cloud Run instance writes
+  to Firestore (single source of truth), and any state
+  transition publishes a message to a new Pub/Sub topic
+  `agent-status-changes` so the mobile app can subscribe via
+  SSE for live updates instead of polling.
+- The api provides `GET /v1/agent/list` (all agents owned by
+  the user) and `GET /v1/agent/{id}/status` (single agent
+  with RTT histogram). Mobile uses both.
+
+**D3 — Windows Scheduled Task, triggered "at log on of any
+user", restart-on-failure, runs as the user (NOT SYSTEM).**
+
+- One scheduled task per machine, named `OperatorOS Agent`,
+  registered via `schtasks /create /xml` from
+  `scripts/install-agent-autostart.ps1`.
+- Trigger: at log on of any user. Action: `powershell.exe
+  -File %APPDATA%\operator-os\start-agent.ps1`.
+- Restart on failure: 3 retries at 1-min intervals (built-in
+  schtasks setting). On 10 consecutive failures the task
+  disables auto-restart and writes a Windows Event Log entry.
+- Run-as: the user account that installed it. SYSTEM is
+  rejected because the Claude CLI's Max OAuth credentials
+  live under the user's profile and SYSTEM cannot read them.
+- Self-update: a daily-cron child step calls
+  `GET /v1/agent/latest-version`; if a newer version is
+  published, the agent downloads to a staging dir, verifies a
+  detached signature against the public key bundled in the
+  agent itself, swaps the binary, and rolls back if the new
+  binary fails its post-swap health check.
+- Logging: the wrapper script tees stdout/stderr to a daily-
+  rotated file at `%APPDATA%\operator-os\logs\agent-
+  YYYYMMDD.log`. Startup and crash events also go to the
+  Windows Event Log under source `OperatorOS Agent`.
+
+**D4 — Deprecate the legacy REST endpoints; the WS is the
+single agent control surface.**
+
+- Affected paths:
+  - `POST /v1/agent/heartbeat`
+  - `POST /v1/agent/heartbeat/agent`
+  - `GET  /v1/agent/commands`
+- Phase 4.0 ship: each route returns the standard deprecation
+  trio of headers — `Deprecation: true`,
+  `Sunset: 2026-05-25` (30 days from Phase 4.0 ship),
+  `Link: </docs/MIGRATION-V4>; rel="deprecation"` — and
+  records request count to the audit log so we can confirm
+  zero-usage before sunset.
+- Phase 4.1 (after `Sunset`): the routes return `410 Gone`
+  with a body pointing at the WS. They stay routable for a
+  further window so anyone with cached client code gets a
+  clear error instead of a confusing 404.
+- Phase 5+: routes removed entirely.
+- Replacement: device state, command polling, and exports all
+  fan in through the WS (`task-progress`, `task-delta`,
+  `task-completed`, `task-failed` frames). Status reads happen
+  via `GET /v1/agent/{id}/status` (read-only, user JWT auth).
+
+### Rationale
+
+Auth model (D1). Three options were on the table: long-lived
+JWT, refresh-token rotation analogous to the mobile flow, and
+opaque per-machine tokens. The opaque token wins on three
+axes that matter more than its single weakness:
+
+- *Revocation*. The mobile flow already has a refresh-token
+  story, but revoking a single agent without affecting the
+  user's mobile session means we'd need an agent-scoped
+  refresh row and a per-row revocation list. With opaque
+  tokens, "revoke" is a single `revoked=true` Firestore field
+  flip. No JWT denylist, no key rotation cascading through
+  the gateway.
+- *Bootstrap simplicity*. A one-time `register` call followed
+  by Credential Manager storage is a single onboarding step
+  the user runs once per machine. Refresh-token rotation
+  would need both the bootstrap *and* a working rotation
+  loop, doubling the surface area where setup can fail.
+- *Blast-radius story*. A leaked agent token only opens that
+  one agent's permissions on that one user. A leaked user
+  refresh token opens the entire mobile session. The agent
+  permissions are also scoped (capabilities array in the
+  Firestore doc), so an agent registered as `code-generation`
+  only can't be used to e.g. read files even if the token
+  leaks.
+
+The single weakness — a Firestore lookup per auth — is
+mitigated by a small in-process LRU cache (token-prefix → bcrypt
+match) so repeated requests on a long-lived WS don't re-hit
+Firestore. Bcrypt cost 12 means a fresh evaluation takes ~250
+ms; cached evaluations are µs.
+
+Online status (D2). A separate heartbeat REST endpoint adds an
+endpoint, a schedule, and a code path to maintain — all to
+report a fact the WS connection already proves continuously.
+Deriving from the WS removes that surface, eliminates the
+clock-skew window between "last heartbeat seen" and "WS
+actually disconnected", and uses the existing 30-second ping
+the api already sends. Pub/Sub fan-out lets the mobile see
+state transitions in <1s instead of waiting for a 30s polling
+cycle, which matters for the user experience of "is my agent
+up?". The trichotomy (online / degraded / offline) gives the
+mobile UI a meaningful "yellow" state instead of a binary
+green/red, and the RTT data is useful operational telemetry.
+
+Startup (D3). Scheduled Task is the only option compatible
+with both auto-restart-on-crash *and* user-context (which is
+required for the Claude CLI's OAuth). NSSM would force SYSTEM
+context, breaking the Max session. Startup folder is fragile
+(no auto-restart, no "at log on of any user" semantics).
+Crash recovery + self-update + Event Log integration are
+production-grade requirements per the user's hard-mode brief
+— skipping any one of them in Phase 4.0 means the agent fails
+silently in a way that's hard to diagnose later.
+
+Legacy sunset (D4). The three deprecated routes are
+currently returning 401 on every call (TD-056), so usage is
+already zero in practice. Adding deprecation headers gives
+us audit evidence to confirm zero-usage before the
+Phase 4.1 sunset, which is good hygiene even though the
+practical effect is nil.
+
+### Consequences
+
+Positive
+
+- The agent survives reboots, crashes, network drops, and
+  Cloud Run scale-to-zero events. The user provisions once
+  per machine and forgets.
+- The mobile UI shows live agent status without polling, so
+  "is my desktop online?" is a 1-second question instead of a
+  30-second one.
+- Auth events feed BigQuery, which means the first phishing
+  attempt or stolen-laptop incident has a forensic trail
+  (geo-jumps, IP changes, sudden frequency spikes are
+  detectable; alerts via Cloud Monitoring on those queries).
+- The agent token is scoped — a leaked token can't escalate
+  beyond the capabilities the user granted at registration.
+- The legacy REST surface gets a clear sunset path with audit
+  evidence, closing TD-056 by design (the new auth path
+  proves it works; the old path retires).
+- The Anthropic API key dependency is removed from the agent
+  `.env`, eliminating the silent-mode-switch risk (TD-055
+  closes once the key is also rotated on the Anthropic side).
+
+Negative
+
+- New backend surface area: 6 new endpoints + a Firestore
+  collection + a BigQuery dataset + a Pub/Sub topic. Each is
+  a new failure mode and a new operational concern.
+- Self-update introduces a binary-replacement code path on
+  Windows. Even with signature verification + post-swap
+  health check + rollback, a malformed update could brick the
+  agent on a single machine until manual intervention. The
+  rollout is conservative (signed releases only, signed by a
+  key whose private half is offline) but the surface exists.
+- Scheduled Task XML is a Windows-specific artefact. macOS /
+  Linux ports of this same productionization story will need
+  their own bootstrap (launchd / systemd) and the install
+  scripts won't translate.
+- Mobile UI gains a Pub/Sub SSE subscription, which is a new
+  long-lived connection alongside the task SSE. Resource
+  contention is unlikely (RN handles multiple SSEs fine
+  post-3.4.1), but it's a new connection to manage on
+  background/foreground transitions.
+
+Mitigations
+
+- Self-update gates: post-swap health check is an HTTP call
+  to `/v1/agent/latest-version` matching the new version
+  string; if the agent process can't even open a socket
+  to reach the api, the wrapper rolls back. This catches
+  the most common failure modes (corrupt download,
+  permissions, signature drift).
+- Pub/Sub topic is auto-created with the api's existing
+  service account permissions; no new IAM bindings.
+- Mobile SSE subscription is paused on background and
+  resumed on foreground (matches existing task SSE pattern
+  from Phase 3.3).
+- Backwards compatibility: the legacy REST endpoints stay
+  routable for 30 days, and the WS path is unchanged from
+  Phase 3.4.1, so no live agent breaks on Phase 4.0 deploy.
+
+Neutral
+
+- Windows-only scope. macOS/Linux agents are out of Phase
+  4.0 by design (no current users on those OSes); the
+  Firestore + WS + token model is OS-agnostic, only the
+  install scripts are not.
+
+### Compliance
+
+Security
+
+- Token never serialized to disk in plaintext (Credential
+  Manager uses DPAPI per-user encryption).
+- Token never logged by the agent (logger redacts
+  `Authorization` headers).
+- Bcrypt cost 12 is the OWASP-recommended floor for 2026;
+  re-evaluate at cost 14 in 2028 per Moore's-law forecast.
+- Self-update signature: detached Ed25519 signature on the
+  binary; public key bundled in the agent. Private key held
+  offline, signing happens on Akmal's machine for Phase 4.0.
+  Key-rotation policy: 1-year cycle.
+
+Operations
+
+- Health check: `GET /v1/agent/list` includes per-agent
+  `lastHeartbeatAt`. A scheduled Cloud Monitoring check
+  alerts on agents that miss > 5min of heartbeats while
+  having `online=true`.
+- Capacity: Firestore `agents` collection scales linearly
+  with agent count; for the foreseeable user base (1–100
+  agents) this is well within free-tier limits. BigQuery
+  audit log writes are batched per minute.
+- Cost: agent token auth is one Firestore read per WS
+  connect (cached for the life of the connection) — small
+  fraction of mobile costs. BigQuery writes are tiny
+  (<100 events/agent/day).
+
+Scalability
+
+- The api's in-memory `AgentSessionRegistry` becomes a
+  per-instance cache layered on top of the Firestore
+  source-of-truth. Cross-instance coordination is via
+  Pub/Sub fan-out. This is the long-promised replacement for
+  *Agent WebSocket Sessions Are In-Memory (MVP); Redis
+  Coordination Is A Future TD* — the future TD now has a
+  concrete answer (Pub/Sub, not Redis).
+
+### Migration plan
+
+Existing single-agent setup → Phase 4.0:
+
+1. Phase 4.0 backend deploys: new endpoints + Firestore
+   collection + BigQuery dataset are live, but the legacy
+   endpoints continue to serve the existing REST clients
+   (with deprecation headers).
+2. The user runs the agent registration CLI once on their
+   PC. The CLI:
+   - prompts for a user JWT (paste from mobile or gateway
+     sign-in flow)
+   - calls `POST /v1/agent/register`
+   - stores the returned token in Credential Manager
+   - self-tests the WS connection
+   - prints success + agent UUID
+3. The user runs `install-agent-autostart.ps1` once,
+   which writes the wrapper script to `%APPDATA%`,
+   registers the scheduled task, and verifies it.
+4. From this point on, every reboot brings the agent back.
+   The user's manual `pnpm dev` flow continues to work
+   exactly as before — Phase 4.0 is purely additive on the
+   client side.
+5. Mobile users get the agent-status UI in the next mobile
+   build (Phase 4.0 mobile work parallels the agent /
+   backend work but is its own deploy).
+
+### Sunset criteria
+
+This ADR is reconsidered if any of the following hold:
+
+- Multi-OS demand. macOS or Linux users would re-open the
+  startup decision (D3); a cross-OS solution likely shifts
+  to per-OS ADRs.
+- Cross-org / multi-tenant scope. The "user owns one or more
+  agents" model implies a single user account; an enterprise
+  tenant model would re-open D1 (likely toward OAuth client
+  credentials) and D2 (likely toward push fan-out via a
+  message broker).
+- > 1000 concurrent agents per Cloud Run instance. The in-
+  memory registry per-instance becomes a hot path; Redis or
+  a similar shared cache is the likely next step.
+- Self-update incidents. If a malformed update bricks more
+  than 5% of agents in any release, D3's self-update
+  mechanism is removed in favour of manual updates with
+  email notification.
+
+### Implementation
+
+Backend (Phase 4.0 Part 3):
+
+- `apps/api/src/routes/agent.ts` — new routes (register,
+  rotate-token, status, list, latest-version) using new
+  `createAgentTokenGuard` middleware.
+- `apps/api/src/integrations/auth.ts` — `createAgentTokenGuard`
+  alongside the existing `createAgentGuard`. Bcrypt-based.
+- `apps/api/src/integrations/firestore.ts` — new `agents`
+  collection wrapper.
+- `apps/api/src/services/agent-registry.ts` — encapsulates
+  the Firestore + Pub/Sub fan-out logic; replaces the
+  current in-memory `AgentSessionRegistry` for persistent
+  identity (the in-memory one stays for per-instance WS
+  bookkeeping).
+- `apps/api/src/integrations/audit-log.ts` — new file;
+  BigQuery writer for `operator_os_dev_audit.agent_auth`.
+- `packages/contracts/src/ai/agent-registration.ts` — new
+  schemas for the register/rotate/status request + response
+  bodies.
+
+Agent (Phase 4.0 Parts 4 + 5 + 6):
+
+- `apps/desktop-agent/src/auth/credential-manager.ts` —
+  new file; PowerShell wrapper around Windows Credential
+  Manager.
+- `apps/desktop-agent/src/cli/register.ts` — new file;
+  one-time CLI entry point.
+- `apps/desktop-agent/src/auth/token-rotator.ts` — new
+  file; background rotation loop.
+- `apps/desktop-agent/src/providers/control-channel-ws.ts` —
+  read token from Credential Manager (replacing
+  `process.env.CONTROL_CHANNEL_TOKEN`).
+- `apps/desktop-agent/src/api-client.ts` — include
+  `Authorization: Bearer <token>` in every REST request,
+  closing TD-056.
+- `scripts/install-agent-autostart.ps1` and
+  `scripts/uninstall-agent-autostart.ps1` — new files.
+- `apps/desktop-agent/scripts/start-agent.ps1` — new file;
+  the wrapper invoked by schtasks.
+
+Mobile (Phase 4.0 Part 7):
+
+- `src/state/agent-status-store.ts` — new Zustand store.
+- `src/screens/devices-screen.tsx` — gain agent list +
+  revoke buttons.
+- `src/components/agent-status-badge.tsx` — new component
+  for the persistent header indicator.
+
+Documentation (Phase 4.0 Part 10):
+
+- `docs/AGENT_SETUP.md` — first-time setup walkthrough.
+- `docs/AGENT_TROUBLESHOOTING.md` — common errors + fixes.
+- `docs/MIGRATION-V4.md` — for the legacy-REST-endpoint
+  sunset.
+
+### References
+
+- Phase 3.2 ADR: *Agent WebSocket Sessions Are In-Memory
+  (MVP); Redis Coordination Is A Future TD* — this ADR is
+  the long-promised follow-up to that "future TD"; the
+  answer is Pub/Sub + Firestore, not Redis.
+- Phase 3.3 ADR: *ClaudeCodeAgent Integration — Phase 1.4
+  + Thin Adapter (Phase 3.3)* — execution path the new
+  auth model wraps.
+- TD-054 (closed): mobile SSE swap to react-native-sse —
+  the close that unblocked Phase 4.0.
+- TD-055 (open, P0): rotate ANTHROPIC_API_KEY. Phase 4.0
+  Part 2 removes the key from the agent's env, but the
+  rotation on the Anthropic side is still a separate user
+  action.
+- TD-056 (open, P3): legacy REST endpoint 401s. Phase 4.0
+  Part 4 closes this incidentally by adding the
+  Authorization header to the REST client; the deprecation
+  in Part 8 retires the endpoints entirely.
+- BCrypt cost 12: OWASP Authentication Cheat Sheet (2026
+  revision).
+- Windows Credential Manager / DPAPI: Microsoft Docs,
+  *Cryptography Next Generation* article on DPAPI per-user
+  encryption.
