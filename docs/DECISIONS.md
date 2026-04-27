@@ -3492,3 +3492,103 @@ Documentation (Phase 4.0 Part 10):
 - Windows Credential Manager / DPAPI: Microsoft Docs,
   *Cryptography Next Generation* article on DPAPI per-user
   encryption.
+
+### Amendment 1 — Token rotation overlap flow (Phase 4.0 Part 3, hard-mode addition)
+
+The original D1 specified a 24-hour overlap window during
+rotation but did not pin the data model. Hard-mode review
+selected a single-document overlap (one `agents/{id}` doc with
+both current and previous hashes) over a sub-collection of
+token versions. The single-doc approach makes rotation a
+single Firestore write, makes auth a single read, and keeps
+the data shape obvious for ops queries.
+
+Field shape on `agents/{agentId}`:
+
+```
+tokenHash:                string         (current bcrypt hash)
+previousTokenHash:        string | null  (last rotated hash)
+previousTokenExpiresAt:   Timestamp | null  (cleanup deadline)
+oldTokenUsageCount:       number         (defaults to 0)
+```
+
+Validation order on inbound auth:
+
+1. `bcrypt.compare(token, tokenHash)` → if match, accept;
+   `oldTokenUsageCount` and `previousTokenHash` are not
+   touched.
+2. Else, if `previousTokenHash !== null` and
+   `now <= previousTokenExpiresAt`:
+   - `bcrypt.compare(token, previousTokenHash)` → if match,
+     accept; **set response header
+     `X-Token-Rotation-Recommended: true`**;
+     `agents.update({ oldTokenUsageCount: increment(1) })`.
+3. Else: 401.
+
+Header semantics on the agent side:
+
+- The agent's REST client + WS-upgrade handler watch every
+  response for `X-Token-Rotation-Recommended: true`.
+- On observation, the agent enqueues an immediate rotation
+  call (`POST /v1/agent/rotate-token`) and proceeds with
+  the in-flight request unchanged. Rotation runs out-of-band
+  on the next event-loop tick, not blocking the user task.
+- The agent debounces: if a rotation is already in flight,
+  subsequent header observations are no-ops until the
+  rotation settles.
+
+Cleanup job:
+
+- A scheduled Cloud Run job (`cron-cleanup-rotated-tokens`,
+  hourly) sweeps `agents/` where `previousTokenExpiresAt <
+  now()` and writes `{previousTokenHash: null,
+  previousTokenExpiresAt: null}`. The sweep is idempotent and
+  uses Firestore's batched writes (max 500 per batch).
+- The job also publishes a metric
+  `agent_old_token_cleanup_count` to Cloud Monitoring per
+  run so we have a visible heartbeat that cleanup is
+  running.
+
+Metric: `oldTokenUsageCount`
+
+- Per-agent counter incremented on every accepted-via-
+  previous-hash auth.
+- Mobile UI surfaces it as a "stale token" indicator on the
+  Devices screen (Phase 4.0 Part 7) so the user sees that an
+  agent hasn't completed rotation yet.
+- A non-zero value 48h after rotation is a real signal: the
+  agent is using a stale token despite seeing the rotation
+  header. Likely root cause: the rotation call failed and
+  the agent didn't retry. Cloud Monitoring alerts on
+  `oldTokenUsageCount > 0` after `previousTokenExpiresAt -
+  6h` (i.e. in the last 6h before cleanup).
+
+Rationale for the header-based pull rather than a
+server-pushed rotation:
+
+- Push would require either polling for "has my token been
+  rotated?" or a long-lived control channel that's already
+  authenticated. Both add machinery without buying anything
+  the header-pull pattern doesn't already give us.
+- Header-pull is opportunistic: rotation happens on the
+  next normal request, which means a sleeping agent doesn't
+  rotate (correct — we don't want to wake it up; the
+  cleanup job will simply expire the previous hash and the
+  agent rotates on its next wake), and a busy agent
+  rotates immediately (correct — high-traffic = high-risk
+  rotation surface).
+
+References:
+
+- TD-057 (filed at this amendment): BigQuery audit pipeline
+  for `agent_auth` events. Part 3 ships with a
+  `LoggingAuditWriter` stub; the BigQuery writer plugs into
+  the same interface once the table exists.
+- TD-058 (filed at this amendment): Pub/Sub topic for the
+  `agent-status-changes` real-time fan-out. Part 3 ships
+  with a no-op publisher; the real one plugs in once the
+  topic is provisioned.
+- TD-059 (filed at this amendment): signed self-update
+  pipeline. Part 3 ships `GET /v1/agent/latest-version`
+  returning a stub response; the actual update mechanism
+  slips to Phase 4.0.1.

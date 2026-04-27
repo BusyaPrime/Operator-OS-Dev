@@ -3899,3 +3899,307 @@ in the same way they already work on `/v1/agent/ws`.
 - 2026-04-25: filed at Phase 3.4 close; observed in the
   desktop agent log during the end-to-end smoke. WS path
   works fine with the same JWT.
+
+## TD-057: BigQuery audit pipeline for `agent_auth` events
+
+Discovered: 2026-04-27 (Phase 4.0 Part 3 scoping — the ADR-025
+    audit story specifies a BigQuery dataset
+    `operator_os_dev_audit.agent_auth` that does not exist yet)
+Type: ops / observability
+Priority: P1
+Status: open
+Owner: Akmal Khujdarov
+Target phase: Phase 4.0 (must close BEFORE Phase 4.0 closure
+    per hard-mode condition — audit logs are a verification
+    requirement)
+
+### Description
+
+ADR-025 D1 specifies that every agent auth event (login attempt,
+login success, token rotation, revocation, anomaly) lands in a
+BigQuery table for forensic queries and Cloud Monitoring
+anomaly detection (geo-jumps, frequency spikes, etc.).
+
+Phase 4.0 Part 3 ships the api-side audit emit interface
+(`AuditWriter` with `record(event: AgentAuthEvent): Promise<void>`)
+backed by a `LoggingAuditWriter` stub that writes structured
+pino logs only. Phase 4.0 closure cannot complete without the
+real BigQuery writer because we need to verify forensic queries
+work end-to-end against real data — a stub log doesn't satisfy
+the verification gate.
+
+### Risk if unaddressed
+
+- ADR-025 verification gate fails — no forensic trail for the
+  first phishing or stolen-laptop incident, despite the design
+  promising one.
+- Cloud Monitoring anomaly alerts can't fire (no data source).
+- Phase 4.0 closure report would carry an asterisk (auth shipped,
+  audit deferred) — bad pattern at "production-grade" promise
+  level.
+
+### Acceptance criteria
+
+1. Dataset `operator_os_dev_audit` exists in BigQuery,
+   region matches the api's home region (`europe-west4`).
+2. Table `agent_auth` exists with the columns specified in
+   ADR-025 D1 audit section (timestamp, agent_id, event_type,
+   ip, user_agent, success, latency_ms, error_code,
+   metadata).
+3. The api's runtime service account has
+   `roles/bigquery.dataEditor` on the dataset (least
+   privilege — write-only against this one dataset, not
+   project-wide).
+4. New `BigQueryAuditWriter` implementation in
+   `apps/api/src/integrations/audit-log.ts` plugs into the
+   `AuditWriter` interface that Part 3 ships. Default
+   factory selection moves from `LoggingAuditWriter` to
+   `BigQueryAuditWriter` when env var
+   `AGENT_AUDIT_BACKEND=bigquery` is present.
+5. Sample query in `docs/AGENT_AUDIT_QUERIES.md` confirms
+   the write path produced data: e.g. "auth events for agent
+   X in the last hour" returns the last test event.
+6. Integration test using the `@google-cloud/bigquery` SDK's
+   in-memory mock asserts the row shape matches the schema.
+
+### Dependencies
+
+- GCP project `operator-os-dev` (existing).
+- IAM: ability to grant the api's runtime SA dataEditor on
+  the new dataset.
+
+### Estimated effort
+
+- Dataset + table provisioning: 15 min via `bq mk`.
+- IAM grant: 5 min.
+- BigQueryAuditWriter implementation: 1 hour.
+- Schema validation test + sample query doc: 30 min.
+- Total: ~2 hours.
+
+### Stale close condition
+
+End-to-end test in Phase 4.0 Part 9 verifies that an auth
+event triggered from the agent appears in
+`operator_os_dev_audit.agent_auth` within 60 seconds, and a
+sample forensic query (e.g. "find all 401s for agent X in the
+last 24h") returns the expected rows.
+
+### Related
+
+- ADR-025 D1 (the audit requirement).
+- Phase 4.0 Part 3 (the LoggingAuditWriter stub this TD
+  replaces).
+
+### History
+
+- 2026-04-27: filed at Phase 4.0 Part 3 scoping.
+
+## TD-058: Pub/Sub topic for `agent-status-changes` real-time mobile fan-out
+
+Discovered: 2026-04-27 (Phase 4.0 Part 3 scoping — ADR-025 D2
+    specifies a Pub/Sub topic the api publishes to and the
+    mobile subscribes via SSE; the topic does not exist yet)
+Type: ops / messaging infrastructure
+Priority: P1
+Status: open
+Owner: Akmal Khujdarov
+Target phase: Phase 4.0 (must close BEFORE Part 7 mobile UI
+    work per hard-mode condition — the mobile real-time
+    indicator depends on this topic)
+
+### Description
+
+ADR-025 D2 specifies that agent state transitions (online,
+offline, degraded) publish to a Pub/Sub topic
+`agent-status-changes` so the mobile app can subscribe via
+SSE for sub-second status updates instead of polling
+`GET /v1/agent/list` every 30 seconds.
+
+Phase 4.0 Part 3 ships the api-side publish interface
+(`AgentStatusEmitter` with
+`emit(event: AgentStatusEvent): Promise<void>`) backed by a
+`NoOpStatusEmitter` stub that writes a pino log only.
+Mobile UI in Part 7 needs the real publisher to deliver the
+"green dot updates within 1s" UX promise.
+
+### Risk if unaddressed
+
+- Mobile UI degrades to 30s polling for status — same as
+  Phase 3 baseline. The "Always-On" UX promise of Phase 4.0
+  doesn't land.
+- The "agent went offline" alert path the user expects is
+  delayed by up to 30s, plus device polling jitter.
+
+### Acceptance criteria
+
+1. Pub/Sub topic `agent-status-changes` exists in
+   `operator-os-dev`.
+2. Subscription `agent-status-changes-sse` (push delivery
+   to the api's `/v1/internal/agent-status` endpoint OR
+   pull-mode for the mobile-fanout SSE handler — design
+   choice deferred to TD execution).
+3. The api's runtime SA has `roles/pubsub.publisher` on
+   the topic. The mobile-fanout component (a new SSE route
+   on the api) has subscriber on the subscription.
+4. New `PubSubStatusEmitter` plugs into the
+   `AgentStatusEmitter` interface Part 3 ships.
+5. New SSE route `GET /v1/agent/status-stream` (auth: user
+   JWT) consumes the subscription and fans the events out
+   to subscribed mobile clients per user.
+6. Mobile-side store wires up the SSE consumer behind a
+   feature flag; the polling path stays as the fallback
+   when the SSE drops or the device is on a network that
+   blocks long-lived connections.
+
+### Dependencies
+
+- GCP project `operator-os-dev` Pub/Sub API enabled (already
+  is, per existing topics for tasks).
+- IAM grants per acceptance criterion #3.
+
+### Estimated effort
+
+- Topic + subscription provisioning: 15 min.
+- IAM grants: 10 min.
+- PubSubStatusEmitter implementation: 1 hour.
+- SSE fanout route: 1.5 hours.
+- Mobile SSE consumer (Part 7 sub-task that depends on this
+  TD): 1.5 hours.
+- Total: ~4 hours, of which ~2 hours is server-side
+  prerequisite for Part 7 mobile work.
+
+### Stale close condition
+
+Mobile UI shows an agent state change within 1 second of the
+api processing the WS connect/disconnect event, observed in
+a manual test where the agent is force-killed and the mobile
+green dot flips to red within the SLO.
+
+### Related
+
+- ADR-025 D2 (the real-time fan-out requirement).
+- Phase 4.0 Part 3 (the NoOpStatusEmitter stub this TD
+  replaces).
+- Phase 4.0 Part 7 (the mobile UI that depends on this).
+
+### History
+
+- 2026-04-27: filed at Phase 4.0 Part 3 scoping.
+
+## TD-059: Signed self-update pipeline for the desktop agent
+
+Discovered: 2026-04-27 (Phase 4.0 Part 3 scoping — ADR-025 D3
+    specifies a signed self-update mechanism with Ed25519
+    signature verification + post-swap health check + rollback;
+    no signing key, no release pipeline, no artifact store
+    exists yet)
+Type: ops / release engineering
+Priority: P2
+Status: open
+Owner: Akmal Khujdarov
+Target phase: Phase 4.0.1 (can defer past Phase 4.0 closure
+    per hard-mode classification — the gap is documented;
+    Phase 4.0 ships with the route stubbed and the
+    update-check loop disabled)
+
+### Description
+
+ADR-025 D3 specifies a self-update pipeline that:
+
+- Generates a signed agent binary on each release
+  (Ed25519 signature, private half offline).
+- Bundles the public key in the agent itself.
+- Has the agent fetch `GET /v1/agent/latest-version` daily.
+- Downloads the new binary if a newer version is reported,
+  verifies the signature, swaps, runs a health check, and
+  rolls back on failure.
+
+This is a multi-faceted release-engineering deliverable that
+spans build infra, signing key management, artefact storage,
+and the agent's update loop. Phase 4.0 Part 3 ships only the
+api-side route stub:
+
+```
+GET /v1/agent/latest-version
+=> {
+  "version": "<current api version>",
+  "downloadUrl": null,
+  "signature": null,
+  "releaseNotes": "Phase 4.0 ships with self-update disabled.
+    See TD-059."
+}
+```
+
+The agent's update loop (Phase 4.0 Part 6 wrapper script) is
+gated on a non-null `downloadUrl`; with the stub returning
+null, the loop is a no-op.
+
+### Risk if unaddressed
+
+- Agents in the field stay on the version they were
+  installed at. New versions require manual re-install
+  (re-run the install script on each machine).
+- For the user's current single-machine posture this is
+  acceptable. For any future multi-machine deploy, the
+  manual update churn would be a real friction point.
+
+### Acceptance criteria
+
+1. Ed25519 keypair generated. Private key stored on Akmal's
+   machine (encrypted backup); public key bundled in the
+   agent source at `apps/desktop-agent/src/keys/update-public.pem`.
+2. Release script `scripts/release-agent.sh` builds the
+   agent's `dist/`, archives it, signs the archive with the
+   private key, uploads the archive + signature to a GCS
+   bucket `operator-os-agent-releases` with object versioning
+   enabled.
+3. `GET /v1/agent/latest-version` reads the bucket's
+   "latest" pointer and returns the actual download URL +
+   signature.
+4. Agent's update loop verifies the signature against the
+   bundled public key before swap.
+5. Post-swap health check: agent process must respond 200
+   to a localhost `/internal/health` (new port, new endpoint
+   the agent exposes for self-test) within 30 seconds.
+   Failure triggers automatic rollback to the previous
+   binary.
+6. End-to-end test on Akmal's machine: bump the release,
+   verify the agent updates within 24h, runs health check,
+   continues serving tasks across the version transition.
+
+### Dependencies
+
+- GCS bucket creation + IAM (the api's runtime SA needs
+  `roles/storage.objectViewer` to read the latest pointer;
+  the release script SA needs `roles/storage.objectAdmin`).
+- Ed25519 tooling (`openssl` or `node:crypto.sign`).
+
+### Estimated effort
+
+- Keygen + key management policy doc: 30 min.
+- Release script: 2 hours.
+- Update-check loop in agent + signature verify + rollback:
+  4 hours.
+- End-to-end test: 1 hour.
+- Total: ~7-8 hours (significant lift; justified deferral
+  past Phase 4.0 closure).
+
+### Stale close condition
+
+A release is published; agents in the field auto-update
+within 24h; the post-swap health check catches at least one
+deliberately-bad release in a deployment dry-run; the
+rollback works.
+
+### Related
+
+- ADR-025 D3 (the self-update spec).
+- Phase 4.0 Part 3 stub: `GET /v1/agent/latest-version`.
+- Phase 4.0 Part 6 stub: agent wrapper script's update-check
+  step is a no-op until this TD lands.
+
+### History
+
+- 2026-04-27: filed at Phase 4.0 Part 3 scoping; deferral
+  past Phase 4.0 closure approved by Akmal under hard-mode
+  TD priority classification.
