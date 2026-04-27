@@ -1,6 +1,13 @@
 import { WebSocket } from 'ws';
 import type { Logger } from 'pino';
 
+import { TOKEN_ROTATION_RECOMMENDED_HEADER } from '@operator-os/contracts';
+
+import {
+  noopAuthSignals,
+  type TokenAuthSignals,
+  type UnauthorizedContext
+} from '../auth/auth-signals.js';
 import {
   createTaskQueue,
   type TaskQueue
@@ -47,13 +54,48 @@ export interface ControlChannelSocket {
   on(event: 'message', cb: (data: unknown) => void): void;
   on(event: 'close', cb: (code: number, reason: Buffer) => void): void;
   on(event: 'error', cb: (err: Error) => void): void;
+  /**
+   * The `ws` library emits this when the HTTP upgrade response
+   * arrives (status 101 + headers + protocols). Phase 4.0
+   * Part 4.E uses it to observe the
+   * `X-Token-Rotation-Recommended` header on the upgrade.
+   * Test stubs may implement it as a no-op.
+   */
+  on(
+    event: 'upgrade',
+    cb: (response: { headers: Record<string, string | string[] | undefined> }) => void
+  ): void;
 }
 
 export interface ControlChannelWsOptions {
   /** Full wss:// URL of /v1/agent/ws */
   readonly url: string;
-  /** User JWT for the WS upgrade Authorization header. */
-  readonly authToken: string;
+  /**
+   * Static bearer token. Legacy path — used as a fallback
+   * when `tokenProvider` is not supplied. Phase 4.0 wiring
+   * passes a `tokenProvider` that reads from the
+   * CredentialStore so a token rotation between connects is
+   * picked up automatically.
+   */
+  readonly authToken?: string;
+  /**
+   * Phase 4.0 Part 4.E — async provider that returns the
+   * current agent token. Read fresh on every connect /
+   * reconnect. Returning null means we have no token; the
+   * connection attempt aborts and `authSignals.onUnauthorized`
+   * fires with `source: 'ws'`.
+   */
+  readonly tokenProvider?: () => Promise<string | null>;
+  /**
+   * Shared auth signals. The WS path observes:
+   *   - `X-Token-Rotation-Recommended: true` on the upgrade
+   *     response → `onRotationHinted()`
+   *   - close code 4001 (server-side revoked mid-session)
+   *     OR an upgrade error with HTTP status 401 →
+   *     `onUnauthorized({source: 'ws', ...})`
+   * Defaults to `noopAuthSignals` if omitted.
+   */
+  readonly authSignals?: TokenAuthSignals;
   /** Agent identity (hello.agentId). */
   readonly agentId: string;
   /** Full manifest the server validates with agentManifestSchema. */
@@ -93,9 +135,19 @@ const DEFAULT_RECONNECT_MAX_MS = 60_000;
  * reconnect.
  */
 export class ControlChannelWs {
-  #opts: Required<Omit<ControlChannelWsOptions, 'socketFactory'>> & {
-    socketFactory?: ControlChannelWsOptions['socketFactory'];
-  };
+  #url: string;
+  #authToken?: string;
+  #tokenProvider?: () => Promise<string | null>;
+  #signals: TokenAuthSignals;
+  #agentId: string;
+  #manifest: Record<string, unknown>;
+  #executor: TaskExecutor;
+  #supportedCapabilities: ReadonlySet<string>;
+  #logger: Logger;
+  #reconnectBaseMs: number;
+  #reconnectMaxMs: number;
+  #socketFactory?: ControlChannelWsOptions['socketFactory'];
+
   #socket?: ControlChannelSocket;
   #queue: TaskQueue = createTaskQueue();
   #sessionId?: string;
@@ -104,18 +156,28 @@ export class ControlChannelWs {
   #reconnectTimer?: NodeJS.Timeout;
 
   constructor(options: ControlChannelWsOptions) {
-    this.#opts = {
-      url: options.url,
-      authToken: options.authToken,
-      agentId: options.agentId,
-      manifest: options.manifest,
-      executor: options.executor,
-      supportedCapabilities: options.supportedCapabilities,
-      logger: options.logger,
-      reconnectBaseMs: options.reconnectBaseMs ?? DEFAULT_RECONNECT_BASE_MS,
-      reconnectMaxMs: options.reconnectMaxMs ?? DEFAULT_RECONNECT_MAX_MS,
-      socketFactory: options.socketFactory
-    };
+    if (
+      options.authToken === undefined &&
+      options.tokenProvider === undefined
+    ) {
+      throw new Error(
+        'ControlChannelWs requires either `authToken` or `tokenProvider`'
+      );
+    }
+    this.#url = options.url;
+    this.#authToken = options.authToken;
+    this.#tokenProvider = options.tokenProvider;
+    this.#signals = options.authSignals ?? noopAuthSignals;
+    this.#agentId = options.agentId;
+    this.#manifest = options.manifest;
+    this.#executor = options.executor;
+    this.#supportedCapabilities = options.supportedCapabilities;
+    this.#logger = options.logger;
+    this.#reconnectBaseMs =
+      options.reconnectBaseMs ?? DEFAULT_RECONNECT_BASE_MS;
+    this.#reconnectMaxMs =
+      options.reconnectMaxMs ?? DEFAULT_RECONNECT_MAX_MS;
+    this.#socketFactory = options.socketFactory;
   }
 
   start(): void {
@@ -149,25 +211,88 @@ export class ControlChannelWs {
   }
 
   #connect(): void {
+    void this.#connectAsync();
+  }
+
+  async #connectAsync(): Promise<void> {
+    if (this.#shuttingDown) return;
+
+    let token: string | null;
+    if (this.#tokenProvider !== undefined) {
+      try {
+        token = await this.#tokenProvider();
+      } catch (err) {
+        this.#logger.warn(
+          { err, source: 'control-channel-ws' },
+          'tokenProvider threw; will retry connect after backoff'
+        );
+        this.#scheduleReconnect();
+        return;
+      }
+      if (token === null || token.length === 0) {
+        this.#logger.error(
+          { source: 'control-channel-ws' },
+          'tokenProvider returned no token; firing onUnauthorized'
+        );
+        this.#emitUnauthorized({
+          source: 'ws',
+          agentId: this.#agentId,
+          reason: 'no_token_in_credential_store'
+        });
+        return;
+      }
+    } else {
+      token = this.#authToken ?? null;
+    }
+
     const factory =
-      this.#opts.socketFactory ??
+      this.#socketFactory ??
       ((url, headers) =>
         new WebSocket(url, { headers }) as unknown as ControlChannelSocket);
 
-    const socket = factory(this.#opts.url, {
-      authorization: `Bearer ${this.#opts.authToken}`
+    const socket = factory(this.#url, {
+      authorization: `Bearer ${token}`
     });
     this.#socket = socket;
 
+    // Observe the upgrade response for the rotation header.
+    // The `ws` library exposes the IncomingMessage on the
+    // 'upgrade' event before 'open'. Wrapped in try/catch
+    // because injected test stubs may handle 'upgrade' as a
+    // no-op or throw.
+    try {
+      socket.on('upgrade', (response) => {
+        const value = response.headers[TOKEN_ROTATION_RECOMMENDED_HEADER];
+        const stringValue =
+          typeof value === 'string'
+            ? value
+            : Array.isArray(value)
+              ? value[0]
+              : undefined;
+        if (stringValue === 'true') {
+          try {
+            this.#signals.onRotationHinted();
+          } catch (err) {
+            this.#logger.warn(
+              { err, source: 'control-channel-ws' },
+              'authSignals.onRotationHinted threw — continuing'
+            );
+          }
+        }
+      });
+    } catch {
+      /* test stub may not implement 'upgrade' */
+    }
+
     socket.on('open', () => {
-      this.#opts.logger.info(
+      this.#logger.info(
         { source: 'control-channel-ws' },
         'control channel opened — sending hello'
       );
       this.#send({
         type: 'hello',
-        agentId: this.#opts.agentId,
-        manifest: this.#opts.manifest
+        agentId: this.#agentId,
+        manifest: this.#manifest
       });
     });
 
@@ -184,7 +309,7 @@ export class ControlChannelWs {
       try {
         frame = JSON.parse(text);
       } catch (err) {
-        this.#opts.logger.warn(
+        this.#logger.warn(
           { err, source: 'control-channel-ws' },
           'frame was not valid JSON'
         );
@@ -194,32 +319,73 @@ export class ControlChannelWs {
     });
 
     socket.on('close', (code: number) => {
-      this.#opts.logger.info(
+      this.#logger.info(
         { source: 'control-channel-ws', code },
         'control channel closed'
       );
       this.#socket = undefined;
       this.#sessionId = undefined;
+      // 4001 = unauthorized per agent-ws.ts close-code map.
+      // We treat that as a fatal auth event and bubble it
+      // up. The subsequent reconnect scheduling is suppressed
+      // so the FatalAuthHandler can exit cleanly.
+      if (code === 4001) {
+        this.#emitUnauthorized({
+          source: 'ws',
+          agentId: this.#agentId,
+          reason: 'ws_close_4001_unauthorized'
+        });
+        this.#shuttingDown = true;
+        return;
+      }
       if (!this.#shuttingDown) {
         this.#scheduleReconnect();
       }
     });
 
     socket.on('error', (err: Error) => {
-      this.#opts.logger.warn(
+      this.#logger.warn(
         { err, source: 'control-channel-ws' },
         'control channel error'
       );
+      // The `ws` library emits a synthetic Error with the
+      // upgrade-response status when the server returns a
+      // non-101 response. Our agentTokenGuard returns 401
+      // for an unrecognized / revoked agent token at WS
+      // upgrade time; surface as onUnauthorized.
+      const message = typeof err.message === 'string' ? err.message : '';
+      if (
+        message.includes('Unexpected server response: 401') ||
+        message.includes('401')
+      ) {
+        this.#emitUnauthorized({
+          source: 'ws',
+          agentId: this.#agentId,
+          reason: 'ws_upgrade_401'
+        });
+        this.#shuttingDown = true;
+      }
     });
+  }
+
+  #emitUnauthorized(context: UnauthorizedContext): void {
+    try {
+      this.#signals.onUnauthorized(context);
+    } catch (err) {
+      this.#logger.warn(
+        { err, source: 'control-channel-ws' },
+        'authSignals.onUnauthorized threw — continuing'
+      );
+    }
   }
 
   #scheduleReconnect(): void {
     this.#reconnectAttempt += 1;
     const delay = Math.min(
-      this.#opts.reconnectBaseMs * 2 ** (this.#reconnectAttempt - 1),
-      this.#opts.reconnectMaxMs
+      this.#reconnectBaseMs * 2 ** (this.#reconnectAttempt - 1),
+      this.#reconnectMaxMs
     );
-    this.#opts.logger.info(
+    this.#logger.info(
       { source: 'control-channel-ws', delay, attempt: this.#reconnectAttempt },
       'scheduling control channel reconnect'
     );
@@ -242,7 +408,7 @@ export class ControlChannelWs {
         if (typeof welcome.sessionId === 'string') {
           this.#sessionId = welcome.sessionId;
           this.#reconnectAttempt = 0;
-          this.#opts.logger.info(
+          this.#logger.info(
             {
               source: 'control-channel-ws',
               sessionId: welcome.sessionId
@@ -259,7 +425,7 @@ export class ControlChannelWs {
       case 'task-assign': {
         const { payload } = typed as { payload?: TaskAssignInput };
         if (!payload || typeof payload.taskId !== 'string') {
-          this.#opts.logger.warn(
+          this.#logger.warn(
             { source: 'control-channel-ws' },
             'task-assign missing payload.taskId'
           );
@@ -269,14 +435,14 @@ export class ControlChannelWs {
         return;
       }
       case 'error': {
-        this.#opts.logger.warn(
+        this.#logger.warn(
           { source: 'control-channel-ws', frame: typed },
           'server sent error frame'
         );
         return;
       }
       default:
-        this.#opts.logger.debug(
+        this.#logger.debug(
           { source: 'control-channel-ws', type: typed.type },
           'unhandled frame type'
         );
@@ -288,8 +454,8 @@ export class ControlChannelWs {
     // router match. Reject rather than execute if this agent cannot
     // satisfy every required capability.
     for (const required of payload.capabilities) {
-      if (!this.#opts.supportedCapabilities.has(required)) {
-        this.#opts.logger.info(
+      if (!this.#supportedCapabilities.has(required)) {
+        this.#logger.info(
           {
             source: 'control-channel-ws',
             taskId: payload.taskId,
@@ -316,8 +482,7 @@ export class ControlChannelWs {
       });
     };
 
-    const executionPromise = this.#opts
-      .executor(payload, emitProgress)
+    const executionPromise = this.#executor(payload, emitProgress)
       .then((result) => {
         if (result.kind === 'completed') {
           this.#send({
@@ -335,7 +500,7 @@ export class ControlChannelWs {
         return result;
       })
       .catch((err: unknown) => {
-        this.#opts.logger.warn(
+        this.#logger.warn(
           { err, taskId: payload.taskId, source: 'control-channel-ws' },
           'executor threw — sending task-failed'
         );
@@ -357,7 +522,7 @@ export class ControlChannelWs {
     try {
       this.#socket.send(JSON.stringify(payload));
     } catch (err) {
-      this.#opts.logger.warn(
+      this.#logger.warn(
         { err, source: 'control-channel-ws' },
         'send failed'
       );
