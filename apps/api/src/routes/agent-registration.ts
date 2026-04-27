@@ -106,13 +106,11 @@ export const registerAgentRegistrationRoutes = async (
   // Suppress lint warnings for currently-unused options that
   // the next route commits will pick up. They're here in the
   // interface so 3.D, 3.E, 3.F, 3.G can share one wiring point.
-  void options.agentTokenGuard;
   void options.currentAgentVersion;
   void projectListResponse;
   void agentListResponseSchema;
   void agentStatusResponseSchema;
   void agentRevokeResponseSchema;
-  void agentRotateTokenResponseSchema;
   void agentLatestVersionResponseSchema;
 
   // POST /v1/agent/register — bind a desktop agent identity to
@@ -211,7 +209,7 @@ export const registerAgentRegistrationRoutes = async (
         await options.audit.record({
           agentId,
           userId,
-          eventType: 'auth_success',
+          eventType: 'agent_registered',
           latencyMs: Date.now() - issuedAt.getTime(),
           ip: request.ip,
           userAgent:
@@ -231,6 +229,113 @@ export const registerAgentRegistrationRoutes = async (
       const validated = agentRegisterResponseSchema.parse(response);
       reply.status(201);
       return validated;
+    }
+  );
+
+  // POST /v1/agent/rotate-token — overlap-window rotation per
+  // ADR-025 amendment 1. Authenticated by the agent's CURRENT
+  // token (not the user JWT — agents drive their own
+  // rotation lifecycle). Old token stays valid for 24h after
+  // the call so a fleet of long-lived WS connections doesn't
+  // see a transient 401 across the rotation boundary.
+  app.post(
+    '/v1/agent/rotate-token',
+    { preHandler: options.agentTokenGuard },
+    async (request, reply) => {
+      const startedAt = Date.now();
+      const agent = request.agent;
+      if (agent === undefined) {
+        // The guard ran but didn't attach an agent — should
+        // never happen given the preHandler contract, but
+        // defending in depth keeps the type narrowing honest.
+        reply.status(401);
+        return routeError(
+          'unauthorized',
+          'Agent token required for rotation'
+        );
+      }
+
+      // Refuse to nest rotations: if the caller authenticated
+      // with the previous (already-rotated-once) token, that
+      // means a rotation is already in flight (or the agent's
+      // last rotation didn't propagate to its credential
+      // store). Forcing a re-rotation here would just churn.
+      if (agent.usedPreviousToken) {
+        reply.status(409);
+        return routeError(
+          'rotation_already_in_progress',
+          'Token is already mid-rotation. Persist the most recent rotate-token response and retry once.'
+        );
+      }
+
+      const newRawToken = generateRawToken();
+      const newTokenHash = await bcrypt.hash(newRawToken, BCRYPT_COST);
+      const newTokenLookupHash = await agentTokenLookupHash(newRawToken);
+      const issuedAt = now();
+      // Overlap window per ADR-025 amendment 1: 24h.
+      const overlapExpiresAt = new Date(
+        issuedAt.getTime() + 24 * 60 * 60 * 1000
+      );
+
+      try {
+        const updated = await options.lifecycleRepository.rotateToken(
+          agent.agentId,
+          newTokenHash,
+          newTokenLookupHash,
+          overlapExpiresAt
+        );
+
+        try {
+          await options.audit.record({
+            agentId: updated.agentId,
+            userId: updated.userId,
+            eventType: 'token_rotated',
+            latencyMs: Date.now() - startedAt,
+            ip: request.ip,
+            userAgent:
+              typeof request.headers['user-agent'] === 'string'
+                ? request.headers['user-agent']
+                : undefined
+          });
+        } catch {
+          /* swallowed — audit is best-effort */
+        }
+
+        const response = {
+          agentId: updated.agentId,
+          agentToken: newRawToken,
+          tokenIssuedAt: updated.tokenIssuedAt,
+          previousTokenExpiresAt:
+            updated.previousTokenExpiresAt ?? overlapExpiresAt.toISOString()
+        };
+        return agentRotateTokenResponseSchema.parse(response);
+      } catch (err) {
+        if (err instanceof AgentsCollectionUnavailableError) {
+          if (err.code === 'AGENT_NOT_FOUND') {
+            reply.status(404);
+            return routeError('agent_not_found', err.message);
+          }
+          if (err.code === 'AGENT_REVOKED') {
+            reply.status(403);
+            return routeError('agent_revoked', err.message);
+          }
+          reply.status(503);
+          return routeError(
+            'agents_collection_unavailable',
+            err.message,
+            { code: err.code }
+          );
+        }
+        request.log.error(
+          { err, agentId: agent.agentId },
+          'token rotation failed'
+        );
+        reply.status(503);
+        return routeError(
+          'agents_collection_unavailable',
+          'Token rotation failed'
+        );
+      }
     }
   );
 };

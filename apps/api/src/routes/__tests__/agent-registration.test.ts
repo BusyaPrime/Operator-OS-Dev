@@ -205,7 +205,7 @@ describe('POST /v1/agent/register — happy path', () => {
     expect(audit.events[0]).toMatchObject({
       agentId: FIXTURE_AGENT_ID,
       userId: FIXTURE_USER_ID,
-      eventType: 'auth_success'
+      eventType: 'agent_registered'
     });
 
     await app.close();
@@ -433,6 +433,343 @@ describe('POST /v1/agent/register — collisions + storage failures', () => {
     expect(response.json()).toMatchObject({
       code: 'agents_collection_unavailable',
       message: 'Agent record could not be persisted'
+    });
+
+    await app.close();
+  });
+});
+
+describe('POST /v1/agent/rotate-token — happy path', () => {
+  it('rotates the token, returns the new raw value, persists overlap window', async () => {
+    // Arrange: a registered agent in the fake repo whose token
+    // we'll "rotate" via the route. The test agentTokenGuard
+    // attaches request.agent based on a header instead of doing
+    // bcrypt — keeps these tests focused on the route logic.
+    const existingRecord: AgentRecord = {
+      agentId: FIXTURE_AGENT_ID,
+      userId: FIXTURE_USER_ID,
+      machineName: 'studio-pc',
+      capabilities: ['code-generation'],
+      tokenHash: '$2b$12$existing-hash',
+      tokenLookupHash: 'a'.repeat(16),
+      tokenIssuedAt: '2026-04-20T00:00:00.000Z',
+      tokenLastRotatedAt: null,
+      tokenUseCount: 5,
+      previousTokenHash: null,
+      previousTokenLookupHash: null,
+      previousTokenExpiresAt: null,
+      oldTokenUsageCount: 0,
+      online: false,
+      lastConnectAt: null,
+      lastDisconnectAt: null,
+      lastHeartbeatAt: null,
+      createdAt: '2026-04-20T00:00:00.000Z',
+      updatedAt: '2026-04-20T00:00:00.000Z',
+      revoked: false,
+      revokedAt: null,
+      revokedReason: null
+    };
+
+    const app = Fastify({ logger: false });
+    const repoState: FakeRepoState = {
+      records: new Map([[FIXTURE_AGENT_ID, existingRecord]]),
+      createCalls: []
+    };
+    const repo = buildFakeLifecycleRepository(repoState);
+    // Override rotateToken to do an actual mutation so the
+    // route's "atomic write returns post-state" contract is
+    // exercised.
+    repo.rotateToken = async (
+      agentId,
+      newTokenHash,
+      newTokenLookupHash,
+      overlapExpiresAt
+    ) => {
+      const before = repoState.records.get(agentId);
+      if (!before) {
+        throw new AgentsCollectionUnavailableError(
+          'AGENT_NOT_FOUND',
+          `Agent ${agentId} not found`
+        );
+      }
+      const now = FIXTURE_NOW.toISOString();
+      const updated: AgentRecord = {
+        ...before,
+        tokenHash: newTokenHash,
+        tokenLookupHash: newTokenLookupHash,
+        tokenIssuedAt: now,
+        tokenLastRotatedAt: now,
+        previousTokenHash: before.tokenHash,
+        previousTokenLookupHash: before.tokenLookupHash,
+        previousTokenExpiresAt: overlapExpiresAt.toISOString(),
+        oldTokenUsageCount: 0,
+        updatedAt: now
+      };
+      repoState.records.set(agentId, updated);
+      return updated;
+    };
+
+    const audit = buildAuditSpy();
+    const userGuard = async (): Promise<void> => {
+      /* not used here */
+    };
+    const agentTokenGuard = async (
+      request: Parameters<Parameters<typeof app.addHook>[1]>[0]
+    ): Promise<void> => {
+      (request as unknown as {
+        agent?: {
+          agentId: string;
+          userId: string;
+          capabilities: string[];
+          usedPreviousToken: boolean;
+        };
+      }).agent = {
+        agentId: FIXTURE_AGENT_ID,
+        userId: FIXTURE_USER_ID,
+        capabilities: ['code-generation'],
+        usedPreviousToken: false
+      };
+    };
+    const newRaw = 'fresh-rotated-token';
+    await registerAgentRegistrationRoutes(app, {
+      lifecycleRepository: repo,
+      audit,
+      userGuard,
+      agentTokenGuard,
+      currentAgentVersion: '0.1.0',
+      now: () => FIXTURE_NOW,
+      generateRawToken: () => newRaw
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/agent/rotate-token',
+      headers: { authorization: 'Bearer current-test-token' },
+      payload: {}
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.agentId).toBe(FIXTURE_AGENT_ID);
+    expect(body.agentToken).toBe(newRaw);
+    expect(body.tokenIssuedAt).toBe(FIXTURE_NOW.toISOString());
+    // Overlap window = exactly 24h after issuance.
+    const expected =
+      new Date(FIXTURE_NOW.getTime() + 24 * 60 * 60 * 1000).toISOString();
+    expect(body.previousTokenExpiresAt).toBe(expected);
+
+    // Persisted record carries the previous hash + lookup
+    // hash for the overlap window.
+    const persisted = repoState.records.get(FIXTURE_AGENT_ID)!;
+    expect(persisted.previousTokenHash).toBe('$2b$12$existing-hash');
+    expect(persisted.previousTokenLookupHash).toBe('a'.repeat(16));
+    expect(persisted.tokenHash).not.toBe('$2b$12$existing-hash');
+    expect(await bcrypt.compare(newRaw, persisted.tokenHash)).toBe(true);
+
+    // Audit event recorded.
+    expect(audit.events).toHaveLength(1);
+    expect(audit.events[0]).toMatchObject({
+      agentId: FIXTURE_AGENT_ID,
+      userId: FIXTURE_USER_ID,
+      eventType: 'token_rotated'
+    });
+
+    await app.close();
+  });
+});
+
+describe('POST /v1/agent/rotate-token — auth + edge cases', () => {
+  const buildRotateApp = async (overrides: {
+    attachAgent?: {
+      agentId: string;
+      userId: string;
+      capabilities: string[];
+      usedPreviousToken: boolean;
+    };
+    repoState?: FakeRepoState;
+    rotateError?: Error;
+  } = {}): Promise<{
+    app: FastifyInstance;
+    repo: ReturnType<typeof buildFakeLifecycleRepository>;
+  }> => {
+    const app = Fastify({ logger: false });
+    const repo = buildFakeLifecycleRepository(overrides.repoState);
+    if (overrides.rotateError) {
+      repo.rotateToken = async () => {
+        throw overrides.rotateError as Error;
+      };
+    }
+    const userGuard = async (): Promise<void> => {
+      /* unused */
+    };
+    const agentTokenGuard = async (
+      request: Parameters<Parameters<typeof app.addHook>[1]>[0]
+    ): Promise<void> => {
+      if (overrides.attachAgent) {
+        (request as unknown as {
+          agent?: typeof overrides.attachAgent;
+        }).agent = overrides.attachAgent;
+      }
+    };
+    await registerAgentRegistrationRoutes(app, {
+      lifecycleRepository: repo,
+      audit: buildAuditSpy(),
+      userGuard,
+      agentTokenGuard,
+      currentAgentVersion: '0.1.0',
+      now: () => FIXTURE_NOW,
+      generateRawToken: () => 'rotated-token'
+    });
+    return { app, repo };
+  };
+
+  it('returns 401 when the guard ran but did not attach request.agent', async () => {
+    const { app } = await buildRotateApp({ attachAgent: undefined });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/agent/rotate-token',
+      headers: { authorization: 'Bearer some-token' },
+      payload: {}
+    });
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json()).toMatchObject({ code: 'unauthorized' });
+
+    await app.close();
+  });
+
+  it('returns 409 when usedPreviousToken=true (rotation already in flight)', async () => {
+    const { app } = await buildRotateApp({
+      attachAgent: {
+        agentId: FIXTURE_AGENT_ID,
+        userId: FIXTURE_USER_ID,
+        capabilities: ['code-generation'],
+        usedPreviousToken: true
+      }
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/agent/rotate-token',
+      headers: { authorization: 'Bearer previous-token' },
+      payload: {}
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({
+      code: 'rotation_already_in_progress'
+    });
+
+    await app.close();
+  });
+
+  it('returns 404 when the agent record was deleted between auth and rotate', async () => {
+    const { app } = await buildRotateApp({
+      attachAgent: {
+        agentId: FIXTURE_AGENT_ID,
+        userId: FIXTURE_USER_ID,
+        capabilities: ['code-generation'],
+        usedPreviousToken: false
+      },
+      rotateError: new AgentsCollectionUnavailableError(
+        'AGENT_NOT_FOUND',
+        `Agent ${FIXTURE_AGENT_ID} not found`
+      )
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/agent/rotate-token',
+      headers: { authorization: 'Bearer current-token' },
+      payload: {}
+    });
+
+    expect(response.statusCode).toBe(404);
+    expect(response.json()).toMatchObject({ code: 'agent_not_found' });
+
+    await app.close();
+  });
+
+  it('returns 403 when the agent was revoked mid-rotation', async () => {
+    const { app } = await buildRotateApp({
+      attachAgent: {
+        agentId: FIXTURE_AGENT_ID,
+        userId: FIXTURE_USER_ID,
+        capabilities: ['code-generation'],
+        usedPreviousToken: false
+      },
+      rotateError: new AgentsCollectionUnavailableError(
+        'AGENT_REVOKED',
+        `Agent ${FIXTURE_AGENT_ID} is revoked`
+      )
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/agent/rotate-token',
+      headers: { authorization: 'Bearer current-token' },
+      payload: {}
+    });
+
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toMatchObject({ code: 'agent_revoked' });
+
+    await app.close();
+  });
+
+  it('returns 503 when Firestore raises an unknown sub-code', async () => {
+    const { app } = await buildRotateApp({
+      attachAgent: {
+        agentId: FIXTURE_AGENT_ID,
+        userId: FIXTURE_USER_ID,
+        capabilities: ['code-generation'],
+        usedPreviousToken: false
+      },
+      rotateError: new AgentsCollectionUnavailableError(
+        'FIRESTORE_UNAVAILABLE',
+        'Firestore not available'
+      )
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/agent/rotate-token',
+      headers: { authorization: 'Bearer current-token' },
+      payload: {}
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toMatchObject({
+      code: 'agents_collection_unavailable'
+    });
+    expect(response.json().details?.code).toBe('FIRESTORE_UNAVAILABLE');
+
+    await app.close();
+  });
+
+  it('returns 503 generic when rotate throws an unknown Error', async () => {
+    const { app } = await buildRotateApp({
+      attachAgent: {
+        agentId: FIXTURE_AGENT_ID,
+        userId: FIXTURE_USER_ID,
+        capabilities: ['code-generation'],
+        usedPreviousToken: false
+      },
+      rotateError: new Error('something exploded')
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/agent/rotate-token',
+      headers: { authorization: 'Bearer current-token' },
+      payload: {}
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toMatchObject({
+      code: 'agents_collection_unavailable',
+      message: 'Token rotation failed'
     });
 
     await app.close();

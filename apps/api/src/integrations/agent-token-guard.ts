@@ -104,7 +104,11 @@ export interface AgentAuthEvent {
     | 'auth_failed_no_token'
     | 'auth_failed_no_match'
     | 'auth_failed_revoked'
-    | 'auth_failed_unknown_token';
+    | 'auth_failed_unknown_token'
+    /** Lifecycle events emitted by route handlers, not the guard. */
+    | 'agent_registered'
+    | 'token_rotated'
+    | 'agent_revoked';
   readonly latencyMs: number;
   readonly ip?: string;
   readonly userAgent?: string;
