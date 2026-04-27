@@ -776,6 +776,259 @@ describe('POST /v1/agent/rotate-token — auth + edge cases', () => {
   });
 });
 
+// --- Part 3.F: read paths ---------------------------------------------
+
+const buildReadApp = async (
+  records: AgentRecord[],
+  options: { operatorId?: string } = {}
+): Promise<{
+  app: FastifyInstance;
+}> => {
+  const app = Fastify({ logger: false });
+  const repoState: FakeRepoState = {
+    records: new Map(records.map((r) => [r.agentId, r])),
+    createCalls: []
+  };
+  const repo = buildFakeLifecycleRepository(repoState);
+  const userGuard = async (
+    request: Parameters<Parameters<typeof app.addHook>[1]>[0]
+  ): Promise<void> => {
+    if (options.operatorId !== undefined) {
+      (request as unknown as {
+        authSession?: { currentUser?: { operatorId: string } };
+        currentUser?: { operatorId: string };
+      }).authSession = { currentUser: { operatorId: options.operatorId } };
+      (request as unknown as {
+        currentUser?: { operatorId: string };
+      }).currentUser = { operatorId: options.operatorId };
+    }
+  };
+  await registerAgentRegistrationRoutes(app, {
+    lifecycleRepository: repo,
+    audit: buildAuditSpy(),
+    userGuard,
+    agentTokenGuard: async () => {
+      /* unused */
+    },
+    currentAgentVersion: '0.1.0',
+    now: () => FIXTURE_NOW,
+    generateRawToken: () => 'unused'
+  });
+  return { app };
+};
+
+const buildAgentRecord = (
+  over: Partial<AgentRecord> = {}
+): AgentRecord => ({
+  agentId: FIXTURE_AGENT_ID,
+  userId: FIXTURE_USER_ID,
+  machineName: 'studio-pc',
+  capabilities: ['code-generation'],
+  tokenHash: '$2b$12$abc',
+  tokenLookupHash: 'a'.repeat(16),
+  tokenIssuedAt: '2026-04-20T00:00:00.000Z',
+  tokenLastRotatedAt: null,
+  tokenUseCount: 0,
+  previousTokenHash: null,
+  previousTokenLookupHash: null,
+  previousTokenExpiresAt: null,
+  oldTokenUsageCount: 0,
+  online: false,
+  lastConnectAt: null,
+  lastDisconnectAt: null,
+  lastHeartbeatAt: null,
+  createdAt: '2026-04-20T00:00:00.000Z',
+  updatedAt: '2026-04-20T00:00:00.000Z',
+  revoked: false,
+  revokedAt: null,
+  revokedReason: null,
+  ...over
+});
+
+describe('GET /v1/agent/list', () => {
+  it('returns 401 when no operator session is present', async () => {
+    const { app } = await buildReadApp([], { operatorId: undefined });
+    const response = await app.inject({
+      method: 'GET',
+      url: '/v1/agent/list'
+    });
+    expect(response.statusCode).toBe(401);
+    await app.close();
+  });
+
+  it('returns an empty list for a user with no agents', async () => {
+    const { app } = await buildReadApp([], { operatorId: FIXTURE_USER_ID });
+    const response = await app.inject({
+      method: 'GET',
+      url: '/v1/agent/list'
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ agents: [] });
+    await app.close();
+  });
+
+  it('only returns agents owned by the calling user', async () => {
+    const mine = buildAgentRecord({
+      agentId: '11111111-2222-4111-8111-111111111111'
+    });
+    const theirs = buildAgentRecord({
+      agentId: '22222222-3333-4222-8222-222222222222',
+      userId: 'someone-else'
+    });
+    const { app } = await buildReadApp([mine, theirs], {
+      operatorId: FIXTURE_USER_ID
+    });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/v1/agent/list'
+    });
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.agents).toHaveLength(1);
+    expect(body.agents[0].agentId).toBe('11111111-2222-4111-8111-111111111111');
+
+    await app.close();
+  });
+
+  it('strips bcrypt + lookup hashes from the response (AgentSummary shape)', async () => {
+    const mine = buildAgentRecord({
+      agentId: '11111111-2222-4111-8111-111111111111'
+    });
+    const { app } = await buildReadApp([mine], {
+      operatorId: FIXTURE_USER_ID
+    });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/v1/agent/list'
+    });
+    const body = response.json();
+    const projected = body.agents[0] as Record<string, unknown>;
+    expect(projected.tokenHash).toBeUndefined();
+    expect(projected.tokenLookupHash).toBeUndefined();
+    expect(projected.previousTokenHash).toBeUndefined();
+    expect(projected.previousTokenLookupHash).toBeUndefined();
+    expect(projected.userId).toBeUndefined();
+    expect(projected.revoked).toBeUndefined();
+
+    await app.close();
+  });
+
+  it('reports onlineState=online when the agent is freshly heartbeating', async () => {
+    const mine = buildAgentRecord({
+      online: true,
+      lastHeartbeatAt: new Date(FIXTURE_NOW.getTime() - 30_000).toISOString()
+    });
+    const { app } = await buildReadApp([mine], {
+      operatorId: FIXTURE_USER_ID
+    });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/v1/agent/list'
+    });
+    expect(response.json().agents[0].onlineState).toBe('online');
+
+    await app.close();
+  });
+
+  it('reports onlineState=offline when heartbeat is stale', async () => {
+    const mine = buildAgentRecord({
+      online: true,
+      lastHeartbeatAt: new Date(
+        FIXTURE_NOW.getTime() - 5 * 60 * 1000
+      ).toISOString()
+    });
+    const { app } = await buildReadApp([mine], {
+      operatorId: FIXTURE_USER_ID
+    });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/v1/agent/list'
+    });
+    expect(response.json().agents[0].onlineState).toBe('offline');
+
+    await app.close();
+  });
+});
+
+describe('GET /v1/agent/:agentId/status', () => {
+  it('returns 401 when no operator session is present', async () => {
+    const { app } = await buildReadApp([buildAgentRecord()], {
+      operatorId: undefined
+    });
+    const response = await app.inject({
+      method: 'GET',
+      url: `/v1/agent/${FIXTURE_AGENT_ID}/status`
+    });
+    expect(response.statusCode).toBe(401);
+    await app.close();
+  });
+
+  it('returns 200 with the AgentSummary projection for the owner', async () => {
+    const mine = buildAgentRecord({
+      online: true,
+      lastHeartbeatAt: new Date(FIXTURE_NOW.getTime() - 1_000).toISOString(),
+      machineName: 'render-pc',
+      capabilities: ['code-generation', 'shell-execution'],
+      oldTokenUsageCount: 4
+    });
+    const { app } = await buildReadApp([mine], {
+      operatorId: FIXTURE_USER_ID
+    });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/v1/agent/${FIXTURE_AGENT_ID}/status`
+    });
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.agentId).toBe(FIXTURE_AGENT_ID);
+    expect(body.machineName).toBe('render-pc');
+    expect(body.capabilities).toEqual(['code-generation', 'shell-execution']);
+    expect(body.onlineState).toBe('online');
+    expect(body.oldTokenUsageCount).toBe(4);
+
+    await app.close();
+  });
+
+  it('returns 404 when the agent does not exist', async () => {
+    const { app } = await buildReadApp([], {
+      operatorId: FIXTURE_USER_ID
+    });
+    const response = await app.inject({
+      method: 'GET',
+      url: '/v1/agent/99999999-9999-4999-8999-999999999999/status'
+    });
+    expect(response.statusCode).toBe(404);
+    expect(response.json()).toMatchObject({ code: 'agent_not_found' });
+    await app.close();
+  });
+
+  it('returns 404 (not 403) when the agent belongs to a different user', async () => {
+    // Cross-user lookup must NOT leak existence — the route
+    // returns 404 even though the doc exists. This is the
+    // same pattern as getTask in the operator repository.
+    const theirs = buildAgentRecord({
+      userId: 'someone-else'
+    });
+    const { app } = await buildReadApp([theirs], {
+      operatorId: FIXTURE_USER_ID
+    });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/v1/agent/${FIXTURE_AGENT_ID}/status`
+    });
+    expect(response.statusCode).toBe(404);
+    expect(response.json()).toMatchObject({ code: 'agent_not_found' });
+
+    await app.close();
+  });
+});
+
 describe('POST /v1/agent/register — audit resilience', () => {
   it('still returns 201 when the audit writer throws', async () => {
     const app = Fastify({ logger: false });

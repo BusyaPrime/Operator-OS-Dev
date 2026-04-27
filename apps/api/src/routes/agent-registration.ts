@@ -107,9 +107,6 @@ export const registerAgentRegistrationRoutes = async (
   // the next route commits will pick up. They're here in the
   // interface so 3.D, 3.E, 3.F, 3.G can share one wiring point.
   void options.currentAgentVersion;
-  void projectListResponse;
-  void agentListResponseSchema;
-  void agentStatusResponseSchema;
   void agentRevokeResponseSchema;
   void agentLatestVersionResponseSchema;
 
@@ -336,6 +333,71 @@ export const registerAgentRegistrationRoutes = async (
           'Token rotation failed'
         );
       }
+    }
+  );
+
+  // GET /v1/agent/list — return every agent owned by the
+  // authenticated user. Mobile polls this periodically to
+  // refresh its devices view (Phase 4.0 Part 7); the
+  // real-time updates come via the SSE fan-out in Part 7
+  // once TD-058 lands.
+  app.get(
+    '/v1/agent/list',
+    { preHandler: options.userGuard },
+    async (request, reply) => {
+      const userId = request.authSession?.currentUser?.operatorId;
+      if (userId === undefined || userId.length === 0) {
+        reply.status(401);
+        return routeError(
+          'unauthorized',
+          'Authenticated session required'
+        );
+      }
+
+      const records = await options.lifecycleRepository.listForUser(userId);
+      const projected = projectListResponse(records, now());
+      return agentListResponseSchema.parse(projected);
+    }
+  );
+
+  // GET /v1/agent/:id/status — return the slim status
+  // projection for one specific agent. Same auth as /list;
+  // 404 if the agent doesn't exist OR belongs to a different
+  // user (we don't leak existence cross-user).
+  app.get(
+    '/v1/agent/:agentId/status',
+    { preHandler: options.userGuard },
+    async (request, reply) => {
+      const userId = request.authSession?.currentUser?.operatorId;
+      if (userId === undefined || userId.length === 0) {
+        reply.status(401);
+        return routeError(
+          'unauthorized',
+          'Authenticated session required'
+        );
+      }
+
+      const params = request.params as { agentId?: string };
+      const agentId = params.agentId;
+      if (typeof agentId !== 'string' || agentId.length === 0) {
+        reply.status(400);
+        return routeError('bad_request', 'agentId path param is required');
+      }
+
+      const record = await options.lifecycleRepository.getById(agentId);
+      if (record === undefined || record.userId !== userId) {
+        // Cross-user lookup — pretend the agent doesn't
+        // exist. This is the same pattern as
+        // FirestoreOperatorRepository.getTask which returns
+        // undefined on ownership mismatch so the route can
+        // 404 without leaking that someone else has the id.
+        reply.status(404);
+        return routeError('agent_not_found', `Agent ${agentId} not found`);
+      }
+
+      return agentStatusResponseSchema.parse(
+        projectAgentSummary(record, now().getTime())
+      );
     }
   );
 };
