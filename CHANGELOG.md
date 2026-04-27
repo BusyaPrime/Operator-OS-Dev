@@ -6,6 +6,57 @@ All notable changes to Operator-OS land here. Format follows
 
 ## Unreleased
 
+### Phase 4.0 Part 4 — Agent-side token management
+
+#### Added
+
+- `DpapiCredentialStore` (`apps/desktop-agent/src/auth/credential-store.ts`):
+  per-machine token at rest under `%APPDATA%/OperatorOS/.credentials/<sanitized-target>.dpapi`,
+  encrypted with PowerShell `ProtectedData` (DPAPI ScopeCurrentUser),
+  atomic .tmp+rename writes. Plus `InMemoryCredentialStore` for tests.
+  `AGENT_TOKEN_TARGET = 'OperatorOS:agent-token'` exported as the
+  canonical key.
+- Registration CLI: `pnpm --filter @operator-os/desktop-agent register`
+  — six-step UX with Max-session preflight, JWT shape + expiry
+  validation, hostname normalisation, register-then-self-test
+  round-trip, Credential Manager write.
+- `TokenRotator`: signal-driven rotation per ADR-025 amendment 1.
+  Single-flight, exponential backoff (1s → 60s ceiling, 6
+  attempts), 401 → fatal-non-retryable, 409 → no-op
+  (server says rotation already in flight), atomic store
+  update (write → read-back → confirm), 6h periodic safety-net
+  timer with 25d local age trigger.
+- `TokenAuthSignals` shared event surface + `noopAuthSignals`.
+- REST client (`DesktopApiClient`) now reads token fresh from
+  the credential store on every request, fires
+  `signals.onRotationHinted` on `X-Token-Rotation-Recommended`
+  observation, fires `signals.onUnauthorized({source: 'rest'})`
+  on 401. Closes TD-056 (legacy heartbeat 401s).
+- WS path (`ControlChannelWs`) accepts `tokenProvider` +
+  `authSignals`, reads token fresh on every (re)connect,
+  observes `X-Token-Rotation-Recommended` on the upgrade
+  response, fires `signals.onUnauthorized` on close code 4001
+  or upgrade error 401.
+- `FatalAuthHandler` subscribes to `onUnauthorized`. First
+  observation logs structured fatal + exits with code 87
+  (`AGENT_TOKEN_REVOKED_EXIT_CODE`). Idempotent. Phase 4.0
+  Part 6's Scheduled Task XML will key off the exit code to
+  stop auto-restart loops.
+- `main.ts` wires all four building blocks together; backward-
+  compat fallback keeps the legacy `CONTROL_CHANNEL_TOKEN` env
+  var path working for dev / smoke flows.
+- Rotation-cascade integration test exercises:
+  upgrade-header → rotator → store → next connect, WS close
+  4001 → fatal exit, rotator 401 → fatal exit.
+
+#### Quality
+
+- `@operator-os/desktop-agent`: 156 → 229 (+73 across 4.A-G).
+- Cumulative TD-056 closure: REST 401s on
+  `/v1/agent/heartbeat` + `/v1/agent/commands` no longer
+  ignored — Authorization header attached on every call,
+  401 cascades to the FatalAuthHandler.
+
 ### Phase 4.0 — Always-On Agent + Max Subscription
 
 #### Added
