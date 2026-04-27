@@ -16,21 +16,29 @@ const FIXTURE_AGENT_ID = 'c5d8b6f0-9ec5-4c7f-8d1a-3a2b1c4d5e6f';
 const FIXTURE_USER_ID = 'user-akmal';
 const FIXTURE_NOW = new Date('2026-04-27T12:00:00Z').getTime();
 
+const tokenLookupHashFor = async (rawToken: string): Promise<string> => {
+  const { createHash } = await import('node:crypto');
+  return createHash('sha256').update(rawToken).digest('hex').slice(0, 16);
+};
+
 const buildRecord = async (
   rawToken: string,
   overrides: Partial<AgentRecord> = {}
 ): Promise<AgentRecord> => {
   const tokenHash = await bcrypt.hash(rawToken, 4); // low cost for fast tests
+  const tokenLookupHash = await tokenLookupHashFor(rawToken);
   return {
     agentId: FIXTURE_AGENT_ID,
     userId: FIXTURE_USER_ID,
     machineName: 'studio-pc',
     capabilities: ['code-generation'],
     tokenHash,
+    tokenLookupHash,
     tokenIssuedAt: '2026-04-20T00:00:00.000Z',
     tokenLastRotatedAt: null,
     tokenUseCount: 0,
     previousTokenHash: null,
+    previousTokenLookupHash: null,
     previousTokenExpiresAt: null,
     oldTokenUsageCount: 0,
     online: false,
@@ -50,21 +58,32 @@ const buildRepo = (
   initialRecords: ReadonlyArray<AgentRecord> = []
 ): AgentRecordRepository & {
   candidatesCalls: number;
+  lastLookupHash: string | undefined;
   incrementCalls: string[];
   records: AgentRecord[];
 } => {
   const records: AgentRecord[] = [...initialRecords];
   const incrementCalls: string[] = [];
   let candidatesCalls = 0;
+  let lastLookupHash: string | undefined;
   return {
     records,
     incrementCalls,
     get candidatesCalls() {
       return candidatesCalls;
     },
-    async findCandidatesByTokenPrefix(_prefix: string) {
+    get lastLookupHash() {
+      return lastLookupHash;
+    },
+    async findCandidatesByTokenLookup(lookupHash: string) {
       candidatesCalls += 1;
-      return records.filter((r) => !r.revoked || true);
+      lastLookupHash = lookupHash;
+      // Filter to records whose current OR previous lookup matches.
+      return records.filter(
+        (r) =>
+          r.tokenLookupHash === lookupHash ||
+          r.previousTokenLookupHash === lookupHash
+      );
     },
     async incrementOldTokenUsage(agentId: string) {
       incrementCalls.push(agentId);
@@ -218,8 +237,10 @@ describe('agentTokenGuard — overlap window (previous hash)', () => {
     const previousToken = 'CCCCCCCC-old-token-pre-rotation';
     const newToken = 'DDDDDDDD-new-token-post-rotation';
     const previousTokenHash = await bcrypt.hash(previousToken, 4);
+    const previousTokenLookupHash = await tokenLookupHashFor(previousToken);
     const record = await buildRecord(newToken, {
       previousTokenHash,
+      previousTokenLookupHash,
       previousTokenExpiresAt: new Date(
         FIXTURE_NOW + 60 * 60 * 1000 // expires in 1h
       ).toISOString()
@@ -253,8 +274,10 @@ describe('agentTokenGuard — overlap window (previous hash)', () => {
     const previousToken = 'EEEEEEEE-stale-old-token';
     const newToken = 'FFFFFFFF-active-token';
     const previousTokenHash = await bcrypt.hash(previousToken, 4);
+    const previousTokenLookupHash = await tokenLookupHashFor(previousToken);
     const record = await buildRecord(newToken, {
       previousTokenHash,
+      previousTokenLookupHash,
       previousTokenExpiresAt: new Date(
         FIXTURE_NOW - 1000 // expired 1 sec ago
       ).toISOString()
@@ -283,8 +306,10 @@ describe('agentTokenGuard — overlap window (previous hash)', () => {
     const previousToken = 'GGGGGGGG-old-token';
     const newToken = 'HHHHHHHH-new-token';
     const previousTokenHash = await bcrypt.hash(previousToken, 4);
+    const previousTokenLookupHash = await tokenLookupHashFor(previousToken);
     const record = await buildRecord(newToken, {
       previousTokenHash,
+      previousTokenLookupHash,
       previousTokenExpiresAt: new Date(
         FIXTURE_NOW + 60 * 60 * 1000
       ).toISOString()
@@ -352,17 +377,45 @@ describe('agentTokenGuard — repo returns no candidates', () => {
   });
 });
 
-describe('agentTokenGuard — multiple candidates (prefix collision)', () => {
-  it('finds the right record when 2+ candidates share a prefix', async () => {
-    const tokenA = 'KKKKKKKK-shared-prefix-token-A';
-    const tokenB = 'KKKKKKKK-shared-prefix-token-B';
+describe('agentTokenGuard — lookup-hash routing', () => {
+  it('passes the sha256(token).slice(0,16) lookup hash to the repository', async () => {
+    const token = 'KKKKKKKK-routed-token';
+    const expectedLookup = await tokenLookupHashFor(token);
+    const record = await buildRecord(token);
+    const repo = buildRepo([record]);
+    const { app } = buildApp({ repository: repo });
+
+    await app.inject({
+      method: 'GET',
+      url: '/protected',
+      headers: { authorization: `Bearer ${token}` }
+    });
+    expect(repo.lastLookupHash).toBe(expectedLookup);
+    expect(repo.lastLookupHash).toHaveLength(16);
+
+    await app.close();
+  });
+
+  it('finds the right record when the repository returns multiple candidates', async () => {
+    const tokenA = 'AAAAAAAA-routed-A';
+    const tokenB = 'BBBBBBBB-routed-B';
     const recordA = await buildRecord(tokenA, {
       agentId: '11111111-1111-4111-8111-111111111111'
     });
     const recordB = await buildRecord(tokenB, {
       agentId: '22222222-2222-4222-8222-222222222222'
     });
-    const repo = buildRepo([recordA, recordB]);
+    // Mock repo that ignores the lookup hash and returns BOTH
+    // candidates — simulates the rare collision case the bcrypt
+    // step is supposed to disambiguate.
+    const repo: AgentRecordRepository = {
+      async findCandidatesByTokenLookup() {
+        return [recordA, recordB];
+      },
+      async incrementOldTokenUsage() {
+        /* noop */
+      }
+    };
     const { app, protectedAgent } = buildApp({ repository: repo });
 
     const response = await app.inject({
@@ -427,14 +480,16 @@ describe('agentTokenGuard — increment failure does not break auth', () => {
     const previousToken = 'NNNNNNNN-old-tok';
     const newToken = 'OOOOOOOO-new-tok';
     const previousTokenHash = await bcrypt.hash(previousToken, 4);
+    const previousTokenLookupHash = await tokenLookupHashFor(previousToken);
     const record = await buildRecord(newToken, {
       previousTokenHash,
+      previousTokenLookupHash,
       previousTokenExpiresAt: new Date(
         FIXTURE_NOW + 60 * 60 * 1000
       ).toISOString()
     });
     const repo: AgentRecordRepository = {
-      async findCandidatesByTokenPrefix() {
+      async findCandidatesByTokenLookup() {
         return [record];
       },
       async incrementOldTokenUsage() {

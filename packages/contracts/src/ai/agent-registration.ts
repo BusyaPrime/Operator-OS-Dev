@@ -245,6 +245,15 @@ export const TOKEN_ROTATION_RECOMMENDED_HEADER =
  *
  * `tokenHash` and `previousTokenHash` are bcrypt hashes; the
  * raw tokens are never stored, only the hashes.
+ *
+ * `tokenLookupHash` and `previousTokenLookupHash` are
+ * sha256(rawToken).slice(0,16) — the indexable fields the
+ * agentTokenGuard uses to narrow the candidate set during
+ * auth. Indexable because they're deterministic; safe
+ * because they're a one-way hash of a 256-bit secret. They
+ * MUST be coherent with their bcrypt counterparts: when
+ * `tokenHash` is rotated, both `tokenLookupHash` and
+ * `tokenHash` are written in the same Firestore update.
  */
 export const agentRecordSchema = z.object({
   agentId: agentIdSchema,
@@ -252,10 +261,12 @@ export const agentRecordSchema = z.object({
   machineName: machineNameSchema,
   capabilities: z.array(agentCapabilitySchema),
   tokenHash: z.string().min(1),
+  tokenLookupHash: z.string().length(16),
   tokenIssuedAt: isoTimestampSchema,
   tokenLastRotatedAt: isoTimestampSchema.nullable(),
   tokenUseCount: z.number().int().nonnegative(),
   previousTokenHash: z.string().min(1).nullable(),
+  previousTokenLookupHash: z.string().length(16).nullable(),
   previousTokenExpiresAt: isoTimestampSchema.nullable(),
   oldTokenUsageCount: z.number().int().nonnegative(),
   online: z.boolean(),

@@ -56,26 +56,29 @@ export interface AuthenticatedAgent {
  * directly — keeps the bcrypt path testable and the storage
  * dependency injected.
  *
- * The guard only needs a read by token-prefix (so it can find
- * the right doc among many) and an "increment old-token usage"
- * write. Other lifecycle ops (register / rotate / revoke)
- * live on a richer service interface in Part 3.D-onwards.
+ * The guard only needs a read by token-lookup-hash (so it
+ * can find the right doc among many) and an "increment
+ * old-token usage" write. Other lifecycle ops (register /
+ * rotate / revoke) live on a richer service interface in
+ * Part 3.D-onwards.
  */
 export interface AgentRecordRepository {
   /**
-   * Look up agent records that *might* match the bearer token.
-   * Implementations should narrow by an indexable prefix
-   * (e.g. first 8 chars of the raw token, persisted alongside
-   * the bcrypt hash). The guard then does a bcrypt comparison
-   * against each candidate.
+   * Look up agent records whose `tokenLookupHash` OR
+   * `previousTokenLookupHash` matches the supplied
+   * deterministic hash (sha256(rawToken).slice(0,16)).
+   * Implementations index both fields and union the matches.
+   * The guard then does a bcrypt comparison against each
+   * candidate's two hash fields to confirm the match before
+   * authenticating.
    *
-   * For Phase 4.0 single-user deployments the index won't see
-   * collisions at the 8-char prefix level (entropy = 48 bits),
-   * but the API contract takes a list to keep the design
-   * scalable.
+   * The lookup hash is one-way (sha256), so storing it as an
+   * indexed field doesn't leak useful information about the
+   * raw token. Collision rate at 64 bits is negligible at
+   * the foreseeable agent count.
    */
-  readonly findCandidatesByTokenPrefix: (
-    prefix: string
+  readonly findCandidatesByTokenLookup: (
+    lookupHash: string
   ) => Promise<ReadonlyArray<AgentRecord>>;
 
   /**
@@ -197,12 +200,6 @@ export interface CreateAgentTokenGuardOptions {
    */
   readonly audit?: AgentAuditWriter;
   /**
-   * How many chars to look up by prefix. 8 = 48 bits of
-   * entropy in our base64url alphabet, plenty to avoid
-   * collisions for single-tenant deploys.
-   */
-  readonly tokenPrefixLength?: number;
-  /**
    * Cache configuration. Tests pass a deterministic clock
    * via `now`. Production omits to take real time.
    */
@@ -217,6 +214,32 @@ export interface CreateAgentTokenGuardOptions {
    */
   readonly now?: () => number;
 }
+
+/**
+ * Length of the lookup hash field stored on the agent record
+ * + indexed in Firestore. 16 hex chars = 64 bits of one-way
+ * sha256 output — no useful information about the raw 256-bit
+ * token, but indexable for O(1) Firestore lookup. Constant is
+ * exported so the Firestore wrapper + the guard agree on the
+ * exact slice length.
+ */
+export const AGENT_TOKEN_LOOKUP_HASH_LENGTH = 16;
+
+/**
+ * Compute the indexable lookup hash for a raw agent token.
+ * This is the only place the derivation logic lives — the
+ * guard, the repository implementation, and any future
+ * tooling all import this helper to stay consistent.
+ */
+export const agentTokenLookupHash = async (
+  token: string
+): Promise<string> => {
+  const { createHash } = await import('node:crypto');
+  return createHash('sha256')
+    .update(token)
+    .digest('hex')
+    .slice(0, AGENT_TOKEN_LOOKUP_HASH_LENGTH);
+};
 
 /**
  * Augment the FastifyRequest type at the api level so route
@@ -278,7 +301,6 @@ export const createAgentTokenGuard = (
   options: CreateAgentTokenGuardOptions
 ): preHandlerAsyncHookHandler => {
   const audit = options.audit ?? noopAudit;
-  const tokenPrefixLength = options.tokenPrefixLength ?? 8;
   const now = options.now ?? Date.now;
   const cache = new TokenAuthCache(
     options.cache?.maxEntries ?? DEFAULT_CACHE_MAX,
@@ -341,9 +363,9 @@ export const createAgentTokenGuard = (
       }
     }
 
-    const prefix = token.slice(0, tokenPrefixLength);
-    const candidates = await options.repository.findCandidatesByTokenPrefix(
-      prefix
+    const lookupHash = await agentTokenLookupHash(token);
+    const candidates = await options.repository.findCandidatesByTokenLookup(
+      lookupHash
     );
 
     if (candidates.length === 0) {
