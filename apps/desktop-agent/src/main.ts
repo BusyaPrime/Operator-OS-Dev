@@ -14,6 +14,12 @@ import {
   buildEchoStubManifest,
   createEchoStubExecutor
 } from './agents/echo-stub-agent/index.js';
+import {
+  AGENT_TOKEN_TARGET,
+  DpapiCredentialStore
+} from './auth/credential-store.js';
+import { FatalAuthHandler } from './auth/fatal-auth-handler.js';
+import { TokenRotator } from './auth/token-rotator.js';
 import { getDesktopAgentConfig } from './config.js';
 import { createLogger } from './logger.js';
 import {
@@ -128,20 +134,95 @@ if (requestedMode === 'echo-stub') {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 4.0 Part 4 wiring — agent-side token management.
+//
+// Composition order:
+//
+//   1. DpapiCredentialStore reads the per-machine token
+//      from `%APPDATA%/OperatorOS/.credentials/...` (Part 4.A).
+//      Only constructed when CONTROL_CHANNEL_URL is set; legacy
+//      CONTROL_CHANNEL_TOKEN env path stays as a fallback for
+//      dev / one-off testing.
+//
+//   2. FatalAuthHandler subscribes to TokenAuthSignals
+//      .onUnauthorized; on first 401 it logs structured
+//      fatal + exits with code 87 (Part 4.F). The Phase 4.0
+//      Part 6 install script's Scheduled Task XML knows
+//      about this code.
+//
+//   3. TokenRotator watches for X-Token-Rotation-Recommended
+//      observations from the REST + WS paths. Every rotation
+//      writes the new token back to the CredentialStore so
+//      the next REST/WS call picks it up automatically
+//      (Part 4.C + 4.D + 4.E).
+//
+//   4. ControlChannelWs reads its bearer token via a fresh
+//      tokenProvider closure that hits the CredentialStore on
+//      every connect / reconnect.
+//
+// All four components share the SAME `TokenAuthSignals` value
+// built by `fatalHandler.attachTo(rotator.triggerRotation)`.
+// ---------------------------------------------------------------------------
+
 const controlChannelUrl = process.env.CONTROL_CHANNEL_URL;
-const controlChannelToken = process.env.CONTROL_CHANNEL_TOKEN;
-const controlChannel =
-  controlChannelUrl && controlChannelToken
-    ? new ControlChannelWs({
-        url: controlChannelUrl,
-        authToken: controlChannelToken,
-        agentId: config.AGENT_ID,
-        manifest: executorSetup.manifest,
-        executor: executorSetup.executor,
-        supportedCapabilities: executorSetup.supportedCapabilities,
-        logger
-      })
-    : undefined;
+const legacyControlChannelToken = process.env.CONTROL_CHANNEL_TOKEN;
+const apiBaseUrl = config.API_BASE_URL;
+
+const credentialStore = new DpapiCredentialStore();
+const fatalAuthHandler = new FatalAuthHandler({ logger });
+
+let tokenRotator: TokenRotator | undefined;
+let storedAgentToken: string | null = null;
+
+if (controlChannelUrl !== undefined) {
+  try {
+    storedAgentToken = await credentialStore.getToken(AGENT_TOKEN_TARGET);
+  } catch (err) {
+    logger.warn(
+      { err, source: 'main' },
+      'credential store read failed at startup; falling back to env var if set'
+    );
+  }
+}
+
+const authSignals = fatalAuthHandler.attachTo(() => {
+  tokenRotator?.triggerRotation();
+});
+
+if (storedAgentToken !== null) {
+  tokenRotator = new TokenRotator({
+    apiBaseUrl,
+    credentialStore,
+    authSignals,
+    logger,
+    fetch: globalThis.fetch
+  });
+}
+
+const controlChannel = controlChannelUrl
+  ? new ControlChannelWs({
+      url: controlChannelUrl,
+      // Production: tokenProvider reads from the credential
+      // store on every (re)connect. Backward-compat fallback:
+      // the legacy CONTROL_CHANNEL_TOKEN env var if no token
+      // is in the store.
+      ...(storedAgentToken !== null
+        ? {
+            tokenProvider: () =>
+              credentialStore.getToken(AGENT_TOKEN_TARGET),
+            authSignals
+          }
+        : legacyControlChannelToken
+          ? { authToken: legacyControlChannelToken }
+          : { tokenProvider: async () => null, authSignals }),
+      agentId: config.AGENT_ID,
+      manifest: executorSetup.manifest,
+      executor: executorSetup.executor,
+      supportedCapabilities: executorSetup.supportedCapabilities,
+      logger
+    })
+  : undefined;
 
 let shuttingDown = false;
 
@@ -154,6 +235,7 @@ const shutdown = async (signal: string) => {
   logger.info({ signal }, 'desktop runtime shutdown requested');
 
   try {
+    await tokenRotator?.stop();
     await controlChannel?.stop();
     if (executorSetup.claudeCodeAgent) {
       await executorSetup.claudeCodeAgent.stop('shutdown');
@@ -182,11 +264,20 @@ if (controlChannel) {
     {
       source: 'main',
       url: controlChannelUrl,
-      executor: executorSetup.mode
+      executor: executorSetup.mode,
+      authMode: storedAgentToken !== null ? 'credential-store' : 'legacy-env'
     },
     'starting Phase 3.2 control channel'
   );
   controlChannel.start();
+}
+
+if (tokenRotator) {
+  logger.info(
+    { source: 'main', apiBaseUrl },
+    'starting Phase 4.0 token rotator (periodic safety net)'
+  );
+  tokenRotator.start();
 }
 
 // path import keeps the dependency declared even when scoping is
