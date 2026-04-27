@@ -17,6 +17,7 @@
     "build": "pnpm exec tsc -p tsconfig.json",
     "dev": "pnpm exec tsx watch src/main.ts",
     "lint": "pnpm exec eslint \"src/**/*.ts\" --ignore-pattern \"src/**/*.test.ts\"",
+    "register": "pnpm exec tsx src/cli/register-bin.ts",
     "start": "node dist/main.js",
     "test": "pnpm exec vitest run",
     "typecheck": "pnpm exec tsc -p tsconfig.json --noEmit"
