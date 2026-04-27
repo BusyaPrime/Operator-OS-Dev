@@ -3625,3 +3625,271 @@ dev-named client.
 
 - 2026-04-25: filed alongside Phase 3.4 first APK to flag the
   dev-named client as a future cleanup item.
+
+## TD-054: Mobile SSE consumer crashes on Response.body.getReader()
+
+Discovered: 2026-04-25 (Phase 3.4 R23 end-to-end smoke test —
+    mobile-submitted task `3e4482ad-c790-4137-9ed8-b573fc4b10b5`
+    completed agent-side, but the streaming-output screen
+    rendered the runtime error
+    "Cannot read property 'getReader' of undefined")
+Type: dependency / runtime crash
+Priority: P1
+Status: open
+Trigger: P1 — blocks the mobile streaming display; backend pipe
+    is fully proven so this is the only mobile-side gap left
+    before the manual smoke is fully green.
+
+### Description
+
+Phase 3.3 c14 picked `@microsoft/fetch-event-source ^2.0.1`
+(see TD-043). The library is correct on web + Node but
+internally calls `response.body.getReader()` on the `Response`
+returned by the host's `fetch`. React Native's built-in
+`fetch` (Hermes / iOS / Android) does NOT expose `Response.body`
+as a `ReadableStream` — `body` is `undefined`. The first SSE
+delta therefore throws inside the library, the catch surfaces
+the error to the screen as a literal string, and no further
+deltas render.
+
+Repro is fully deterministic:
+
+1. Backend confirmed working (curl-based: api SSE returns
+   `delta`, `status`, `completed` events with correct payload).
+2. Mobile POST /v1/tasks succeeds (taskId returned).
+3. Mobile UI navigates to streaming-output screen.
+4. SSE consumer crashes immediately with the getReader error.
+5. Desktop agent processes the same task ID and logs
+   `task settled / closeReason: completed`.
+
+This is the same dep as TD-043 but TD-043 was an "audit-later"
+hygiene item; TD-054 is the active runtime crash and supersedes
+it for severity / urgency. TD-043 should close once TD-054
+resolves (the dep gets removed, not just audited).
+
+### Risk if unaddressed
+
+- Phase 3.4 mobile smoke cannot fully close — the streaming
+  output is the user-visible payoff of the whole pipeline.
+- Any user who submits a task sees a raw JS error string and
+  no agent reply. Looks broken even though the backend ran.
+- Deferring further means later phases pile new mobile work
+  on top of a known-broken streaming layer.
+
+### Proposed fix
+
+Swap `D:/operator-os-mobapp/src/services/sse-client.ts` from
+`@microsoft/fetch-event-source` to `react-native-sse`
+(native `EventSource` for RN, supports custom Authorization
+headers, ~30 KB, MIT, well-maintained).
+
+1. `npm install react-native-sse`.
+2. Rewrite `sse-client.ts` keeping the exported
+   `connectSse(options: SseClientOptions): SseConnection`
+   contract byte-for-byte identical (every screen depends on
+   the existing onMessage / onUnauthorized / onClose / onError /
+   lastEventId shape).
+3. Map react-native-sse events to the existing CloseReason
+   union (`'server-end' | 'reauth-needed' | 'fatal' | 'aborted'`).
+4. Update `sse-client.test.ts` — react-native-sse doesn't take
+   a fetch override, so swap the test seam to a fake
+   `EventSource` ctor injection. Keep coverage of: 401 →
+   onUnauthorized=true → reauth-needed; 401 → onUnauthorized=false
+   → fatal; clean server-end; client-aborted; lastEventId
+   resume header.
+5. `npm uninstall @microsoft/fetch-event-source`.
+6. `npm run typecheck && npm test` (both must pass).
+7. Trigger `eas build --platform android --profile preview`,
+   `adb install -r` the resulting APK, run the manual smoke
+   from the Tasks tab.
+
+Estimated: 1-2 hours.
+
+### Stale close condition
+
+Streaming-output screen renders the agent reply correctly for
+a real task, AND `@microsoft/fetch-event-source` is gone from
+`package.json`. TD-043 closes alongside.
+
+### Related
+
+- TD-043 (the broader "audit-eventually" parent — supersedes).
+- ADR *Mobile-To-Api Streaming — SSE* (Phase 3.3) —
+  Consequences section flags the underlying RN limitation.
+- Phase 3.4.1 carve-out (this TD is the carve-out).
+
+### History
+
+- 2026-04-25: filed at Phase 3.4 close after end-to-end smoke
+  exposed the runtime crash.
+
+## TD-055: Rotate `ANTHROPIC_API_KEY` (transcript leak)
+
+Discovered: 2026-04-25 (Phase 3.4 — the original API key
+    `sk-ant-api03-wS5l9...` was pasted into a chat transcript
+    by the user during smoke-test setup; the key is in the
+    conversation log by definition)
+Type: security / secrets-hygiene
+Priority: P0
+Status: open
+Trigger: rotate before the next agent run that consumes the
+    Anthropic API. The current key (`...AAA` suffix) was
+    deployed for the Phase 3.4 smoke and is otherwise
+    unrotated.
+
+### Description
+
+Per the global secrets-hygiene rule (note once, rotate, never
+re-lecture), an API key that appears in any human-readable
+transcript is compromised by definition — even if the
+transcript stays private, it has crossed enough trust
+boundaries that the assumption of secrecy no longer holds.
+Akmal acknowledged the leak, generated a replacement key
+(`sk-ant-api03-MLmsl...`, suffix `...AAA`), and verified it
+works (`claude --bare -p "Say hi in 3 words"` returned
+"Hi there, friend!"). The rotation of the leaked key was
+deferred to "after smoke test"; smoke is now done.
+
+### Risk if unaddressed
+
+- The leaked key still exists on the Anthropic account and
+  could be used by anyone with transcript access until it is
+  explicitly deleted.
+- The current desktop-agent `.env` carries the replacement
+  key, which has NOT itself been pasted in any transcript —
+  but a single misuse (a future paste, log dump, or screen
+  share) would put us back here. Treating "rotate after
+  every leak" as a habit is cheaper than tracking which key
+  is which.
+
+### Proposed fix
+
+1. https://console.anthropic.com/settings/keys
+2. Locate the leaked key (the `wS5l9` prefix one) and delete it.
+3. (Optional but recommended) rotate the replacement key too,
+   for clean state. Generate a new one, update
+   `D:/Operator-OS-Dev/apps/desktop-agent/.env`, delete the
+   replacement. End-state: exactly one current key, never
+   shared.
+4. Confirm `claude` CLI still works (`claude --bare -p "Say
+   ok"` returns a sensible reply).
+
+Estimated: 5 minutes.
+
+### Stale close condition
+
+The leaked key is removed from the Anthropic console AND a
+fresh post-rotation key is in the agent `.env`.
+
+### Related
+
+- Global rule: secrets-hygiene (`note once, rotate, never
+  re-lecture`).
+- Phase 3.4 smoke-test transcript (the original leak event).
+
+### History
+
+- 2026-04-25: filed at Phase 3.4 close; the leaked key has
+  not yet been deleted from the Anthropic console.
+
+## TD-056: `/v1/agent/heartbeat` and `/v1/agent/commands` reject operator JWT
+
+Discovered: 2026-04-25 (Phase 3.4 R23 — running the desktop
+    agent with the operator HS256 JWT as
+    `CONTROL_CHANNEL_TOKEN` produced a clean WS handshake and
+    correct task execution, but the REST heartbeat and command-
+    poll loops returned 401 on every tick)
+Type: server / auth-policy
+Priority: P3
+Status: open
+Trigger: nice-to-have — does not block any production path.
+    Worth tackling when the agent's REST surface gets revisited
+    (heartbeat-v3 or persistent command consumer landing).
+
+### Description
+
+`apps/api/src/integrations/auth.ts` exposes three Fastify
+guards:
+
+- `createOptionalGuard()` — accepts Firebase ID tokens only
+  (used by `/v1/auth/session`, `/v1/operator/dashboard`).
+- `createRequiredGuard()` — Firebase ID OR operator HS256
+  access token (no Google OIDC).
+- `createAgentGuard(audience)` — Firebase ID OR operator HS256
+  OR Google OIDC ID token for the service URL.
+
+The agent REST loops (`/v1/agent/heartbeat`, both shapes, and
+`/v1/agent/commands`) all use `createAgentGuard(...)` per
+`apps/api/src/app.ts:203,205`. So in theory an operator HS256
+JWT should be accepted. In practice, with the operator JWT
+the agent log shows:
+
+    Agent request failed with status 401
+    path: /v1/agent/heartbeat
+    path: /v1/agent/commands
+
+Either:
+
+(a) the routes are wired to a different guard than agentGuard
+    (mis-routing) and Phase 3.4 read the wrong file path; or
+(b) the operator-access-token verifier rejects JWTs whose
+    `aud` claim is `operator-os-api` but the audience check
+    inside `OperatorAccessTokenVerifier.verify()` expects
+    something else; or
+(c) the agent's `DesktopApiClient` sends the token with a
+    different `Authorization` casing / format than the WS
+    handshake (less likely — both go through the same
+    `Bearer ` template).
+
+Phase 3.4 does not block on this because the WS path —
+which is the only one task execution actually depends on —
+accepts the same operator JWT cleanly (`control channel
+welcomed sessionId 28d42751-…`). The REST 401 noise does not
+prevent task assign / progress / completed / failed frames.
+
+### Risk if unaddressed
+
+- Heartbeat data does not reach the api when the agent is
+  running on an operator JWT — observability gap for a single-
+  user dev posture. Production runs the agent under a Google
+  service identity (see TD-047), so this is dev-only noise.
+- Future engineers debugging the agent's 401 logs may waste
+  time on what is a known compatibility quirk rather than a
+  real bug.
+
+### Proposed fix
+
+1. Read `apps/api/src/routes/agent.ts` carefully — confirm
+   the heartbeat and commands routes use `routeOptions.preHandler`
+   and `routeOptions` actually maps to `agentGuard` (sanity
+   check; Phase 3.4 saw `agentGuard` registered in app.ts but
+   did not chase the indirection to ground).
+2. Add a unit test in `apps/api/src/routes/__tests__/agent.test.ts`
+   that POSTs `/v1/agent/heartbeat` with a synthetic operator
+   HS256 token and asserts 200, mirroring the working WS test.
+3. If the test reproduces the 401, fix the guard wiring or
+   the verifier's audience check so operator JWTs work
+   uniformly across WS + REST.
+4. If the test passes (i.e. Phase 3.4 saw a transient or env
+   issue), close TD-056 with "stale on first review" and a
+   short note in the History section.
+
+Estimated: 1 hour (most of it in the routing audit).
+
+### Stale close condition
+
+A unit test demonstrates that operator HS256 JWTs round-trip
+cleanly through `/v1/agent/heartbeat` AND `/v1/agent/commands`
+in the same way they already work on `/v1/agent/ws`.
+
+### Related
+
+- TD-047 (audit IAM bindings for the api + agent surfaces).
+- Phase 3.4 R23 closure report — the 401 noise was filed there
+  as a non-blocking observation.
+
+### History
+
+- 2026-04-25: filed at Phase 3.4 close; observed in the
+  desktop agent log during the end-to-end smoke. WS path
+  works fine with the same JWT.
