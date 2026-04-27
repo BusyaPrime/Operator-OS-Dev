@@ -375,18 +375,27 @@ The desktop agent reads `DESKTOP_AGENT_EXECUTOR` to pick its
 executor:
 
 - `claude-code` (default) — uses `ClaudeCodeAgent` via the
-  Phase 3.3 c7 adapter. Requires `ANTHROPIC_API_KEY` in the
-  agent process environment and the `claude` CLI on the
-  user's PATH (`claude --version` must succeed).
+  Phase 3.3 c7 adapter. Requires the `claude` CLI on the user's
+  PATH (`claude --version` must succeed) and a Claude Max OAuth
+  session at `~/.claude/.credentials.json` (the file the CLI
+  writes after `claude` interactive login). Phase 4.0 added a
+  start-time preflight that fails fast with a clear message
+  when the OAuth shape is missing.
 - `echo-stub` — uses the Phase 3.2 echo executor. No model
-  call, no API key needed. Used in CI / unit tests.
+  call, no Max session needed. Used in CI / unit tests.
 
 Set the executor in `apps/desktop-agent/.env` (gitignored):
 
 ```
-ANTHROPIC_API_KEY=sk-ant-...
 DESKTOP_AGENT_EXECUTOR=claude-code
 ```
+
+`ANTHROPIC_API_KEY` is **not** required and **not** read by the
+agent — Phase 4.0 removed the env var from the documented
+setup. The `claude` CLI in normal mode prefers the OAuth session
+over the API key; the agent does not pass `--bare`. If you do
+have the env var set in your shell, the CLI ignores it (per
+`claude --help`).
 
 The Phase 3.2 OIDC token-mint instructions (above) still apply
 for probing the internal routes locally.

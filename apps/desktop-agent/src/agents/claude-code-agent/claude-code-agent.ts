@@ -18,6 +18,12 @@ import {
 import { execa } from 'execa';
 import type { Logger } from 'pino';
 
+import {
+  MaxSessionUnavailableError,
+  verifyMaxSession,
+  type MaxSessionPreflightOptions,
+  type MaxSessionPreflightResult
+} from './max-session-preflight.js';
 import type { SpawnFn, SpawnResult, SubprocessHandle } from './spawn-types.js';
 
 export interface ClaudeCodeAgentOptions {
@@ -45,6 +51,20 @@ export interface ClaudeCodeAgentOptions {
    * SIGTERM. Default 5000.
    */
   readonly cancelGraceMs?: number;
+  /**
+   * Phase 4.0 Max-session preflight. Defaults to reading the
+   * Claude CLI's `~/.claude/.credentials.json` and verifying the
+   * `claudeAiOauth` shape; tests inject a fixture path or a
+   * pre-built result.
+   *
+   * Set to `false` to skip the preflight entirely (Phase 1.4
+   * back-compat path used by the echo-stub executor selector
+   * branch and by unit tests that don't care about Max).
+   */
+  readonly maxSessionPreflight?:
+    | false
+    | MaxSessionPreflightOptions
+    | (() => Promise<MaxSessionPreflightResult>);
 }
 
 interface ActiveTask {
@@ -79,6 +99,10 @@ export class ClaudeCodeAgent implements AIAgent {
   #model: string;
   #spawnFn: SpawnFn;
   #cancelGraceMs: number;
+  #maxSessionPreflight:
+    | false
+    | MaxSessionPreflightOptions
+    | (() => Promise<MaxSessionPreflightResult>);
 
   #state: AIAgentState = 'offline';
   #startedAt?: Date;
@@ -108,6 +132,7 @@ export class ClaudeCodeAgent implements AIAgent {
     this.#model = options.model ?? DEFAULT_MODEL;
     this.#spawnFn = options.spawnFn ?? defaultExecaSpawn;
     this.#cancelGraceMs = options.cancelGraceMs ?? CANCEL_GRACE_DEFAULT_MS;
+    this.#maxSessionPreflight = options.maxSessionPreflight ?? {};
   }
 
   get runtime(): AIAgentRuntime {
@@ -141,14 +166,7 @@ export class ClaudeCodeAgent implements AIAgent {
 
     try {
       await this.#spawnFn(this.#binaryPath, ['--version']);
-      this.#state = 'idle';
-      this.#startedAt = new Date();
       this.#healthChecks.binary = 'ok';
-      this.#lastHeartbeatAt = new Date().toISOString();
-      this.#logger.info(
-        { binaryPath: this.#binaryPath, model: this.#model },
-        'claude-code agent started'
-      );
     } catch (err) {
       this.#state = 'degraded';
       this.#healthChecks.binary = 'fail';
@@ -167,6 +185,64 @@ export class ClaudeCodeAgent implements AIAgent {
         }
       );
     }
+
+    // Phase 4.0 Max-session preflight. The Claude CLI prefers
+    // OAuth (`claudeAiOauth` in `~/.claude/.credentials.json`)
+    // over `ANTHROPIC_API_KEY` in normal mode. We surface a
+    // clear failure here if the OAuth shape is missing rather
+    // than letting the first task fail with a less obvious
+    // error at model-call time. The preflight throws
+    // `MaxSessionUnavailableError`; we wrap it as `AIAgentError`
+    // so the existing main.ts fallback to echo-stub still
+    // applies (Phase 4.0 hard constraint #4: no functional
+    // downgrade).
+    if (this.#maxSessionPreflight !== false) {
+      try {
+        const result =
+          typeof this.#maxSessionPreflight === 'function'
+            ? await this.#maxSessionPreflight()
+            : await verifyMaxSession(this.#maxSessionPreflight);
+        this.#healthChecks.maxSession = 'ok';
+        if (result.expiresInSeconds < 0) {
+          this.#logger.warn(
+            { expiresInSeconds: result.expiresInSeconds },
+            'Claude Max OAuth access token already expired; CLI will refresh on first call'
+          );
+        } else if (result.expiresInSeconds < 24 * 60 * 60) {
+          this.#logger.warn(
+            { expiresInSeconds: result.expiresInSeconds },
+            'Claude Max OAuth access token expires within 24h'
+          );
+        }
+      } catch (err) {
+        this.#state = 'degraded';
+        this.#healthChecks.maxSession = 'fail';
+        if (err instanceof MaxSessionUnavailableError) {
+          this.#logger.error(
+            { code: err.code, path: err.path },
+            'Claude Max OAuth session preflight failed'
+          );
+          throw new AIAgentError(
+            'CLAUDE_MAX_SESSION_UNAVAILABLE',
+            err.message,
+            {
+              retriable: false,
+              cause: err,
+              details: { credentialsPath: err.path, code: err.code }
+            }
+          );
+        }
+        throw err;
+      }
+    }
+
+    this.#state = 'idle';
+    this.#startedAt = new Date();
+    this.#lastHeartbeatAt = new Date().toISOString();
+    this.#logger.info(
+      { binaryPath: this.#binaryPath, model: this.#model },
+      'claude-code agent started'
+    );
   }
 
   async stop(reason: 'user' | 'shutdown' | 'error'): Promise<void> {

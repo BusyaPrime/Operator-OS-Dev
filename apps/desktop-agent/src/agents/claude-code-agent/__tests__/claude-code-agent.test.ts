@@ -215,6 +215,12 @@ describe('ClaudeCodeAgent', () => {
       userId: 'user-1',
       spawnFn: harness.spawnFn,
       cancelGraceMs: 100,
+      // Phase 4.0 Max-session preflight defaults to reading
+      // ~/.claude/.credentials.json. The test harness disables
+      // it by default so the unit suite stays hermetic; tests
+      // that want to exercise the preflight pass an explicit
+      // function via `over.maxSessionPreflight`.
+      maxSessionPreflight: false,
       ...over
     });
 
@@ -288,6 +294,100 @@ describe('ClaudeCodeAgent', () => {
 
       await agent.start();
       expect(harness.calls).toHaveLength(1);
+    });
+
+    describe('Max-session preflight (Phase 4.0)', () => {
+      it('runs the preflight after the binary probe and marks healthCheck.maxSession=ok', async () => {
+        const probe = createDeferredSubprocess();
+        harness.enqueue(probe.handle);
+        const preflight = vi.fn(async () => ({
+          path: '/fake/.credentials.json',
+          expiresInSeconds: 3600,
+          ok: true as const
+        }));
+
+        const agent = buildAgent({ maxSessionPreflight: preflight });
+        const pending = agent.start();
+        probe.resolve({ stdout: 'claude 1.2.3', stderr: '', exitCode: 0 });
+        await pending;
+
+        expect(preflight).toHaveBeenCalledOnce();
+        const status = await agent.getStatus();
+        expect(status.state).toBe('idle');
+        expect(status.healthChecks.binary).toBe('ok');
+        expect(status.healthChecks.maxSession).toBe('ok');
+      });
+
+      it('throws CLAUDE_MAX_SESSION_UNAVAILABLE when preflight throws MaxSessionUnavailableError', async () => {
+        const { MaxSessionUnavailableError } = await import(
+          '../max-session-preflight.js'
+        );
+        const probe = createDeferredSubprocess();
+        harness.enqueue(probe.handle);
+        const preflight = vi.fn(async () => {
+          throw new MaxSessionUnavailableError(
+            'CREDENTIALS_OAUTH_MISSING',
+            '/fake/.credentials.json',
+            'no oauth block',
+            'login first'
+          );
+        });
+
+        const agent = buildAgent({ maxSessionPreflight: preflight });
+        const pending = agent.start();
+        probe.resolve({ stdout: 'claude 1.2.3', stderr: '', exitCode: 0 });
+
+        let caught: AIAgentError | undefined;
+        try {
+          await pending;
+        } catch (err) {
+          caught = err as AIAgentError;
+        }
+        expect(caught).toBeInstanceOf(AIAgentError);
+        expect(caught!.code).toBe('CLAUDE_MAX_SESSION_UNAVAILABLE');
+        expect(caught!.details).toMatchObject({
+          credentialsPath: '/fake/.credentials.json',
+          code: 'CREDENTIALS_OAUTH_MISSING'
+        });
+
+        const status = await agent.getStatus();
+        expect(status.state).toBe('degraded');
+        expect(status.healthChecks.maxSession).toBe('fail');
+      });
+
+      it('passes when binary probe succeeds and preflight is explicitly disabled (back-compat)', async () => {
+        const probe = createDeferredSubprocess();
+        harness.enqueue(probe.handle);
+        const agent = buildAgent({ maxSessionPreflight: false });
+
+        const pending = agent.start();
+        probe.resolve({ stdout: 'claude 1.2.3', stderr: '', exitCode: 0 });
+        await pending;
+
+        const status = await agent.getStatus();
+        expect(status.state).toBe('idle');
+        expect(status.healthChecks.binary).toBe('ok');
+        expect(status.healthChecks.maxSession).toBeUndefined();
+      });
+
+      it('logs a warning when the OAuth session expires within 24h but still succeeds', async () => {
+        const probe = createDeferredSubprocess();
+        harness.enqueue(probe.handle);
+        const preflight = vi.fn(async () => ({
+          path: '/fake/.credentials.json',
+          expiresInSeconds: 60 * 60, // 1h, well under 24h
+          ok: true as const
+        }));
+
+        const agent = buildAgent({ maxSessionPreflight: preflight });
+        const pending = agent.start();
+        probe.resolve({ stdout: 'claude 1.2.3', stderr: '', exitCode: 0 });
+        await pending;
+
+        const status = await agent.getStatus();
+        expect(status.state).toBe('idle');
+        expect(status.healthChecks.maxSession).toBe('ok');
+      });
     });
   });
 
