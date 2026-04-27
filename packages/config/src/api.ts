@@ -13,6 +13,14 @@ export const apiEnvSchema = z.object({
   PORT: integerFromString(8080),
   LOG_LEVEL: z.string().min(1).default('info'),
   API_SERVICE_NAME: z.string().min(1).default('operator-os-api'),
+  /**
+   * Agent release pointer surfaced by GET /v1/agent/latest-version
+   * (Phase 4.0 Part 3.G). Phase 4.0 returns it as the version
+   * string with downloadUrl + signature null per TD-059. When
+   * TD-059 lands the signed-update pipeline this field becomes
+   * a real release tag the api reads from a GCS bucket pointer.
+   */
+  API_SERVICE_VERSION: z.string().min(1).default('0.1.0'),
   GOOGLE_CLOUD_PROJECT: z.string().min(1).default('operator-os-dev'),
   GOOGLE_CLOUD_REGION: z.string().min(1).default('europe-west4'),
   FIREBASE_PROJECT_ID: z.string().min(1).default('operator-os-dev'),

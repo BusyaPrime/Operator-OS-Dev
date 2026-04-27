@@ -125,9 +125,18 @@ export interface AgentLifecycleRepository {
   ) => Promise<number>;
 }
 
-export class FirestoreAgentRepository
-  implements AgentRecordRepository, AgentLifecycleRepository
-{
+/**
+ * Combined surface used by the agent-registration routes +
+ * the agentTokenGuard. The concrete FirestoreAgentRepository
+ * implements it; tests pass an in-memory fake. Splitting the
+ * combined interface from the two narrow ones keeps the guard
+ * tests shielded from the lifecycle surface and vice-versa.
+ */
+export interface AgentRepository
+  extends AgentRecordRepository,
+    AgentLifecycleRepository {}
+
+export class FirestoreAgentRepository implements AgentRepository {
   readonly name = 'firestore-agents';
 
   #adcStatus = detectApplicationDefaultCredentials();

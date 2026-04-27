@@ -53,6 +53,17 @@ export interface AgentRegistrationRoutesOptions {
   /** Guard that authenticates the agent's own token. */
   readonly agentTokenGuard: preHandlerAsyncHookHandler;
   /**
+   * Optional cache invalidator. The agentTokenGuard caches
+   * (token, recordSnapshot) pairs to amortise bcrypt cost; a
+   * rotation or revocation that doesn't tell the cache about
+   * the change leaves stale snapshots that would let the next
+   * request authenticate against the old hash. Routes call
+   * this after every successful rotateToken / markRevoked
+   * write so the cache stays coherent. Optional because the
+   * per-route unit tests use a no-cache stub guard.
+   */
+  readonly invalidateAgentTokenCache?: (agentId: string) => void;
+  /**
    * Phase 4.0 stub returns this string as the latest agent
    * version, with downloadUrl + signature null. TD-059 lands
    * the real signed-update pipeline.
@@ -278,6 +289,19 @@ export const registerAgentRegistrationRoutes = async (
           overlapExpiresAt
         );
 
+        // Cache invalidation BEFORE audit. The cache holds a
+        // stale (rawToken → recordSnapshot) entry from the
+        // pre-rotation state that would falsely authenticate
+        // the old token as `hit: 'current'` instead of
+        // `hit: 'previous'`. Calling invalidate here ensures
+        // the next auth re-derives the correct hit type from
+        // the freshly-persisted record.
+        try {
+          options.invalidateAgentTokenCache?.(updated.agentId);
+        } catch {
+          /* swallowed — cache is purely a perf optimisation */
+        }
+
         try {
           await options.audit.record({
             agentId: updated.agentId,
@@ -435,6 +459,17 @@ export const registerAgentRegistrationRoutes = async (
           agentId,
           'user-initiated revoke from /v1/agent/:agentId DELETE'
         );
+
+        // Cache invalidation: the guard's LRU still holds a
+        // pre-revocation snapshot that would let the next
+        // auth pass before the snapshot's TTL expires. Force
+        // re-evaluation here so the revoke takes effect on
+        // the very next request.
+        try {
+          options.invalidateAgentTokenCache?.(agentId);
+        } catch {
+          /* swallowed */
+        }
 
         try {
           await options.audit.record({

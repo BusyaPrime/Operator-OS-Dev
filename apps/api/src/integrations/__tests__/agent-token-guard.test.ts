@@ -112,7 +112,7 @@ const buildApp = (
 ): TestApp => {
   const app = Fastify({ logger: false });
   const protectedAgent: { agent?: AuthenticatedAgent } = {};
-  app.get('/protected', { preHandler: createAgentTokenGuard(options) }, async (request, reply) => {
+  app.get('/protected', { preHandler: createAgentTokenGuard(options).preHandler }, async (request, reply) => {
     protectedAgent.agent = request.agent;
     return reply.send({ ok: true });
   });

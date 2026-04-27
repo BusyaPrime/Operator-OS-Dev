@@ -185,6 +185,24 @@ class TokenAuthCache {
     this.#map.delete(key);
   }
 
+  /**
+   * Invalidate every cached entry whose snapshot points at
+   * the named agent. Called after rotate / revoke writes so
+   * the next auth re-derives `hit: current | previous` against
+   * the freshly-persisted record state instead of returning a
+   * stale snapshot.
+   *
+   * O(cacheSize) — bounded at the LRU max (default 256), so
+   * the linear scan is a few microseconds even at the ceiling.
+   */
+  invalidateByAgentId(agentId: string): void {
+    for (const [key, entry] of this.#map) {
+      if (entry.recordSnapshot.agentId === agentId) {
+        this.#map.delete(key);
+      }
+    }
+  }
+
   /** Test seam — reset between cases. */
   clear(): void {
     this.#map.clear();
@@ -297,13 +315,25 @@ const isPreviousTokenStillValid = (
 };
 
 /**
- * Build the Fastify preHandler. Returns a closure so each
- * api instance can wire the same guard into multiple routes
- * with shared cache + audit hooks.
+ * Handle returned from `createAgentTokenGuard`. Routes attach
+ * `preHandler` to their definition (`{ preHandler:
+ * guard.preHandler }`); the rotate-token + revoke routes also
+ * call `invalidateAgent` after a successful write so the LRU
+ * cache doesn't serve a stale snapshot to the next request.
+ */
+export interface AgentTokenGuardHandle {
+  readonly preHandler: preHandlerAsyncHookHandler;
+  readonly invalidateAgent: (agentId: string) => void;
+}
+
+/**
+ * Build the Fastify preHandler. Returns a handle bundling the
+ * preHandler with a per-agent cache invalidator so routes can
+ * keep the LRU coherent with their own writes.
  */
 export const createAgentTokenGuard = (
   options: CreateAgentTokenGuardOptions
-): preHandlerAsyncHookHandler => {
+): AgentTokenGuardHandle => {
   const audit = options.audit ?? noopAudit;
   const now = options.now ?? Date.now;
   const cache = new TokenAuthCache(
@@ -312,7 +342,7 @@ export const createAgentTokenGuard = (
     options.cache?.now ?? now
   );
 
-  return async function agentTokenGuard(
+  const preHandler: preHandlerAsyncHookHandler = async function agentTokenGuard(
     request: FastifyRequest,
     reply: FastifyReply
   ): Promise<void> {
@@ -455,6 +485,13 @@ export const createAgentTokenGuard = (
     });
     reply.code(401);
     return reply.send({ message: 'Agent token not recognised.' });
+  };
+
+  return {
+    preHandler,
+    invalidateAgent(agentId: string) {
+      cache.invalidateByAgentId(agentId);
+    }
   };
 };
 
