@@ -12,6 +12,14 @@ import {
   createTaskQueue,
   type TaskQueue
 } from '../registry/task-queue.js';
+import {
+  ConnectionStateMachine,
+  type ConnectionState
+} from './connection-state-machine.js';
+import { categorizeDisconnect } from './disconnect-categorizer.js';
+import type { NetworkChangeDetector } from './network-change-detector.js';
+import { ReconnectBackoff } from './reconnect-backoff.js';
+import type { RttHistogram } from './rtt-histogram.js';
 
 /**
  * Input handed to the TaskExecutor. Mirror of the server-side
@@ -107,6 +115,43 @@ export interface ControlChannelWsOptions {
   readonly logger: Logger;
   readonly reconnectBaseMs?: number;
   readonly reconnectMaxMs?: number;
+  /**
+   * Phase 4.0 Part 5.F — explicit connection state machine.
+   * If omitted, the WS constructs its own internal instance.
+   * Supplying one externally lets `main.ts` subscribe to
+   * state transitions for mobile-status fan-out (TD-058).
+   */
+  readonly stateMachine?: ConnectionStateMachine;
+  /**
+   * Phase 4.0 Part 5.F — backoff policy for reconnect
+   * scheduling. Defaults to a `ReconnectBackoff` with the
+   * documented 1s/60s/±20%/1000-attempt config. Tests
+   * inject a deterministic policy.
+   */
+  readonly backoff?: ReconnectBackoff;
+  /**
+   * Phase 4.0 Part 5.F — network-change detector. When
+   * supplied, the WS subscribes on `start()` and triggers
+   * an immediate reconnect attempt whenever the local
+   * interface set changes. When omitted, the periodic
+   * backoff schedule is the only reconnect trigger.
+   */
+  readonly networkChangeDetector?: NetworkChangeDetector;
+  /**
+   * Phase 4.0 Part 5.F — RTT histogram. The agent records
+   * a sample on every server-driven `ping` round-trip. The
+   * caller (main.ts) reads `.percentiles()` for the mobile
+   * status fan-out (Part 7).
+   *
+   * Design limitation: the api's current ping frame doesn't
+   * carry an echoed-back timestamp, so the "RTT" we record
+   * is the local time between inbound-ping arrival and
+   * outbound-pong send completion. That's a processing-
+   * latency proxy, not the full network round-trip. A
+   * follow-up TD upgrades the api to echo timestamps so
+   * we can record true RTT.
+   */
+  readonly rttHistogram?: RttHistogram;
   /** Test seam — build a fake socket instead of a real WS. */
   readonly socketFactory?: (
     url: string,
@@ -148,11 +193,15 @@ export class ControlChannelWs {
   #reconnectMaxMs: number;
   #socketFactory?: ControlChannelWsOptions['socketFactory'];
 
+  #stateMachine: ConnectionStateMachine;
+  #backoff: ReconnectBackoff;
+  #networkChangeDetector?: NetworkChangeDetector;
+  #unsubscribeNetworkChange?: () => void;
+  #rttHistogram?: RttHistogram;
+
   #socket?: ControlChannelSocket;
   #queue: TaskQueue = createTaskQueue();
   #sessionId?: string;
-  #shuttingDown = false;
-  #reconnectAttempt = 0;
   #reconnectTimer?: NodeJS.Timeout;
 
   constructor(options: ControlChannelWsOptions) {
@@ -178,15 +227,54 @@ export class ControlChannelWs {
     this.#reconnectMaxMs =
       options.reconnectMaxMs ?? DEFAULT_RECONNECT_MAX_MS;
     this.#socketFactory = options.socketFactory;
+    this.#stateMachine =
+      options.stateMachine ??
+      new ConnectionStateMachine({ logger: options.logger });
+    this.#backoff =
+      options.backoff ??
+      new ReconnectBackoff({
+        baseMs: this.#reconnectBaseMs,
+        maxMs: this.#reconnectMaxMs
+      });
+    this.#networkChangeDetector = options.networkChangeDetector;
+    this.#rttHistogram = options.rttHistogram;
   }
 
   start(): void {
-    this.#shuttingDown = false;
+    if (this.#stateMachine.isTerminal) {
+      this.#logger.warn(
+        { state: this.#stateMachine.state, source: 'control-channel-ws' },
+        'start() called on terminal state machine — ignored'
+      );
+      return;
+    }
+    // Subscribe to network-change once at start; the
+    // detector itself handles its own start/stop.
+    if (
+      this.#networkChangeDetector !== undefined &&
+      this.#unsubscribeNetworkChange === undefined
+    ) {
+      this.#unsubscribeNetworkChange =
+        this.#networkChangeDetector.onChange((event) => {
+          this.#logger.info(
+            { event, source: 'control-channel-ws' },
+            'network change detected; expediting reconnect'
+          );
+          this.#expediteReconnect();
+        });
+    }
     this.#connect();
   }
 
   async stop(): Promise<void> {
-    this.#shuttingDown = true;
+    this.#stateMachine.request({
+      to: 'DISCONNECTING',
+      reason: 'operator-stop'
+    });
+    if (this.#unsubscribeNetworkChange !== undefined) {
+      this.#unsubscribeNetworkChange();
+      this.#unsubscribeNetworkChange = undefined;
+    }
     if (this.#reconnectTimer) {
       clearTimeout(this.#reconnectTimer);
       this.#reconnectTimer = undefined;
@@ -199,6 +287,17 @@ export class ControlChannelWs {
       }
       this.#socket = undefined;
     }
+    // The 'close' handler from the WS would normally complete
+    // the DISCONNECTING -> DISCONNECTED transition. If the
+    // socket close didn't propagate (test stubs that don't
+    // emit close), do it here defensively so the state
+    // machine ends in a known idle state.
+    if (this.#stateMachine.state === 'DISCONNECTING') {
+      this.#stateMachine.request({
+        to: 'DISCONNECTED',
+        reason: 'stop-completed'
+      });
+    }
   }
 
   /** Read-only view of currently executing tasks. Test hook. */
@@ -207,7 +306,32 @@ export class ControlChannelWs {
   }
 
   get isConnected(): boolean {
-    return this.#socket !== undefined && this.#sessionId !== undefined;
+    return this.#stateMachine.canSend;
+  }
+
+  /** Phase 4.0 Part 5.F — current state machine snapshot. */
+  get connectionState(): ConnectionState {
+    return this.#stateMachine.state;
+  }
+
+  /** Server-issued session id from the most recent welcome, if any. */
+  get sessionId(): string | undefined {
+    return this.#sessionId;
+  }
+
+  /**
+   * Cancel any pending backoff timer and re-enter CONNECTING
+   * immediately. Called by the network-change detector when
+   * the local interface comes back. No-op when we're not
+   * currently waiting on a reconnect.
+   */
+  #expediteReconnect(): void {
+    if (this.#stateMachine.isTerminal) return;
+    if (this.#stateMachine.state !== 'DISCONNECTED') return;
+    if (this.#reconnectTimer === undefined) return;
+    clearTimeout(this.#reconnectTimer);
+    this.#reconnectTimer = undefined;
+    this.#connect();
   }
 
   #connect(): void {
@@ -215,7 +339,19 @@ export class ControlChannelWs {
   }
 
   async #connectAsync(): Promise<void> {
-    if (this.#shuttingDown) return;
+    if (this.#stateMachine.isTerminal) return;
+    if (
+      this.#stateMachine.state === 'DISCONNECTING' ||
+      this.#stateMachine.state === 'CONNECTING' ||
+      this.#stateMachine.state === 'CONNECTED' ||
+      this.#stateMachine.state === 'DEGRADED'
+    ) {
+      return;
+    }
+    this.#stateMachine.request({
+      to: 'CONNECTING',
+      reason: 'open-connect'
+    });
 
     let token: string | null;
     if (this.#tokenProvider !== undefined) {
@@ -226,6 +362,16 @@ export class ControlChannelWs {
           { err, source: 'control-channel-ws' },
           'tokenProvider threw; will retry connect after backoff'
         );
+        // Roll back from CONNECTING → DISCONNECTED so the
+        // backoff scheduler can try again. The state machine
+        // disallows direct CONNECTING → CONNECTING; this flip
+        // also gives the network-change detector a window to
+        // expedite if the credential store recovers fast.
+        this.#stateMachine.request({
+          to: 'DISCONNECTED',
+          reason: 'token-provider-threw',
+          metadata: { errMessage: err instanceof Error ? err.message : '' }
+        });
         this.#scheduleReconnect();
         return;
       }
@@ -238,6 +384,12 @@ export class ControlChannelWs {
           source: 'ws',
           agentId: this.#agentId,
           reason: 'no_token_in_credential_store'
+        });
+        // No token means the agent must re-register; mark
+        // REVOKED so we don't loop the reconnect.
+        this.#stateMachine.request({
+          to: 'REVOKED',
+          reason: 'no-token-in-credential-store'
         });
         return;
       }
@@ -319,8 +471,14 @@ export class ControlChannelWs {
     });
 
     socket.on('close', (code: number) => {
+      const intentional =
+        this.#stateMachine.state === 'DISCONNECTING' || code === 1000;
+      const category = categorizeDisconnect({
+        closeCode: code,
+        intentional
+      });
       this.#logger.info(
-        { source: 'control-channel-ws', code },
+        { source: 'control-channel-ws', code, category },
         'control channel closed'
       );
       this.#socket = undefined;
@@ -335,17 +493,35 @@ export class ControlChannelWs {
           agentId: this.#agentId,
           reason: 'ws_close_4001_unauthorized'
         });
-        this.#shuttingDown = true;
+        this.#stateMachine.request({
+          to: 'REVOKED',
+          reason: 'close-4001',
+          metadata: { category }
+        });
         return;
       }
-      if (!this.#shuttingDown) {
-        this.#scheduleReconnect();
+      if (this.#stateMachine.state === 'DISCONNECTING') {
+        this.#stateMachine.request({
+          to: 'DISCONNECTED',
+          reason: 'operator-stop-close',
+          metadata: { code, category }
+        });
+        return;
       }
+      this.#stateMachine.request({
+        to: 'DISCONNECTED',
+        reason: `transport-close-${code}`,
+        metadata: { code, category }
+      });
+      this.#scheduleReconnect();
     });
 
     socket.on('error', (err: Error) => {
+      const category = categorizeDisconnect({
+        error: err as Error & { code?: string }
+      });
       this.#logger.warn(
-        { err, source: 'control-channel-ws' },
+        { err, category, source: 'control-channel-ws' },
         'control channel error'
       );
       // The `ws` library emits a synthetic Error with the
@@ -363,7 +539,11 @@ export class ControlChannelWs {
           agentId: this.#agentId,
           reason: 'ws_upgrade_401'
         });
-        this.#shuttingDown = true;
+        this.#stateMachine.request({
+          to: 'REVOKED',
+          reason: 'upgrade-error-401',
+          metadata: { category }
+        });
       }
     });
   }
@@ -380,18 +560,32 @@ export class ControlChannelWs {
   }
 
   #scheduleReconnect(): void {
-    this.#reconnectAttempt += 1;
-    const delay = Math.min(
-      this.#reconnectBaseMs * 2 ** (this.#reconnectAttempt - 1),
-      this.#reconnectMaxMs
-    );
+    if (this.#stateMachine.isTerminal) return;
+    if (this.#stateMachine.state === 'DISCONNECTING') return;
+    const delay = this.#backoff.nextDelayMs();
+    if (delay === null) {
+      this.#logger.error(
+        {
+          source: 'control-channel-ws',
+          maxAttempts: this.#backoff.attempts
+        },
+        'reconnect backoff exhausted; staying DISCONNECTED'
+      );
+      return;
+    }
     this.#logger.info(
-      { source: 'control-channel-ws', delay, attempt: this.#reconnectAttempt },
+      {
+        source: 'control-channel-ws',
+        delay,
+        attempt: this.#backoff.attempts
+      },
       'scheduling control channel reconnect'
     );
     this.#reconnectTimer = setTimeout(() => {
       this.#reconnectTimer = undefined;
-      if (!this.#shuttingDown) this.#connect();
+      if (this.#stateMachine.isTerminal) return;
+      if (this.#stateMachine.state === 'DISCONNECTING') return;
+      this.#connect();
     }, delay);
     if (typeof this.#reconnectTimer.unref === 'function') {
       this.#reconnectTimer.unref();
@@ -407,7 +601,12 @@ export class ControlChannelWs {
         const welcome = typed as { sessionId?: string };
         if (typeof welcome.sessionId === 'string') {
           this.#sessionId = welcome.sessionId;
-          this.#reconnectAttempt = 0;
+          this.#backoff.reset();
+          this.#stateMachine.request({
+            to: 'CONNECTED',
+            reason: 'welcome-frame',
+            metadata: { sessionId: welcome.sessionId }
+          });
           this.#logger.info(
             {
               source: 'control-channel-ws',
@@ -419,7 +618,17 @@ export class ControlChannelWs {
         return;
       }
       case 'ping': {
-        this.#send({ type: 'pong', ts: Date.now() });
+        // Phase 4.0 Part 5.F — RTT proxy. The api's current
+        // ping doesn't carry a timestamp we can echo back,
+        // so this measures local processing latency only.
+        // Recorded into the histogram so percentiles still
+        // populate; a follow-up TD upgrades to true RTT.
+        const receivedAt = Date.now();
+        this.#send({ type: 'pong', ts: receivedAt });
+        if (this.#rttHistogram !== undefined) {
+          const elapsed = Date.now() - receivedAt;
+          this.#rttHistogram.record(elapsed);
+        }
         return;
       }
       case 'task-assign': {
