@@ -91,6 +91,25 @@ export const apiEnvSchema = z.object({
     .default('task-dispatch-dlq-dev'),
   PUBSUB_PUSH_AUDIENCE: optionalUrlFromString(),
   BIGQUERY_DATASET: z.string().min(1).default('ops_analytics'),
+  /**
+   * Phase 4.0 TD-057 — agent auth audit backend selection.
+   *
+   * - `bigquery` (default): stream events into the
+   *   `operator_os_dev_audit.agent_auth` partitioned + clustered
+   *   table provisioned per ADR-025 D1.
+   * - `logging`: keep the Phase 4.0 Part 3 stub behaviour
+   *   (structured pino logs only). Used in tests where ADC is
+   *   unavailable and in the breakglass case where BQ inserts
+   *   are misbehaving.
+   * - `noop`: drop events on the floor. Unused outside of niche
+   *   diagnostic scenarios but available so the switch covers
+   *   the full operational matrix without code changes.
+   */
+  AGENT_AUDIT_BACKEND: z
+    .enum(['bigquery', 'logging', 'noop'])
+    .optional(),
+  AGENT_AUDIT_DATASET: z.string().min(1).default('operator_os_dev_audit'),
+  AGENT_AUDIT_TABLE: z.string().min(1).default('agent_auth'),
   ARTIFACTS_BUCKET: z.string().min(1).default('operator-os-dev-artifacts'),
   EXPORTS_BUCKET: z.string().min(1).default('operator-os-dev-exports'),
   REMOTE_BUCKET: z.string().min(1).default('operator-os-dev-remote'),

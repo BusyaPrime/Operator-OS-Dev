@@ -3580,10 +3580,27 @@ server-pushed rotation:
 
 References:
 
-- TD-057 (filed at this amendment): BigQuery audit pipeline
-  for `agent_auth` events. Part 3 ships with a
-  `LoggingAuditWriter` stub; the BigQuery writer plugs into
-  the same interface once the table exists.
+- TD-057 (closed 2026-04-28): BigQuery audit pipeline for
+  `agent_auth` events. Part 3 shipped with a
+  `LoggingAuditWriter` stub; TD-057 plugged
+  `BigQueryAuditWriter` into the same `AgentAuditWriter`
+  interface, provisioned
+  `operator-os-dev.operator_os_dev_audit.agent_auth`
+  (EU multi-region, daily-partitioned on `timestamp`,
+  clustered on `(agent_id, event_type)`, 365-day partition
+  expiration), and granted dataset-scoped
+  `roles/bigquery.dataEditor` to
+  `cloudrun-runtime@operator-os-dev.iam.gserviceaccount.com`
+  (legacy `WRITER` ACL because the modern
+  `bq add-iam-policy-binding` is allowlist-blocked on this
+  project — see `docs/IAM_PLAN.md`). Backend selection is
+  driven by `AGENT_AUDIT_BACKEND` env var (`bigquery` /
+  `logging` / `noop`); default in production is `bigquery`,
+  in any other `NODE_ENV` it falls through to `logging` so
+  tests don't generate ADC-failure noise. Verification queries
+  catalogued in `docs/AGENT_AUDIT_QUERIES.md`. The Cloud
+  Monitoring billing alert + per-event dashboard slipped to
+  TD-060.
 - TD-058 (filed at this amendment): Pub/Sub topic for the
   `agent-status-changes` real-time fan-out. Part 3 ships
   with a no-op publisher; the real one plugs in once the

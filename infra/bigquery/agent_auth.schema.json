@@ -1,0 +1,62 @@
+[
+  {
+    "name": "timestamp",
+    "type": "TIMESTAMP",
+    "mode": "REQUIRED",
+    "description": "Server-side wall-clock at which the audit row was inserted. Used as the partition column."
+  },
+  {
+    "name": "agent_id",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "agentId (UUID) the event belongs to. Null for pre-auth failures (e.g. unknown token, missing bearer)."
+  },
+  {
+    "name": "user_id",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Owning userId. Null for pre-auth failures."
+  },
+  {
+    "name": "event_type",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "One of the AgentAuthEvent eventType variants: auth_success | auth_success_previous_hash | auth_failed_no_token | auth_failed_no_match | auth_failed_revoked | auth_failed_unknown_token | agent_registered | token_rotated | agent_revoked."
+  },
+  {
+    "name": "ip",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Client IP as seen by the api (post-trustProxy). Null when the request did not carry a recognisable IP (e.g. internal injection)."
+  },
+  {
+    "name": "user_agent",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Raw User-Agent header. Null when absent."
+  },
+  {
+    "name": "success",
+    "type": "BOOL",
+    "mode": "REQUIRED",
+    "description": "True for the success and lifecycle event types; false for any auth_failed_* variant. Derived server-side from event_type so the column is queryable without a CASE expression."
+  },
+  {
+    "name": "latency_ms",
+    "type": "INT64",
+    "mode": "NULLABLE",
+    "description": "Time the agent-token-guard spent processing the request, milliseconds. Null when the event was emitted outside the guard (lifecycle events from route handlers)."
+  },
+  {
+    "name": "error_code",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Short stable identifier for failure reason; opaque free-form string for now."
+  },
+  {
+    "name": "metadata",
+    "type": "JSON",
+    "mode": "NULLABLE",
+    "description": "Forward-compatibility envelope. Currently always null; reserved for structured supplemental context (rotation result code, previous-hash usage count delta, anomaly scores) without a schema migration."
+  }
+]

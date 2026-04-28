@@ -97,6 +97,36 @@ Recommended follow-up:
    dataset IAM command path
 2. re-run the API integration smoke tests for BigQuery writes
 
+### BigQuery Audit Dataset Write Access (Phase 4.0 / TD-057)
+
+Applied 2026-04-28:
+
+- `roles/bigquery.dataEditor` on dataset `operator_os_dev_audit`
+  for `cloudrun-runtime@operator-os-dev.iam.gserviceaccount.com`.
+
+How it was applied:
+
+- The modern `bq add-iam-policy-binding --dataset` form remains
+  allowlist-blocked on this project (same response as
+  `ops_analytics`).
+- Worked around via the legacy `bq update --source <acl-json>`
+  path. BigQuery normalised the binding to legacy `WRITER` in
+  the stored ACL, which is the alias of
+  `roles/bigquery.dataEditor` (per Google's role-mapping
+  table) so the effective permission is identical.
+- Reproducible JSON for the access list lives at
+  `docs/AGENT_AUDIT_QUERIES.md` ("Reproducing the schema from
+  scratch") for disaster recovery / project copy scenarios.
+
+Future placeholder — analytics SA:
+
+- When an analytics SA is provisioned (per the TD-047
+  inventory effort), it should receive
+  `roles/bigquery.dataViewer` on `operator_os_dev_audit` so
+  it can read the audit trail without write capability. Apply
+  via the same legacy ACL path until the modern bind is
+  allowlisted.
+
 ## What Was Intentionally Not Granted
 
 Not granted during this pass:
