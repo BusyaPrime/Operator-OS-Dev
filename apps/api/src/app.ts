@@ -6,8 +6,12 @@ import { AccessTokenSecretLoader } from './integrations/signing-secret.js';
 import { AccessTokenVerifier } from './integrations/access-token-verifier.js';
 import { BigQueryAnalyticsWriter } from './integrations/bigquery.js';
 import { FirebaseAuthService } from './integrations/auth.js';
-import { createAgentTokenGuard } from './integrations/agent-token-guard.js';
+import {
+  createAgentTokenGuard,
+  type AgentAuditWriter
+} from './integrations/agent-token-guard.js';
 import { LoggingAuditWriter } from './integrations/audit-log.js';
+import { createBigQueryAuditWriter } from './integrations/audit/bigquery-audit-writer.js';
 import { FirestoreOperatorRepository } from './integrations/firestore.js';
 import {
   FirestoreAgentRepository,
@@ -516,11 +520,55 @@ export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) =>
   // FirestoreAgentRepository into the same auth-service path
   // the user routes use for the userGuard, and an
   // agent-token guard backed by the same repository for the
-  // agent-only rotate-token route. Audit emit goes through
-  // the LoggingAuditWriter stub (TD-057 swaps in BigQuery).
+  // agent-only rotate-token route.
+  //
+  // Audit emit (TD-057) is selected by AGENT_AUDIT_BACKEND:
+  //   - explicit env value wins
+  //   - else: production → bigquery, anything else → logging.
+  // Production resolution lands the row in
+  // `operator_os_dev_audit.agent_auth` per ADR-025 D1; tests
+  // and local dev keep the structured-log path so a missing
+  // ADC doesn't generate noise.
   const agentRepository: AgentRepository =
     options.agentRepository ?? new FirestoreAgentRepository(config, app.log);
-  const agentAuditWriter = new LoggingAuditWriter(app.log);
+  const agentAuditBackend =
+    config.AGENT_AUDIT_BACKEND ??
+    (config.NODE_ENV === 'production' ? 'bigquery' : 'logging');
+  const agentAuditWriter: AgentAuditWriter = ((): AgentAuditWriter => {
+    switch (agentAuditBackend) {
+      case 'bigquery':
+        return createBigQueryAuditWriter({
+          projectId: config.GOOGLE_CLOUD_PROJECT,
+          dataset: config.AGENT_AUDIT_DATASET,
+          table: config.AGENT_AUDIT_TABLE,
+          logger: app.log
+        });
+      case 'logging':
+        return new LoggingAuditWriter(app.log);
+      case 'noop':
+        return { record: async () => undefined };
+      default: {
+        // Zod enum keeps this branch unreachable at runtime;
+        // the assertion gives us a build-time exhaustiveness
+        // guarantee if a new backend is added without wiring.
+        const _exhaustive: never = agentAuditBackend;
+        app.log.warn(
+          { AGENT_AUDIT_BACKEND: _exhaustive },
+          'unknown agent audit backend; falling back to LoggingAuditWriter'
+        );
+        return new LoggingAuditWriter(app.log);
+      }
+    }
+  })();
+  app.log.info(
+    {
+      source: 'buildServer',
+      agentAuditBackend,
+      agentAuditDataset: config.AGENT_AUDIT_DATASET,
+      agentAuditTable: config.AGENT_AUDIT_TABLE
+    },
+    'agent audit writer wired'
+  );
   const agentTokenGuard = createAgentTokenGuard({
     repository: agentRepository,
     audit: agentAuditWriter

@@ -118,3 +118,24 @@ describe('Phase 3.2 task-dispatch env vars', () => {
     expect(env.PUBSUB_PUSH_AUDIENCE).toBeUndefined();
   });
 });
+
+describe('Phase 4.0 TD-057 agent audit env vars', () => {
+  it('leaves AGENT_AUDIT_BACKEND undefined by default and applies dataset/table defaults', () => {
+    const env = parseApiEnv({});
+
+    expect(env.AGENT_AUDIT_BACKEND).toBeUndefined();
+    expect(env.AGENT_AUDIT_DATASET).toBe('operator_os_dev_audit');
+    expect(env.AGENT_AUDIT_TABLE).toBe('agent_auth');
+  });
+
+  it('accepts the three documented backends and rejects others', () => {
+    for (const backend of ['bigquery', 'logging', 'noop'] as const) {
+      const env = parseApiEnv({ AGENT_AUDIT_BACKEND: backend });
+      expect(env.AGENT_AUDIT_BACKEND).toBe(backend);
+    }
+
+    expect(() =>
+      parseApiEnv({ AGENT_AUDIT_BACKEND: 'kafka' })
+    ).toThrow();
+  });
+});
