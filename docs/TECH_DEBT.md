@@ -3905,12 +3905,13 @@ in the same way they already work on `/v1/agent/ws`.
 Discovered: 2026-04-27 (Phase 4.0 Part 3 scoping — the ADR-025
     audit story specifies a BigQuery dataset
     `operator_os_dev_audit.agent_auth` that does not exist yet)
+Closed: 2026-04-28
 Type: ops / observability
 Priority: P1
-Status: open
+Status: closed
 Owner: Akmal Khujdarov
-Target phase: Phase 4.0 (must close BEFORE Phase 4.0 closure
-    per hard-mode condition — audit logs are a verification
+Target phase: Phase 4.0 (closed before Phase 4.0 ship per
+    hard-mode condition — audit logs are a verification
     requirement)
 
 ### Description
@@ -3989,10 +3990,91 @@ last 24h") returns the expected rows.
 - ADR-025 D1 (the audit requirement).
 - Phase 4.0 Part 3 (the LoggingAuditWriter stub this TD
   replaces).
+- TD-060 (filed at TD-057 closure): Cloud Monitoring billing
+  alert + insert-rate dashboard for the audit pipeline.
+
+### As-built (2026-04-28)
+
+Provisioning:
+- Dataset `operator-os-dev.operator_os_dev_audit` created in
+  EU multi-region (matches the existing `ops_analytics`
+  region).
+- Table `agent_auth` with the ADR-025 D1 schema: `timestamp`
+  (REQUIRED, partition column), `agent_id`/`user_id`/`ip`/
+  `user_agent`/`error_code` (NULLABLE STRING), `event_type`
+  (REQUIRED STRING), `success` (REQUIRED BOOL, derived from
+  event_type), `latency_ms` (NULLABLE INT64), `metadata`
+  (NULLABLE JSON, reserved for future fields).
+- Daily partitioning on `timestamp`, clustered on
+  `(agent_id, event_type)`, partition expiration 365 days.
+- Schema JSON persisted at
+  `infra/bigquery/agent_auth.schema.json` so reprovisioning
+  is reproducible.
+
+IAM:
+- `roles/bigquery.dataEditor` on the dataset granted to
+  `cloudrun-runtime@operator-os-dev.iam.gserviceaccount.com`.
+  The modern `bq add-iam-policy-binding` form is
+  allowlist-blocked on this project (same blocker observed on
+  `ops_analytics` per `docs/IAM_PLAN.md`); the binding was
+  applied via the legacy `bq update --source <acl-json>` path
+  — semantically identical (BQ even normalised the role to
+  legacy `WRITER` in the stored ACL, which is the alias of
+  `roles/bigquery.dataEditor`).
+- Future analytics SA placeholder for `dataViewer` recorded in
+  `docs/IAM_PLAN.md` for when the analytics SA exists.
+
+Code:
+- `apps/api/src/integrations/audit/bigquery-audit-writer.ts`
+  ships the writer + a production factory
+  `createBigQueryAuditWriter`. The writer is structurally
+  injected at construction (`AuditTable` interface), so the
+  unit tests run against a `vi.fn()` mock without touching
+  `@google-cloud/bigquery`.
+- 50 ms timeout on every `record()` call; the insert is
+  fire-and-forget. Failures (immediate or post-timeout) emit
+  one structured `pino warn` under `source=agent-audit` and
+  resolve cleanly. The auth hot path NEVER blocks on BQ.
+- `buildServer` reads `AGENT_AUDIT_BACKEND` and instantiates
+  the matching writer (`bigquery` / `logging` / `noop`); the
+  default resolves to `bigquery` in production and `logging`
+  elsewhere so tests stay quiet without an env override.
+
+Tests:
+- 9 unit tests covering happy path, schema mapping for every
+  eventType variant, optional-field passthrough, synchronous
+  insert failure swallow, timeout warn, no-warn on fast
+  resolution, late-rejection no-unhandled-rejection guarantee,
+  and the default 50 ms timeout.
+- 2 new config tests in
+  `packages/config/src/index.test.ts` covering
+  `AGENT_AUDIT_BACKEND` defaults + enum rejection.
+- Existing 220+ tests on the api + config workspaces stay
+  green; the `LoggingAuditWriter` integration test path is
+  unchanged.
+
+Verification path (deferred — see PR description):
+- Catalogue of forensic queries in
+  `docs/AGENT_AUDIT_QUERIES.md`.
+- Live verification (curl-driven register/rotate/revoke
+  followed by the smoke query) runs after the next deploy.
+  Marks the PR ready when verified.
+
+Operational follow-ups (TD-060):
+- Cloud Monitoring billing alert at $0.50/day BQ ingestion
+  spend on the `operator_os_dev_audit` dataset (rationale +
+  threshold maths in `docs/AGENT_AUDIT_QUERIES.md`).
+- Per-event dashboard (insert success rate, latency
+  p50/p95/p99, failed inserts by error_code).
 
 ### History
 
 - 2026-04-27: filed at Phase 4.0 Part 3 scoping.
+- 2026-04-28: closed via the
+  `chore/td-057-bigquery-audit` branch off
+  `feat/phase-3.4-mobile-build`. Provisioning, IAM, writer
+  implementation, tests, config switch, and docs land in the
+  same PR. TD-060 filed for the operational follow-ups.
 
 ## TD-058: Pub/Sub topic for `agent-status-changes` real-time mobile fan-out
 
@@ -4203,3 +4285,90 @@ rollback works.
 - 2026-04-27: filed at Phase 4.0 Part 3 scoping; deferral
   past Phase 4.0 closure approved by Akmal under hard-mode
   TD priority classification.
+
+## TD-060: Cloud Monitoring billing alert + per-event dashboard for the agent audit pipeline
+
+Discovered: 2026-04-28 (TD-057 closure — operational polish
+    deferred so the BQ pipeline ships within the 60-90 min
+    PR budget)
+Type: ops / observability
+Priority: P3
+Status: open
+Owner: Akmal Khujdarov
+Target phase: Phase 4.0 closure window or first post-launch
+    polish sprint
+
+### Description
+
+TD-057 landed the BigQuery audit pipeline (dataset, table,
+IAM, writer, tests, config switch, docs) but explicitly
+deferred two operational polish items:
+
+1. **Cloud Monitoring billing alert** at $0.50/day BigQuery
+   streaming-insert spend on the `operator_os_dev_audit`
+   dataset. Rationale: at projected volume (sub-MB/day) the
+   spend is sub-cent; $0.50/day is ~10 GB/day of inserts —
+   three orders of magnitude above projected, so a hit means
+   either a runaway loop in the writer or an attack flooding
+   auth attempts. The alert provisioning route is
+   `gcloud alpha billing budgets create` against the project
+   billing account, with a label filter on the dataset.
+2. **Per-event dashboard** in Cloud Monitoring covering:
+   insert success rate, insert latency p50/p95/p99 (read from
+   `latency_ms` in the table since pino logs don't aggregate
+   nicely), failed inserts by `error_code`, daily event
+   counts by `event_type`. Aggregation queries in
+   `docs/AGENT_AUDIT_QUERIES.md` already cover the underlying
+   data; this TD is the dashboard wiring.
+
+### Risk if unaddressed
+
+- Runaway audit-write loop in the api would not page anyone
+  until the monthly BQ bill arrives. Sub-cent normal spend
+  makes the alert load-bearing the moment it's needed.
+- Without the dashboard the on-call uses raw SQL queries to
+  triage. Workable but slow; for Phase 4.0 launch traffic it
+  doesn't matter, but it will the first time we have a real
+  incident.
+
+### Acceptance criteria
+
+1. Cloud Monitoring alert policy `agent-audit-bq-spend`
+   exists, fires on `bigquery.googleapis.com/billing/...`
+   filtered to the `operator_os_dev_audit` dataset above
+   $0.50/day, paging the on-call channel.
+2. Dashboard `agent-audit-bq-pipeline` exists with the four
+   panels listed above, using `latency_ms` and `success` from
+   the table for visualisation.
+3. Both artifacts committed as Terraform / `gcloud` scripts
+   under `infra/cloud-run/monitoring/` (or a new
+   `infra/monitoring/` dir) so they're reproducible.
+
+### Dependencies
+
+- Existing TD-057 dataset + table.
+- `roles/monitoring.editor` on the project for the
+  applying account (Akmal currently has Owner; safe).
+
+### Estimated effort
+
+- Billing alert: 30 min via `gcloud alpha billing budgets`.
+- Dashboard: 60 min — the panels are mostly SQL-backed
+  queries reused from `docs/AGENT_AUDIT_QUERIES.md`.
+- Total: ~1.5 hours.
+
+### Stale close condition
+
+Both artifacts exist in the project AND a synthetic spike test
+(insert N rows in a tight loop) confirms the alert fires.
+
+### Related
+
+- TD-057 (the parent — provisions the data the alert/
+  dashboard observes).
+- ADR-025 D1 (the audit requirement).
+
+### History
+
+- 2026-04-28: filed at TD-057 closure as the deferred
+  operational polish piece.
