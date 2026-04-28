@@ -3592,3 +3592,77 @@ References:
   pipeline. Part 3 ships `GET /v1/agent/latest-version`
   returning a stub response; the actual update mechanism
   slips to Phase 4.0.1.
+
+### Amendment 2 — Connection state machine + reconnect resilience (Phase 4.0 Part 5, hard-mode addition)
+
+D2 of the original ADR specified the
+online/degraded/offline trichotomy mobile UI surfaces. Part 5
+of Phase 4.0 makes the agent-side bookkeeping that drives
+that trichotomy explicit:
+
+- **Six-state machine** (`ConnectionStateMachine`):
+  DISCONNECTED → CONNECTING → CONNECTED → DEGRADED →
+  DISCONNECTING → REVOKED. REVOKED is absorbing — once a
+  401 fires, the WS doesn't reconnect (the FatalAuthHandler
+  exits the process anyway). Every transition logged with
+  reason + metadata. Mobile UI's trichotomy maps directly:
+  CONNECTED→online, DEGRADED→degraded, every other state→
+  offline.
+
+- **Backoff with jitter + ceiling**:
+  - 1s base, 60s ceiling (unchanged from Phase 3.2).
+  - ±20% uniform jitter so a fleet of agents doesn't
+    thunder-herd on Cloud Run after a regional blip.
+  - 1000-attempt ceiling (~16h of wall time at the 60s
+    ceiling). After exhaustion the agent stays
+    DISCONNECTED + emits a structured error log; the
+    operator decides whether to manually `start()` again.
+  - Reset on welcome.
+
+- **RTT histogram** records on every server-driven ping.
+  Phase 4.0 limitation: the api's ping doesn't currently
+  echo back a timestamp, so the recorded value is local
+  processing latency (receive → pong-send) not true RTT.
+  A follow-up TD (filed alongside the eventual mobile fan-
+  out work) upgrades the api to echo timestamps so true
+  RTT lands. Mobile UI's DEGRADED threshold maps to
+  `histogram.percentiles().p95 > 200ms` once the data
+  becomes meaningful.
+
+- **Disconnect categorisation** turns close codes + error
+  fields into nine documented buckets (NETWORK_DOWN,
+  DNS_FAILURE, TLS_HANDSHAKE_FAIL, SERVER_UNREACHABLE,
+  SERVER_REJECTED, PROTOCOL_ERROR, CLIENT_TIMEOUT,
+  INTENTIONAL, UNKNOWN). Lands in the structured close log
+  AND in the state-transition metadata so listeners get
+  full context for ops dashboards (TD-058 future).
+
+- **Network-change detector** polls
+  `os.networkInterfaces()` every 5s, fires onChange when
+  the non-internal-address signature shifts. ControlChannelWs
+  subscribes on start() and cancels its pending backoff
+  timer + re-enters CONNECTING immediately whenever the
+  detector fires. Polling chosen over Windows WMI / WNet
+  events to keep zero native-build deps; same tradeoff
+  Part 4.A made for the credential store. Forward path: a
+  Windows-native event impl plugs into the same
+  NetworkChangeDetector interface when Phase 4.x lands
+  cross-OS support.
+
+Wiring: `ControlChannelWs` accepts every primitive as an
+optional constructor option. Defaults wire up an internal
+state machine + backoff with sensible production values;
+tests inject deterministic versions. main.ts (Part 4.G/Part
+6) constructs the network-change detector + RTT histogram
+once and passes both into the WS so other components (mobile
+fan-out via TD-058) can subscribe to the same instances.
+
+References:
+
+- TD already-filed: TD-057, TD-058, TD-059 (no new TDs from
+  Part 5 — every primitive ships fully-tested without
+  external infra dependencies).
+- The local-RTT-only limitation is documented inline in
+  `ControlChannelWsOptions.rttHistogram` JSDoc. When the api
+  upgrades to timestamp-echoing pings, the limitation is
+  lifted by a one-line change in the agent's ping handler.
