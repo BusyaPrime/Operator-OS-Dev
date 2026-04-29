@@ -6,6 +6,66 @@ All notable changes to Operator-OS land here. Format follows
 
 ## Unreleased
 
+### Phase 4.0 Part 5 — Reconnection state machine + RTT + categorisation
+
+#### Added
+
+- `ConnectionStateMachine` — six-state explicit machine
+  (DISCONNECTED → CONNECTING → CONNECTED → DEGRADED →
+  DISCONNECTING → REVOKED with REVOKED absorbing). Replaces
+  scattered `#shuttingDown` + `#sessionId !== undefined`
+  booleans inside the WS class.
+- `RttHistogram` — bounded rolling-window histogram
+  (default 20 samples ≈ 10 minutes at 30s ping cadence).
+  Reports p50 / p95 / p99 / mean / mostRecent. Pure utility,
+  numpy-style linear-interpolation percentiles.
+- `categorizeDisconnect(...)` — maps WS disconnect inputs
+  (Error.code, Error.message, closeCode, intentional) into
+  nine documented categories: NETWORK_DOWN, DNS_FAILURE,
+  TLS_HANDSHAKE_FAIL, SERVER_UNREACHABLE, SERVER_REJECTED,
+  PROTOCOL_ERROR, CLIENT_TIMEOUT, INTENTIONAL, UNKNOWN.
+- `ReconnectBackoff` — exponential backoff with ±20%
+  jitter, 1000-attempt ceiling, reset on welcome, injectable
+  random source for deterministic tests. Replaces inline
+  backoff math in `#scheduleReconnect`.
+- `PollingNetworkChangeDetector` — polls
+  `os.networkInterfaces()` every 5s, fires onChange
+  listeners when the non-internal-address signature
+  changes. ControlChannelWs subscribes on `start()` and
+  cancels its pending backoff timer + reconnects
+  immediately when the local interface comes back. Pure
+  TS, no native deps. Forward path to a Windows-event
+  impl when Phase 4.x lands a native addon.
+- ADR-025 amendment 2 documents the state machine,
+  reconnect resilience, RTT limitation (local processing
+  latency only — true RTT pending api timestamp echo).
+
+#### Changed
+
+- `ControlChannelWs` accepts five new optional constructor
+  fields (`stateMachine`, `backoff`,
+  `networkChangeDetector`, `rttHistogram`). Defaults wire
+  up production-ready instances; tests inject deterministic
+  ones.
+- New public getters: `connectionState`, `sessionId`.
+- `isConnected` now reads `stateMachine.canSend` (CONNECTED
+  or DEGRADED).
+- Backoff math + `#shuttingDown` state replaced with state-
+  machine queries throughout `#connectAsync`,
+  `#scheduleReconnect`, close-event handler, error-event
+  handler.
+
+#### Quality
+
+- `@operator-os/desktop-agent`: 229 → 285 (+56 across 5.A-F).
+- Every new primitive ships with focused unit tests:
+  ConnectionStateMachine (15), RttHistogram (8),
+  categorizeDisconnect (15), ReconnectBackoff (18),
+  NetworkChangeDetector (14). The Part 5.F integration was
+  validated by the existing 285-test suite — no regressions
+  in the WS auth path (Part 4.E), rotation cascade (Part
+  4.G), or claude-code-agent tests.
+
 ### Phase 4.0 Part 4 — Agent-side token management
 
 #### Added
