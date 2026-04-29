@@ -15,6 +15,7 @@ import type { FastifyInstance, preHandlerAsyncHookHandler } from 'fastify';
 
 import type { FirestoreOperatorRepository } from '../integrations/firestore.js';
 import type { PubSubPublisher } from '../integrations/pubsub.js';
+import { createDeprecationPreHandler } from '../middleware/deprecation.js';
 import type { AlertsService } from '../services/alerts.js';
 import type { CommandsService } from '../services/commands.js';
 import type { ExportsService } from '../services/exports.js';
@@ -81,17 +82,34 @@ export const registerAgentRoutes = async (
   const rateLimiter =
     options.heartbeatRateLimiter ?? createAgentHeartbeatRateLimiter();
 
-  app.post('/v1/agent/heartbeat', routeOptions, async (request) => {
-    const deviceState = deviceStateSchema.parse(request.body);
-    const receipt = await options.repository.recordDeviceState(deviceState);
-    await options.pubSubPublisher.publishAgentEvent(deviceState);
-
-    return mutationReceiptSchema.parse({
-      ...receipt,
-      operation: 'device-state.heartbeat',
-      resourceId: deviceState.deviceId
-    });
+  // Phase 4.0 Part 8 — ADR-025 D4 sunsets the legacy REST
+  // surface in favour of the WS control channel. Three routes
+  // keep responding (so pre-4.0 builds survive the rollout)
+  // but every response carries the RFC-spec'd deprecation
+  // headers + emits a structured `legacy-endpoint-usage` log
+  // line so ops can count residual traffic.
+  const deprecatedRouteOptions = (endpoint: string) => ({
+    preHandler: [
+      options.authGuard,
+      createDeprecationPreHandler({ logger: app.log, endpoint })
+    ] as preHandlerAsyncHookHandler[]
   });
+
+  app.post(
+    '/v1/agent/heartbeat',
+    deprecatedRouteOptions('POST /v1/agent/heartbeat'),
+    async (request) => {
+      const deviceState = deviceStateSchema.parse(request.body);
+      const receipt = await options.repository.recordDeviceState(deviceState);
+      await options.pubSubPublisher.publishAgentEvent(deviceState);
+
+      return mutationReceiptSchema.parse({
+        ...receipt,
+        operation: 'device-state.heartbeat',
+        resourceId: deviceState.deviceId
+      });
+    }
+  );
 
   // Phase 2 / TD-024: additive agent-centric heartbeat. The
   // existing /v1/agent/heartbeat keeps accepting deviceStateSchema
@@ -104,56 +122,65 @@ export const registerAgentRoutes = async (
   // Zod issues list, not as 500 through the generic error
   // handler. The older /v1/agent/heartbeat still .parse()s for
   // bug-for-bug backward compatibility with existing clients.
-  app.post('/v1/agent/heartbeat/agent', routeOptions, async (request, reply) => {
-    const parsed = agentHeartbeatRequestSchema.safeParse(request.body);
-    if (!parsed.success) {
-      reply.status(400);
-      return {
-        error: 'Bad Request',
-        message: 'agentHeartbeatRequestSchema validation failed',
-        issues: parsed.error.issues
-      };
+  app.post(
+    '/v1/agent/heartbeat/agent',
+    deprecatedRouteOptions('POST /v1/agent/heartbeat/agent'),
+    async (request, reply) => {
+      const parsed = agentHeartbeatRequestSchema.safeParse(request.body);
+      if (!parsed.success) {
+        reply.status(400);
+        return {
+          error: 'Bad Request',
+          message: 'agentHeartbeatRequestSchema validation failed',
+          issues: parsed.error.issues
+        };
+      }
+      const heartbeat = parsed.data;
+
+      if (!rateLimiter.tryAccept(heartbeat.agentId)) {
+        reply.status(429);
+        return {
+          error: 'Too Many Requests',
+          message:
+            `Agent ${heartbeat.agentId} must wait at least ` +
+            `${AGENT_HEARTBEAT_MIN_INTERVAL_MS}ms between heartbeats.`
+        };
+      }
+
+      // `operatorId` comes from the JWT via the agent guard; it's
+      // the identity Cost / budget reads will key on. Defensive
+      // fallback: if for any reason the guard left it unset, use
+      // 'unknown-agent' — persistence still works, and a later
+      // audit flags the row.
+      const userId =
+        request.authSession?.currentUser?.operatorId ?? 'unknown-agent';
+
+      await options.repository.recordAgentHeartbeat(heartbeat, userId);
+
+      // Phase 2 scope: `pendingTaskIds` + `commands` are both
+      // empty. Real task dispatch is Week 4; command dispatch
+      // (pause/resume/shutdown/update-config) is router-integration
+      // work not covered here.
+      return agentHeartbeatResponseSchema.parse({
+        status: 'ok',
+        serverTime: new Date().toISOString(),
+        pendingTaskIds: [],
+        commands: []
+      });
     }
-    const heartbeat = parsed.data;
+  );
 
-    if (!rateLimiter.tryAccept(heartbeat.agentId)) {
-      reply.status(429);
-      return {
-        error: 'Too Many Requests',
-        message:
-          `Agent ${heartbeat.agentId} must wait at least ` +
-          `${AGENT_HEARTBEAT_MIN_INTERVAL_MS}ms between heartbeats.`
-      };
+  app.get(
+    '/v1/agent/commands',
+    deprecatedRouteOptions('GET /v1/agent/commands'),
+    async (request) => {
+      const query = commandPollQuerySchema.parse(request.query);
+
+      return commandPollResponseSchema.parse(
+        await options.commandsService.pollCommands(query.deviceId)
+      );
     }
-
-    // `operatorId` comes from the JWT via the agent guard; it's
-    // the identity Cost / budget reads will key on. Defensive
-    // fallback: if for any reason the guard left it unset, use
-    // 'unknown-agent' — persistence still works, and a later
-    // audit flags the row.
-    const userId = request.authSession?.currentUser?.operatorId ?? 'unknown-agent';
-
-    await options.repository.recordAgentHeartbeat(heartbeat, userId);
-
-    // Phase 2 scope: `pendingTaskIds` + `commands` are both
-    // empty. Real task dispatch is Week 4; command dispatch
-    // (pause/resume/shutdown/update-config) is router-integration
-    // work not covered here.
-    return agentHeartbeatResponseSchema.parse({
-      status: 'ok',
-      serverTime: new Date().toISOString(),
-      pendingTaskIds: [],
-      commands: []
-    });
-  });
-
-  app.get('/v1/agent/commands', routeOptions, async (request) => {
-    const query = commandPollQuerySchema.parse(request.query);
-
-    return commandPollResponseSchema.parse(
-      await options.commandsService.pollCommands(query.deviceId)
-    );
-  });
+  );
 
   app.post('/v1/agent/sessions', routeOptions, async (request) =>
     sessionReceiptSchema.parse(await options.sessionsService.recordSession(request.body))

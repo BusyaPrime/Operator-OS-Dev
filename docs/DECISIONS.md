@@ -3592,3 +3592,89 @@ References:
   pipeline. Part 3 ships `GET /v1/agent/latest-version`
   returning a stub response; the actual update mechanism
   slips to Phase 4.0.1.
+
+### Amendment 3 — Phase 4.0 Part 8 deprecation execution
+
+D4 of the original ADR specified that `POST /v1/agent/heartbeat`,
+`POST /v1/agent/heartbeat/agent`, and `GET /v1/agent/commands`
+would be deprecated by Phase 4.0 in favour of the WS control
+channel, but did not pin the surface a deprecated route presents
+to its callers. Part 8 fills that in.
+
+Surface (per RFC):
+
+- `Deprecation: @<unix-seconds>` (RFC 9745 §2) — set to the
+  Phase 4.0 Part 8 ship date (2026-04-29).
+- `Sunset: <HTTP-date>` (RFC 8594 §3) — set to **2026-05-25**.
+  ~26-day window. Aggressive on purpose — every pre-4.0 caller
+  is internal (we own the desktop agent), so the migration
+  budget is correspondingly short.
+- `Link: <doc>; rel="deprecation"` and
+  `Link: <doc>; rel="sunset"` (RFC 8288) — both point at
+  `docs/MIGRATION-V4.md`. Default URL
+  `https://docs.operator-os.dev/migration/v4`; overridable per
+  preHandler instance.
+
+Phase transitions:
+
+- **Phase 4.0 (now):** routes keep responding 200/4xx/5xx as
+  before. Every response carries the three header families.
+  Every call emits a structured `source: legacy-endpoint-usage`
+  pino INFO line so Cloud Logging can count residual traffic
+  via a log-based metric.
+- **Phase 4.1 (post-2026-05-25):** routes return `410 Gone`
+  once the `legacy-endpoint-usage` count stays at zero for two
+  consecutive weeks. We will not black-hole working traffic on
+  the calendar date alone.
+- **Phase 5 (post-410-stable):** routes are deleted from
+  `apps/api/src/routes/agent.ts`. Any client still calling
+  them gets `404 Not Found`.
+
+Implementation:
+
+- `apps/api/src/middleware/deprecation.ts` — `applyDeprecationHeaders`,
+  `recordLegacyEndpointUsage`, `createDeprecationPreHandler`
+  factory. Constants: `LEGACY_ENDPOINT_DEPRECATION_AT`,
+  `LEGACY_ENDPOINT_SUNSET_AT`, `DEFAULT_MIGRATION_DOC_URL`.
+- `apps/api/src/routes/agent.ts` — three deprecated routes
+  share a `deprecatedRouteOptions(endpoint)` factory that
+  chains the auth guard with the deprecation preHandler.
+  Other `/v1/agent/*` routes (`/sessions`, `/exports`,
+  `/alerts`) are explicitly NOT in the deprecation set —
+  surface stays scoped, not blanket.
+- `docs/MIGRATION-V4.md` — caller-facing migration guide:
+  affected endpoints, replacement (WS frames), timeline,
+  detection (header + log shape), FAQ.
+
+Audit-pipeline integration:
+
+- The legacy-usage events stay on the structured-log path
+  even when TD-057's BigQuery writer is live for the agent
+  auth events. Two reasons:
+  1. The legacy-usage stream is short-lived (closed when
+     residual traffic hits zero) — bolting it onto the
+     Firestore-doc-typed `AgentAuthEvent` enum would make
+     the BQ table description churn for a temporary signal.
+  2. Cloud Logging's log-based-metric path is enough for
+     "alert at zero hits for two weeks" — a full BQ schema
+     mod is over-engineered for that question.
+
+References:
+
+- Implementation PR: feat/phase-4.0-part-8-deprecate-legacy
+- TD-058 (still open): Pub/Sub `agent-status-changes` topic
+  is unrelated to the deprecation surface but shares the
+  D4-blocking-Part-7 dependency tree; flagged here so the
+  closure cross-link survives rebase.
+
+Merge-order dependency:
+
+- This amendment is numbered sequentially after Amendment 2
+  ("Phase 4.0 Part 5 — Reconnection state machine + RTT +
+  categorisation"), which lives on PR #40 / branch
+  `feat/phase-4.0-part-5-reconnection`. If PR #40 merges
+  after this PR, this section needs a rebase — bump the
+  header from "Amendment 3" to "Amendment 2" or whichever
+  slot is correct on the merged base. The body content does
+  not depend on Amendment 2 (different concerns: WS layer
+  vs REST surface), so the rebase is purely cosmetic.
