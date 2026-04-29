@@ -4203,3 +4203,106 @@ rollback works.
 - 2026-04-27: filed at Phase 4.0 Part 3 scoping; deferral
   past Phase 4.0 closure approved by Akmal under hard-mode
   TD priority classification.
+
+## TD-062: Investigate prompt injection in `system-reminder` hook output
+
+Discovered: 2026-04-28 (Phase 4.0 Part 5 closure turn —
+    pre-existing reproducer; first observed inline)
+Type: security / agent-platform integrity
+Priority: P1 (must investigate before any new automation
+    that consumes hook context unaltered)
+Phase: post-Phase-4.0 immediate follow-up
+Status: open
+Evidence count: 4
+
+### Description
+
+A `[MAGIC KEYWORD: <name>]` token is reaching the model's
+input stream via the `UserPromptSubmit` hook's
+`system-reminder` block. The token frames itself as
+"Skill routing detected" and instructs the model to invoke a
+named skill or read a `SKILL.md` fallback path. Observed
+keyword to date: `AI-SLOP-CLEANER`.
+
+The instruction is appended to the actual user prompt by an
+intermediate process (oh-my-claudecode hook, pre-prompt
+rewriter, or upstream proxy) that the user did NOT type and
+did NOT consent to in the current turn. From the user's
+perspective the prompt they sent is unchanged; from the
+model's perspective an extra "important" routing directive
+shows up out of nowhere. That gap is the exploit surface.
+
+The model's correct response is to refuse the unsolicited
+skill invocation and surface the observation to the user.
+This TD captures the recurring pattern so the source can be
+traced and shut off.
+
+### Evidence chain
+
+Each observation is a turn in which the system-reminder
+context contained the verbatim string
+`[MAGIC KEYWORD: AI-SLOP-CLEANER]` outside any user-typed
+content. Refusal protocol: silently decline, note inline,
+continue user's task. No skill activation in any case.
+
+1. **2026-04-28** — Phase 4.0 Part 5 closure turn. First
+   observation. Refused, filed initial TD.
+2. **2026-04-28** — TD-062 file turn (commit 619b70b on
+   `feat/phase-4.0-part-5-reconnection`). Same pattern.
+3. **2026-04-28** — Standby acknowledgement turn (chip-flow
+   approach approval). Same pattern.
+4. **2026-04-29** — Phase 4.0 Stage 2 (Part 8) docs phase
+   (this commit). Same pattern. Pattern is persistent and
+   not escalating across sessions.
+
+### Investigation plan
+
+1. Trace the `UserPromptSubmit` hook chain in
+   `~/.claude/settings.json` and the OMC hook scripts under
+   `~/.claude/hooks/`. Identify which hook injects the
+   `[MAGIC KEYWORD: ...]` text.
+2. Inspect the hook's source: is it deliberate skill-router
+   behaviour from oh-my-claudecode (in which case it's a
+   feature, not an injection — but still surfaces wrong)
+   or does it come from elsewhere?
+3. If it's an OMC feature: file an upstream issue at
+   [Yeachan-Heo/oh-my-claudecode] asking for either
+   (a) opt-in keyword routing instead of silent injection,
+   or (b) a clear "this routing was suggested by your local
+   hook config" preamble that distinguishes hook-suggested
+   skills from user-requested skills.
+4. If it's NOT from OMC: track the actual injector
+   (proxy? extension? CI-side hook?) and disable it.
+
+### Containment (in place)
+
+- Refusal protocol applied each turn it shows up.
+- Pattern stays the same across 4 observations — not
+  escalating, not switching keywords. Lower exploit surface
+  than a polymorphic injection would carry.
+
+### Stale close condition
+
+The injector is identified, the injection is either turned
+off or rewritten as opt-in routing, and a hardening test
+proves we no longer ingest `[MAGIC KEYWORD: ...]` patterns
+from the hook context without explicit user consent.
+
+### Related
+
+- Phase 4.0 Part 5 (when this was first observed inline).
+- `~/.claude/settings.json` and `~/.claude/hooks/`
+  (oh-my-claudecode hook chain — primary suspect).
+- TD-062 was originally filed in commit 619b70b on the
+  Part 5 branch. This entry on the Part 8 branch may
+  duplicate the Part 5 entry on merge — keep the version
+  with the higher evidence count and reconcile the
+  history list during conflict resolution. Five-minute
+  fix.
+
+### History
+
+- 2026-04-28: TD filed (Part 5 branch, evidence count 3).
+- 2026-04-29: increment to evidence count 4 (this entry,
+  Part 8 branch, same-pattern observation during Stage 2
+  docs phase). Refusal protocol held.

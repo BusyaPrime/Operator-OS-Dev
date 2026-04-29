@@ -6,6 +6,62 @@ All notable changes to Operator-OS land here. Format follows
 
 ## Unreleased
 
+### Phase 4.0 Part 8 — Legacy REST sunset (ADR-025 D4)
+
+#### Deprecated
+
+- `POST /v1/agent/heartbeat`,
+  `POST /v1/agent/heartbeat/agent`, and
+  `GET /v1/agent/commands` are formally deprecated in favour
+  of the WS control channel (`/v1/agent/ws`). Each response
+  now carries `Deprecation: @<unix-seconds>` (RFC 9745),
+  `Sunset: Mon, 25 May 2026 00:00:00 GMT` (RFC 8594), and
+  `Link: <docs/MIGRATION-V4.md>; rel="deprecation"`,
+  `Link: <docs/MIGRATION-V4.md>; rel="sunset"` (RFC 8288).
+  Phase 4.1 turns the routes into `410 Gone` once
+  `legacy-endpoint-usage` log-based metric stays at zero
+  for two consecutive weeks.
+
+#### Added
+
+- `apps/api/src/middleware/deprecation.ts` —
+  `applyDeprecationHeaders`, `recordLegacyEndpointUsage`,
+  and a `createDeprecationPreHandler` factory that chains
+  cleanly with the existing auth guards. Exports the
+  baked-in dates (`LEGACY_ENDPOINT_DEPRECATION_AT`,
+  `LEGACY_ENDPOINT_SUNSET_AT`) and the default migration
+  doc URL so tests + agent code can assert against the
+  same constants the routes serve.
+- Each call to one of the three deprecated routes now
+  emits a structured `source: 'legacy-endpoint-usage'`
+  pino INFO line carrying `endpoint`, `userId`, `ip`,
+  `userAgent`, plus the deprecation/sunset timestamps —
+  Cloud Logging surfaces this as a log-based metric so
+  ops can count residual traffic per day per endpoint.
+- `docs/MIGRATION-V4.md` — caller-facing migration guide:
+  affected endpoints, replacement (WS frame schema),
+  timeline, on-the-wire detection (header shape +
+  log-line shape), and a query template for the
+  `legacy-endpoint-usage` metric.
+
+#### Documented
+
+- ADR-025 amendment 3 in `docs/DECISIONS.md` records the
+  deprecation surface, transition phases (4.0 → 4.1 →
+  Phase 5), and the merge-order dependency on Amendment 2
+  (Phase 4.0 Part 5, PR #40).
+
+#### Quality
+
+- `@operator-os/api`: 230 → 243 tests (+13 across 2 new
+  files: `middleware/__tests__/deprecation.test.ts` (9)
+  and `routes/__tests__/agent-deprecation.test.ts` (4)).
+- Coverage targets: every header is present on the success
+  path; the Sunset header round-trips through Date.parse
+  back to the documented constant; non-deprecated
+  `/v1/agent/*` routes (e.g. `/sessions`) carry NO
+  deprecation headers — surface stays scoped.
+
 ### Phase 4.0 — Always-On Agent + Max Subscription
 
 #### Added
