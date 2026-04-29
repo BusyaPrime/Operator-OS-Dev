@@ -6,6 +6,44 @@ All notable changes to Operator-OS land here. Format follows
 
 ## Unreleased
 
+### Phase 4.0 Part 6 — Windows Scheduled Task auto-start (ADR-025 D3)
+
+#### Added
+
+- `scripts/start-agent.ps1` — wrapper invoked by the
+  Scheduled Task. Runs preflight (claude CLI, Max session,
+  agent root, dist build), spawns `node dist/main.js` with
+  stdout/stderr captured into a daily-rotated log under
+  `%APPDATA%\operator-os\logs\agent-YYYYMMDD.log`. Translates
+  the agent's exit code for Task Scheduler — most importantly
+  rewrites exit 87 (`AGENT_TOKEN_REVOKED`) to 0 so the task
+  does NOT auto-restart on a permanent failure mode.
+- `scripts/install-agent-autostart.ps1` — generates the task
+  XML, copies the wrapper to a stable per-user location
+  (`%APPDATA%\operator-os\start-agent.ps1`), registers the
+  task via `schtasks /Create /XML ... /F`. Idempotent. No
+  admin rights required. Settings: LogonTrigger, principal
+  LeastPrivilege + InteractiveToken (so the agent can read
+  `~\.claude\.credentials.json`), `MultipleInstancesPolicy =
+  StopExisting`, `RestartOnFailure = { 3 retries × 1 min }`.
+- `scripts/uninstall-agent-autostart.ps1` — companion
+  uninstaller. Stops + deletes the task, prompts before
+  removing the config directory, reminds the user that
+  backend revocation is separate.
+- `docs/AGENT_SETUP.md` — caller-facing setup walkthrough
+  (prerequisites, register, install, verify, custom paths,
+  manual update procedure, uninstall).
+- `docs/AGENT_TROUBLESHOOTING.md` — exit-code table,
+  diagnostic commands, common failure modes (task not
+  starting, WS reconnect loop, wrong Claude session, high
+  log volume, immediate exit 87), escalation capture list.
+
+#### Documented
+
+- ADR-025 amendment 4 in `docs/DECISIONS.md` records the
+  Scheduled Task XML decisions, exit-code taxonomy, and the
+  load-bearing exit-87-translation behaviour.
+
 ### Phase 4.0 Part 5 — Reconnection state machine + RTT + categorisation
 
 #### Added

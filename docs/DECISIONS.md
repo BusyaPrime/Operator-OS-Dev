@@ -3666,3 +3666,93 @@ References:
   `ControlChannelWsOptions.rttHistogram` JSDoc. When the api
   upgrades to timestamp-echoing pings, the limitation is
   lifted by a one-line change in the agent's ping handler.
+
+### Amendment 4 — Phase 4.0 Part 6 startup implementation
+
+D3 of the original ADR specified that the desktop agent
+auto-starts via a Windows Scheduled Task at user logon, runs
+as the user (not SYSTEM), and treats exit code 87 as the
+"do not auto-restart" signal. Part 6 fills in the
+implementation surface.
+
+Deliverables:
+
+- `scripts/start-agent.ps1` — wrapper invoked by the
+  Scheduled Task. Runs preflight (claude CLI, Max session,
+  agent root, dist build), spawns `node dist/main.js` with
+  stdout/stderr captured into a daily-rotated log under
+  `%APPDATA%\operator-os\logs\agent-YYYYMMDD.log`, and
+  translates the agent's exit code for the scheduler.
+- `scripts/install-agent-autostart.ps1` — generates the task
+  XML, copies the wrapper to a stable per-user location,
+  registers the task via `schtasks /Create /XML ... /F`.
+  Idempotent. No admin rights required.
+- `scripts/uninstall-agent-autostart.ps1` — companion
+  uninstaller. Stops + deletes the task, prompts before
+  removing the config directory, reminds the user that
+  backend-side revocation is separate.
+- `docs/AGENT_SETUP.md` — caller-facing setup walkthrough.
+- `docs/AGENT_TROUBLESHOOTING.md` — exit-code table,
+  diagnostic commands, common failure modes, escalation
+  capture list.
+
+Exit code taxonomy (single namespace shared between wrapper
+and agent — see `apps/desktop-agent/src/auth/fatal-auth-handler.ts`
+for the agent-side constant):
+
+| Code | Meaning                              |
+|------|--------------------------------------|
+| 0    | Clean shutdown                       |
+| 87   | `AGENT_TOKEN_REVOKED` (Part 4.F)     |
+| 88   | claude CLI missing                   |
+| 89   | Max session credentials missing      |
+| 90   | agent root path not found            |
+| 91   | dist/main.js not built               |
+
+Exit code 87 handling (the load-bearing decision):
+
+- Task Scheduler XML schema (`Task.Settings.RestartOnFailure`)
+  has no per-exit-code policy; the choice is "restart on any
+  non-zero" or "never restart". A revoked token is permanent
+  until the user re-registers — restarting the agent every
+  minute would thrash without making progress.
+- Resolution: the wrapper script translates exit 87 into
+  exit 0 BEFORE returning to Task Scheduler. The agent's
+  fatal log (`source: 'fatal-auth-handler'`) preserves the
+  forensic record; the scheduler sees a "clean exit" and
+  waits for the next logon trigger.
+- All other non-zero codes (88-91 + agent-side errors) flow
+  through to Task Scheduler unchanged, so RestartOnFailure
+  3×1min covers transient failures.
+
+Scheduled Task settings:
+
+- `LogonTrigger` — fires once per user logon.
+- `Principal.LogonType = InteractiveToken`,
+  `Principal.RunLevel = LeastPrivilege` — runs as the user,
+  not SYSTEM, so `~\.claude\.credentials.json` is
+  accessible.
+- `Settings.MultipleInstancesPolicy = StopExisting` —
+  manual `schtasks /Run` after a logon-triggered instance
+  is already running stops the old one and starts fresh.
+- `Settings.ExecutionTimeLimit = PT0S` — no time limit;
+  the agent is expected to run until the user logs off.
+- `Settings.RestartOnFailure = { Interval: PT1M, Count: 3 }` —
+  3 retries at 1-minute intervals on any non-zero (post-
+  wrapper-translation) exit.
+
+Documentation refs:
+
+- `docs/AGENT_SETUP.md` — one-time setup walkthrough.
+- `docs/AGENT_TROUBLESHOOTING.md` — exit codes, common
+  failure modes, diagnostic commands.
+
+Deferred:
+
+- TD-059 (signed self-update pipeline) — Phase 4.0.1.
+- Native Windows Event Log integration — optional, not
+  required for Phase 4.0 closure.
+- Per-machine `OPERATOR_OS_AGENT_ROOT` system env var
+  installation. The current wrapper falls back to a
+  hard-coded path; users with non-default repo locations
+  set the env var manually before reinstalling the task.
