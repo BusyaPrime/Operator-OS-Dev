@@ -97,6 +97,7 @@ $taskXml = @"
   </Triggers>
   <Principals>
     <Principal id="Author">
+      <UserId>$env:USERDOMAIN\$env:USERNAME</UserId>
       <LogonType>InteractiveToken</LogonType>
       <RunLevel>LeastPrivilege</RunLevel>
     </Principal>
