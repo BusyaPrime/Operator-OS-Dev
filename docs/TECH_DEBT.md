@@ -4203,3 +4203,177 @@ rollback works.
 - 2026-04-27: filed at Phase 4.0 Part 3 scoping; deferral
   past Phase 4.0 closure approved by Akmal under hard-mode
   TD priority classification.
+
+## TD-066: WS auth integration gap not surfaced by tests
+
+Discovered: 2026-05-04 (Phase 4.0 Part 9 T1.4 — first real
+    WS upgrade attempt against the deployed backend)
+Type: process / test-strategy
+Priority: P2 (process gap; functional fix lands separately
+    via the WS-auth-fix hotfix PR)
+Phase: post-Phase-4.0 audit follow-up
+Status: open
+
+### Description
+
+Phase 4.0 Part 3 added `agentTokenGuard` middleware (validates
+the per-machine opaque token via bcrypt + LRU cache) and wired
+it into every new REST route under `/v1/agent/*`
+(register / list / status / rotate-token / revoke). The WS
+upgrade route at `/v1/agent/ws` is registered separately via
+`registerAgentWsRoute` in `apps/api/src/app.ts` and was missed
+in the wiring pass — it kept using the legacy Phase 3
+`createAgentGuard` (validates user JWT / Firebase ID / Google
+OIDC).
+
+Result: the Phase 4.0 desktop agent registered correctly,
+DPAPI-stored its opaque token correctly, attempted the WS
+upgrade with `Authorization: Bearer <opaque-token>`, and got
+401 — because the legacy guard tried to verify the opaque
+token as a JWT.
+
+### Why this slipped through
+
+1. The Part 3.H integration test mounted the full `buildServer`
+   but only exercised REST paths.
+2. The WS-route unit tests injected their own `agentGuard`
+   fake, bypassing the production wiring.
+3. There was no "the WS upgrade rejects a Phase 3 JWT and
+   accepts a Phase 4 opaque token" test pinning the wiring
+   contract.
+4. Code review on PR #38 didn't flag the asymmetry between
+   how REST and WS routes consume their guards.
+
+### Action items
+
+1. Add a wiring-level integration test that mounts the full
+   `buildServer` and exercises a WS upgrade with both an
+   opaque token (must accept) and a stale Phase 3 JWT (must
+   reject). Lives alongside `agent-registration.integration.test.ts`.
+2. Audit every other Phase boundary for the same pattern
+   ("middleware exists, wired into route subset, missed
+   adjacent route"). Document findings.
+3. Update the test-strategy doc with a "wiring contract"
+   section: every middleware that exists must have at
+   least one full-stack integration test pinning it to its
+   intended routes.
+4. Consider a periodic `grep` audit script in CI: every
+   route file whose handlers reference `request.agent` (or
+   `request.authSession`) must have a corresponding
+   integration test. Tooling-level enforcement is the
+   sustainable fix.
+
+### Stale close condition
+
+The four action items land + the audit produces no further
+similar gaps + the wiring-contract section is in
+`docs/TESTING.md` (or equivalent).
+
+### Related
+
+- ADR-025 amendment 5 (the WS auth wiring fix this TD
+  triages).
+- Part 9 T1.4 (where this surfaced).
+- TD-067 (the elevation issue surfaced in the same
+  Part 9 stretch — different defect class, separately
+  filed).
+
+### History
+
+- 2026-05-04: Filed at Phase 4.0 Part 9 T1.4 surfacing.
+
+## TD-067: Part 6 install requires elevation on locked-down Windows
+
+Discovered: 2026-05-04 (Phase 4.0 Part 9 T1.2 — first real
+    Scheduled Task install attempt on the dev machine)
+Type: agent / install-script user experience
+Priority: P1 (visible to every desktop-agent installer on
+    a locked-down Windows account; blocks autostart)
+Phase: Phase 4.0.1
+Status: open
+
+### Description
+
+`scripts/install-agent-autostart.ps1` calls `schtasks /Create
+/XML` to register the OperatorOS Agent Scheduled Task. The
+XML uses `LogonType = InteractiveToken` and
+`RunLevel = LeastPrivilege` per ADR-025 D3, so the resulting
+task runs as the user (not SYSTEM) at user logon — no admin
+needed at runtime.
+
+But the `/Create` operation itself fails with HRESULT
+0x80070005 (Access Denied) on accounts where the local
+security policy denies non-admin users the right to create
+scheduled tasks at all. `Register-ScheduledTask` (the modern
+PowerShell cmdlet path) hits the same wall — the underlying
+Task Scheduler 2.0 COM API enforces the same access check.
+
+Empirically observed on the Akmal dev account on Windows 11
+with default settings. Other accounts on the same machine
+may behave differently depending on group-policy / local
+policy configuration.
+
+### Mitigations available
+
+The Phase 4.0 Part 6 patch (commit abe0aab on PR #43) added
+a `<UserId>` element to the Principal block. That fixes a
+related-but-distinct schtasks-XML rejection mode. It does NOT
+fix the broader "user can't create tasks at all" wall —
+that's this TD.
+
+Options for the fix:
+
+1. **Detect-and-elevate** — the install script probes its
+   privilege state at start, and if task-creation rights
+   are absent, re-launches itself elevated via
+   `Start-Process -Verb RunAs`. UAC prompt is shown; user
+   consents once per install. The elevated child process
+   completes the task creation; the parent exits.
+
+2. **Document admin-run requirement** — `docs/AGENT_SETUP.md`
+   gets a clear "if step 2 fails with Access Denied, right-
+   click PowerShell → Run as Administrator and re-run".
+   Lower-effort fix, but every user hits the wall once.
+
+3. **Startup folder fallback** — if `schtasks` fails, the
+   script falls back to dropping a shortcut into
+   `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`
+   that triggers `start-agent.ps1` at logon. Doesn't get
+   `RestartOnFailure` semantics; pure best-effort.
+
+Recommended: option 1 + 2 as the primary path. Fall-back to
+Startup folder is a stretch goal — its semantics differ
+enough from the Scheduled Task that mixing them in one
+install script adds more confusion than value.
+
+### Estimated effort
+
+- Detect-and-elevate logic: 30 min.
+- Documentation update: 15 min.
+- Manual smoke test: 30 min (need at least two test
+  accounts — admin and non-admin — to exercise both paths).
+- Total: ~1.5 hours.
+
+### Stale close condition
+
+A fresh non-admin Windows install runs through the install
+flow, gets the UAC prompt, accepts, and ends up with a
+running OperatorOS Agent Scheduled Task. Plus the AGENT_SETUP
+doc reflects the actual user-facing flow.
+
+### Related
+
+- Phase 4.0 Part 6 (the install script that needs the fix).
+- ADR-025 D3 amendment 4 (sets the design constraints —
+  LeastPrivilege, no admin at runtime).
+- Part 9 T1.2 (where this surfaced).
+- TD-066 (the WS auth gap surfaced in the same Part 9
+  stretch; different defect class).
+
+### History
+
+- 2026-05-04: Filed at Phase 4.0 Part 9 T1.2 surfacing.
+  Workaround for the Part 9 verification: run agent
+  directly via `node dist/main.js` (bypasses the autostart
+  layer entirely; the WS-connection path is what Part 9
+  actually validates).
