@@ -1,8 +1,13 @@
 import { parseApiEnv } from '@operator-os/config';
+import type { AgentRecord } from '@operator-os/contracts';
 import { SignJWT } from 'jose';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { buildServer } from '../../app.js';
+import {
+  AgentsCollectionUnavailableError,
+  type AgentRepository
+} from '../../integrations/firestore-agent-repository.js';
 
 /**
  * Integration tests for WSS /v1/agent/ws (Phase 2 / TD-017).
@@ -10,9 +15,19 @@ import { buildServer } from '../../app.js';
  * Uses @fastify/websocket's `app.injectWS()` helper to drive a
  * real ws client against the in-process Fastify instance — no
  * separate listen(), no port-binding flakiness.
+ *
+ * Phase 4.0 ADR-025 amendment 5 — these tests now authenticate
+ * via the Phase 4.0 opaque token (issued by POST
+ * /v1/agent/register) rather than a Phase 3 user JWT, because
+ * the WS upgrade route has switched to agentTokenGuard. The
+ * test body assertions (hello → welcome, malformed-frame
+ * close codes, idle behaviour) are unchanged — only the auth
+ * shape moved.
  */
 
 const LITERAL = 'a-very-secret-shared-between-auth-gateway-and-operator-api';
+const TEST_USER_ID = 'agent-user-1';
+const TEST_AGENT_ID = '00000000-0000-4000-8000-000000000001';
 
 const buildEnv = () =>
   parseApiEnv({
@@ -21,7 +36,7 @@ const buildEnv = () =>
     AUTH_ACCESS_TOKEN_AUDIENCE: 'operator-os-api'
   });
 
-const mintToken = async (operatorId = 'agent-user-1') => {
+const mintUserToken = async (operatorId = TEST_USER_ID): Promise<string> => {
   const secret = new TextEncoder().encode(LITERAL);
   const now = Math.floor(Date.now() / 1000);
   return new SignJWT({
@@ -30,7 +45,7 @@ const mintToken = async (operatorId = 'agent-user-1') => {
     aud: 'operator-os-api',
     iat: now,
     exp: now + 3600,
-    scopes: ['agent:write'],
+    scopes: ['user:read', 'user:write'],
     plan: 'free' as const,
     operatorId,
     email: 'agent@example.com'
@@ -39,7 +54,137 @@ const mintToken = async (operatorId = 'agent-user-1') => {
     .sign(secret);
 };
 
-const validHello = (agentId = '00000000-0000-4000-8000-000000000001') => ({
+/**
+ * In-memory AgentRepository — same shape as the integration
+ * tests' fixture. Inline so this file stays self-contained.
+ */
+const buildInMemoryRepository = (): AgentRepository => {
+  const records = new Map<string, AgentRecord>();
+  return {
+    async create(record) {
+      if (records.has(record.agentId)) {
+        throw new AgentsCollectionUnavailableError(
+          'AGENT_ID_TAKEN',
+          `Agent ${record.agentId} already exists`
+        );
+      }
+      records.set(record.agentId, record);
+    },
+    async getById(agentId) {
+      return records.get(agentId);
+    },
+    async listForUser(userId, options = {}) {
+      const includeRevoked = options.includeRevoked ?? false;
+      return [...records.values()]
+        .filter((r) => r.userId === userId)
+        .filter((r) => includeRevoked || !r.revoked);
+    },
+    async rotateToken(
+      agentId,
+      newTokenHash,
+      newTokenLookupHash,
+      overlapExpiresAt
+    ) {
+      const before = records.get(agentId);
+      if (!before) {
+        throw new AgentsCollectionUnavailableError(
+          'AGENT_NOT_FOUND',
+          `Agent ${agentId} not found`
+        );
+      }
+      const now = new Date().toISOString();
+      const updated: AgentRecord = {
+        ...before,
+        tokenHash: newTokenHash,
+        tokenLookupHash: newTokenLookupHash,
+        tokenIssuedAt: now,
+        tokenLastRotatedAt: now,
+        previousTokenHash: before.tokenHash,
+        previousTokenLookupHash: before.tokenLookupHash,
+        previousTokenExpiresAt: overlapExpiresAt.toISOString(),
+        oldTokenUsageCount: 0,
+        updatedAt: now
+      };
+      records.set(agentId, updated);
+      return updated;
+    },
+    async markRevoked(agentId, reason) {
+      const before = records.get(agentId);
+      if (!before) {
+        throw new AgentsCollectionUnavailableError(
+          'AGENT_NOT_FOUND',
+          `Agent ${agentId} not found`
+        );
+      }
+      const now = new Date().toISOString();
+      const updated: AgentRecord = {
+        ...before,
+        revoked: true,
+        revokedAt: before.revokedAt ?? now,
+        revokedReason: before.revokedReason ?? reason,
+        updatedAt: now
+      };
+      records.set(agentId, updated);
+      return updated;
+    },
+    async markOnline() {
+      /* noop */
+    },
+    async markOffline() {
+      /* noop */
+    },
+    async recordHeartbeat() {
+      /* noop */
+    },
+    async clearExpiredPreviousTokens() {
+      return 0;
+    },
+    async findCandidatesByTokenLookup(lookupHash) {
+      return [...records.values()].filter(
+        (r) =>
+          r.tokenLookupHash === lookupHash ||
+          r.previousTokenLookupHash === lookupHash
+      );
+    },
+    async incrementOldTokenUsage(agentId) {
+      const before = records.get(agentId);
+      if (!before) return;
+      records.set(agentId, {
+        ...before,
+        oldTokenUsageCount: before.oldTokenUsageCount + 1
+      });
+    }
+  };
+};
+
+/**
+ * Register a test agent against a running app + return the
+ * opaque token. This is the auth shape the WS upgrade now
+ * accepts (via Phase 4.0 agentTokenGuard).
+ */
+const registerTestAgent = async (
+  app: Awaited<ReturnType<typeof buildServer>>
+): Promise<string> => {
+  const userJwt = await mintUserToken();
+  const response = await app.inject({
+    method: 'POST',
+    url: '/v1/agent/register',
+    headers: { authorization: `Bearer ${userJwt}` },
+    payload: {
+      agentId: TEST_AGENT_ID,
+      machineName: 'agent-ws-test-host',
+      capabilities: ['code-generation']
+    }
+  });
+  if (response.statusCode !== 201) {
+    throw new Error(
+      `register failed: ${response.statusCode} ${response.body}`
+    );
+  }
+  return (response.json() as { agentToken: string }).agentToken;
+};
+
+const validHello = (agentId: string = TEST_AGENT_ID) => ({
   type: 'hello' as const,
   agentId,
   manifest: {
@@ -70,10 +215,15 @@ const recvOne = <T = unknown>(socket: {
 
 describe('WSS /v1/agent/ws', () => {
   let app: Awaited<ReturnType<typeof buildServer>>;
+  let agentToken: string;
 
   beforeEach(async () => {
-    app = buildServer(buildEnv(), { trustProxy: false });
+    app = buildServer(buildEnv(), {
+      trustProxy: false,
+      agentRepository: buildInMemoryRepository()
+    });
     await app.ready();
+    agentToken = await registerTestAgent(app);
   });
 
   afterEach(async () => {
@@ -95,9 +245,8 @@ describe('WSS /v1/agent/ws', () => {
   });
 
   it('completes hello → welcome for an authenticated client', async () => {
-    const token = await mintToken();
     const socket = await app.injectWS('/v1/agent/ws', {
-      headers: { authorization: `Bearer ${token}` }
+      headers: { authorization: `Bearer ${agentToken}` }
     });
 
     socket.send(JSON.stringify(validHello()));
@@ -117,9 +266,8 @@ describe('WSS /v1/agent/ws', () => {
   });
 
   it('closes 4002 when the hello frame is malformed', async () => {
-    const token = await mintToken();
     const socket = await app.injectWS('/v1/agent/ws', {
-      headers: { authorization: `Bearer ${token}` }
+      headers: { authorization: `Bearer ${agentToken}` }
     });
 
     socket.send(JSON.stringify({ type: 'hello' })); // missing agentId + manifest
@@ -132,9 +280,8 @@ describe('WSS /v1/agent/ws', () => {
   });
 
   it('sends an error frame and closes 4002 when the hello payload fails schema', async () => {
-    const token = await mintToken();
     const socket = await app.injectWS('/v1/agent/ws', {
-      headers: { authorization: `Bearer ${token}` }
+      headers: { authorization: `Bearer ${agentToken}` }
     });
 
     const invalidHello = {
@@ -155,9 +302,8 @@ describe('WSS /v1/agent/ws', () => {
   });
 
   it('rejects non-JSON frames with an error message', async () => {
-    const token = await mintToken();
     const socket = await app.injectWS('/v1/agent/ws', {
-      headers: { authorization: `Bearer ${token}` }
+      headers: { authorization: `Bearer ${agentToken}` }
     });
 
     socket.send('not-json-at-all');
@@ -168,9 +314,8 @@ describe('WSS /v1/agent/ws', () => {
   });
 
   it('accepts post-welcome task-progress without errors', async () => {
-    const token = await mintToken();
     const socket = await app.injectWS('/v1/agent/ws', {
-      headers: { authorization: `Bearer ${token}` }
+      headers: { authorization: `Bearer ${agentToken}` }
     });
 
     socket.send(JSON.stringify(validHello()));
@@ -198,9 +343,8 @@ describe('WSS /v1/agent/ws', () => {
   });
 
   it('emits an error but stays open on post-welcome invalid frame', async () => {
-    const token = await mintToken();
     const socket = await app.injectWS('/v1/agent/ws', {
-      headers: { authorization: `Bearer ${token}` }
+      headers: { authorization: `Bearer ${agentToken}` }
     });
 
     socket.send(JSON.stringify(validHello()));
@@ -271,9 +415,8 @@ describe('WSS /v1/agent/ws', () => {
     // without spuriously closing for `pongTimeoutMs` — which
     // is effectively the ping loop contract from the client's
     // perspective.
-    const token = await mintToken();
     const socket = await app.injectWS('/v1/agent/ws', {
-      headers: { authorization: `Bearer ${token}` }
+      headers: { authorization: `Bearer ${agentToken}` }
     });
 
     socket.send(JSON.stringify(validHello()));
@@ -287,9 +430,8 @@ describe('WSS /v1/agent/ws', () => {
   });
 
   it('updates lastActivityAt via heartbeat-ping without erroring', async () => {
-    const token = await mintToken();
     const socket = await app.injectWS('/v1/agent/ws', {
-      headers: { authorization: `Bearer ${token}` }
+      headers: { authorization: `Bearer ${agentToken}` }
     });
 
     socket.send(JSON.stringify(validHello()));

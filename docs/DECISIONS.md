@@ -3592,3 +3592,80 @@ References:
   pipeline. Part 3 ships `GET /v1/agent/latest-version`
   returning a stub response; the actual update mechanism
   slips to Phase 4.0.1.
+
+### Amendment 5 — WS upgrade auth wiring fix (Phase 4.0 Part 9, hotfix)
+
+Surfaced during Phase 4.0 Part 9 T1.4 (first real WS upgrade
+against the deployed backend). Root cause: `registerAgentWsRoute`
+in `apps/api/src/app.ts` was wired with the legacy Phase 3
+`createAgentGuard` (validates user JWT / Firebase ID / Google
+OIDC) instead of the Phase 4.0 `agentTokenGuard` (validates
+the per-machine opaque token via bcrypt + lookup hash).
+
+Symptom: a freshly-registered desktop agent presented its
+DPAPI-stored opaque token on the WS upgrade `Authorization`
+header → legacy guard tried to verify it as a JWT → 401 →
+agent's `FatalAuthHandler` cascaded to `process.exit(87)`. The
+Phase 4.0 register/list/status/rotate/revoke REST routes worked
+correctly because they were wired to `agentTokenGuard` from
+Part 3.
+
+The asymmetry was invisible to the existing test surface: the
+WS-protocol unit tests (`agent-ws.test.ts`) injected their own
+guard fakes, and the Part 3.H integration test exercised REST
+only.
+
+#### Fix
+
+`apps/api/src/app.ts`: hoist the `agentTokenGuard` construction
+above the `registerAgentWsRoute` call site, then thread
+`agentGuard: agentTokenGuard.preHandler` into the WS route
+options. Same guard composition the Part 3 REST routes already
+use; no new instances, no new state machines.
+
+The WS route is intentionally agent-only — no legitimate human
+caller authenticates over `/v1/agent/ws`. Replacing rather than
+chaining the guards is the right move: the legacy guard would
+have accepted user JWTs on the WS, an architectural smell we
+don't want to preserve under "backward compat".
+
+#### Test coverage
+
+New file: `apps/api/src/routes/__tests__/agent-ws-auth.test.ts`
+(7 tests) pins the wiring contract:
+
+- valid Phase 4.0 opaque token → upgrade succeeds.
+- invalid token (no record) → 401.
+- Phase 3 user JWT → 401 (regression guard for the exact bug
+  this amendment fixes).
+- no `Authorization` header → 401.
+- non-Bearer scheme (e.g. `Basic`) → 401.
+- revoked token → 401 (post-`markRevoked` re-attempt).
+- post-rotation: new token accepted, unrelated random token
+  rejected.
+
+Existing `agent-ws.test.ts` tests updated to use the opaque-
+token auth path through the same `agentRepository` injection
+seam used by the Part 3.H integration test. The protocol-level
+assertions (hello → welcome, malformed-frame close 4002, idle
+behaviour, heartbeat-ping) are unchanged — only the auth shape
+moved.
+
+#### Process gap (TD-066)
+
+The wiring asymmetry slipped through PR #38 review and through
+CI. TD-066 (filed at the same time as this amendment, on the
+integration tip 2026-05-04) captures the process improvements
+that prevent the recurrence: a wiring-level integration test
+that mounts the full `buildServer` and exercises every
+auth-protected route family at the real wiring layer; an audit
+of similar Phase boundaries; a `docs/TESTING.md` "wiring
+contract" section.
+
+#### Implementation refs
+
+- Branch: `feat/phase-4.0-ws-auth-fix`
+- Closes: Phase 4.0 ship blocker for Part 9 E2E.
+- Surfaced by: Part 9 T1.4 — agent direct-run with proper env
+  showed `Unexpected server response: 401` on WS upgrade
+  followed by `exit 87` from `FatalAuthHandler`.
