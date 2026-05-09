@@ -4377,3 +4377,139 @@ doc reflects the actual user-facing flow.
   directly via `node dist/main.js` (bypasses the autostart
   layer entirely; the WS-connection path is what Part 9
   actually validates).
+
+## TD-068: markOnline / markOffline never invoked from WS lifecycle
+
+Discovered: 2026-05-09 (Phase 4.0 Part 9 T1.4 verification of
+    PR #44 — first real WS welcome against fixed backend)
+Type: api / Phase 4.0 closure blocker
+Priority: P1 (blocks Part 7 mobile agent-status UX +
+    downstream TD-058 Pub/Sub fan-out)
+Phase: Phase 4.0 closure
+Status: open
+
+### Description
+
+`AgentRepository.markOnline()` and `markOffline()` are
+defined on the interface (and implemented on
+`FirestoreAgentRepository` per the per-method shape declared
+during Part 3) but never invoked from the WS lifecycle.
+
+Empirical grep against the deployed source:
+
+```
+grep -rn 'markOnline\|markOffline' \
+    apps/api/src/routes/agent-ws.ts \
+    apps/api/src/services/agent-session-registry.ts
+# → zero matches
+```
+
+The WS welcome handler attaches the session to the in-memory
+`agentSessionRegistry` but never propagates the state
+transition to Firestore.
+
+### Symptom (verified live, 2026-05-09 T1.4)
+
+After PR #44 deployed at 100% traffic, the agent
+`412eaea5-94b4-4777-ae45-d5d4bbb8074d` opened a real WS
+session (`c37b30a6-baa0-4425-8c6b-3cbe3d27d689`, log
+timestamp 1778321176272) and held it for 90+ seconds with
+continuous emit observed. Throughout the session, the user-
+JWT-protected status endpoint (`GET /v1/agent/:id/status`)
+returned:
+
+```json
+{
+  "agentId": "412eaea5-94b4-4777-ae45-d5d4bbb8074d",
+  "onlineState": "offline",
+  "lastHeartbeatAt": null,
+  "lastConnectAt": null,
+  "lastDisconnectAt": null,
+  ...
+}
+```
+
+The status projection reads from Firestore. Because the WS
+handler never writes `lastConnectAt` / `lastHeartbeatAt`, the
+Firestore record stays in its post-register-only state and
+the projection reports the agent as offline regardless of
+actual WS connectivity.
+
+### Acceptance criteria
+
+1. On WS welcome-frame ack: invoke
+   `agentRepository.markOnline(agentId, { sessionId,
+   connectedAt: now })`. Idempotent at the data layer
+   (re-welcomes don't break the state).
+2. On WS ping/pong: bump `lastHeartbeatAt` to the timestamp
+   of the latest received pong (or sent ping — whichever the
+   data model defines as "alive proof"). Throttled to one
+   write per ~30s so a busy session doesn't flood Firestore.
+3. On WS close (any close-code, any disconnect category):
+   invoke `markOffline(agentId, { lastDisconnectAt: now,
+   reason: closeCode + categoriser-output })`.
+4. The status endpoint reflects actual WS state within 5
+   seconds of any state transition (welcome / disconnect),
+   subject to Firestore propagation latency.
+5. Cross-instance state propagation is **out of scope** for
+   this TD — that's TD-058's Pub/Sub fan-out, which depends
+   on this TD's writes existing in the first place.
+
+### Implementation sketch (not blocking on user direction)
+
+The cleanest seam is to extend `agentSessionRegistry` (the
+in-memory map already wired into the WS handler) with two
+side effects on `register()` / `evict()`:
+
+- After `register()` succeeds, call `markOnline` (fire-and-
+  forget with a single pino warn on failure — never block
+  the WS loop).
+- After `evict()` (any reason), call `markOffline` similarly.
+
+Heartbeat updates from ping/pong should land via a separate
+throttled write — possibly a small per-agent debouncer in
+the registry.
+
+The agent record's repository interface already accepts
+these methods; the wiring is the missing piece, not new
+storage shape.
+
+### Estimated effort
+
+- Wire markOnline/markOffline into agentSessionRegistry: 30 min.
+- Heartbeat throttled write: 30 min.
+- Tests (pin the wiring contract per TD-066 prevention
+  pattern): 30 min.
+- Total: ~90 minutes.
+
+### Stale close condition
+
+The grep above returns non-zero matches in the WS path AND
+a real WS session causes the status endpoint to flip to
+`onlineState: "online"` within 5 seconds. Plus the four
+acceptance criteria above each have a passing test.
+
+### Related
+
+- TD-058 (Pub/Sub `agent-status-changes` fan-out) — depends
+  on this TD's writes existing. Without TD-068, TD-058 has
+  nothing to fan out.
+- TD-066 (test-strategy "wiring contract" gap) — the
+  recurrence-prevention plan from TD-066 would have caught
+  this gap at PR #38 review.
+- ADR-025 D2 — the design statement that requires online
+  state to derive from WS lifecycle.
+- ADR-025 amendment 5 — fixed the WS auth wiring; this TD
+  is the next-layer wiring gap exposed once auth started
+  working.
+- Part 9 T1.4 (where this surfaced — 2026-05-09).
+
+### History
+
+- 2026-05-09: filed at Phase 4.0 Part 9 T1.4 surfacing,
+  immediately after PR #44 deploy made WS welcome reachable.
+  Workaround for ongoing Part 9 testing: judge T-PASS on
+  agent-side log evidence (sessionId in `control channel
+  welcomed` line); status endpoint cannot be trusted as a
+  Phase 4.0 health signal until this TD lands.
+
