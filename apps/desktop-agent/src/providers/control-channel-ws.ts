@@ -405,6 +405,27 @@ export class ControlChannelWs {
     const socket = factory(this.#url, {
       authorization: `Bearer ${token}`
     });
+
+    // TD-069 layer 1, defect A — defensive prior-socket close
+    // before overwrite. The state-machine guard at the top of
+    // #connectAsync already rejects re-entry when state is in
+    // CONNECTING / CONNECTED / DEGRADED / DISCONNECTING, but we
+    // belt-and-suspenders close any prior socket reference here
+    // so a future bug elsewhere cannot leak overlapping sockets.
+    // The prior socket's lifecycle handlers are no-oped via the
+    // ownerSocket scoping introduced in defect B (commit 2.3).
+    const priorSocket = this.#socket;
+    if (priorSocket !== undefined && priorSocket !== socket) {
+      this.#logger.warn(
+        { source: 'control-channel-ws' },
+        'TD-069 defensive close — found prior #socket reference at #connect; closing it'
+      );
+      try {
+        priorSocket.close(1000, 'reconnect-supersede');
+      } catch {
+        /* prior may already be in CLOSING state — ignore */
+      }
+    }
     this.#socket = socket;
 
     // Observe the upgrade response for the rotation header.
