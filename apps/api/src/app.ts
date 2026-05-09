@@ -498,8 +498,33 @@ export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) =>
     }
   };
 
+  // Phase 4.0 Part 3 — agent registration + token guard. Built
+  // BEFORE the WS route registration so the same guard wires
+  // both the REST routes (register/list/status/rotate/revoke)
+  // AND the WS upgrade route. ADR-025 amendment 5 captures the
+  // wiring fix — pre-amendment-5 code wired the WS route to the
+  // legacy Phase 3 createAgentGuard (JWT-based), which rejected
+  // the very opaque tokens the Phase 4.0 register endpoint
+  // mints.
+  //
+  // FirestoreAgentRepository is the durable storage; the audit
+  // writer goes through the LoggingAuditWriter stub (TD-057
+  // swaps in BigQuery).
+  const agentRepository: AgentRepository =
+    options.agentRepository ?? new FirestoreAgentRepository(config, app.log);
+  const agentAuditWriter = new LoggingAuditWriter(app.log);
+  const agentTokenGuard = createAgentTokenGuard({
+    repository: agentRepository,
+    audit: agentAuditWriter
+  });
+
   void registerAgentWsRoute(app, {
-    agentGuard: authService.createAgentGuard(agentAudience),
+    // Phase 4.0 amendment 5: WS upgrade now validates the
+    // per-machine opaque token via the same agentTokenGuard
+    // that gates the Phase 4.0 REST routes. Pre-amendment-5
+    // wiring (legacy createAgentGuard) rejected opaque tokens
+    // because it tried to verify them as JWTs.
+    agentGuard: agentTokenGuard.preHandler,
     sessionRegistry: agentSessionRegistry,
     taskCallbacks
   });
@@ -512,19 +537,6 @@ export const buildServer = (config: ApiEnv, options: BuildServerOptions = {}) =>
     taskEventBus
   });
 
-  // Phase 4.0 Part 3 — agent registration routes. Plugs the
-  // FirestoreAgentRepository into the same auth-service path
-  // the user routes use for the userGuard, and an
-  // agent-token guard backed by the same repository for the
-  // agent-only rotate-token route. Audit emit goes through
-  // the LoggingAuditWriter stub (TD-057 swaps in BigQuery).
-  const agentRepository: AgentRepository =
-    options.agentRepository ?? new FirestoreAgentRepository(config, app.log);
-  const agentAuditWriter = new LoggingAuditWriter(app.log);
-  const agentTokenGuard = createAgentTokenGuard({
-    repository: agentRepository,
-    audit: agentAuditWriter
-  });
   void registerAgentRegistrationRoutes(app, {
     lifecycleRepository: agentRepository,
     audit: agentAuditWriter,

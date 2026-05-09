@@ -4377,3 +4377,386 @@ doc reflects the actual user-facing flow.
   directly via `node dist/main.js` (bypasses the autostart
   layer entirely; the WS-connection path is what Part 9
   actually validates).
+
+## TD-068: markOnline / markOffline never invoked from WS lifecycle
+
+Discovered: 2026-05-09 (Phase 4.0 Part 9 T1.4 verification of
+    PR #44 — first real WS welcome against fixed backend)
+Type: api / Phase 4.0 closure blocker
+Priority: P1 (blocks Part 7 mobile agent-status UX +
+    downstream TD-058 Pub/Sub fan-out)
+Phase: Phase 4.0 closure
+Status: open
+
+### Description
+
+`AgentRepository.markOnline()` and `markOffline()` are
+defined on the interface (and implemented on
+`FirestoreAgentRepository` per the per-method shape declared
+during Part 3) but never invoked from the WS lifecycle.
+
+Empirical grep against the deployed source:
+
+```
+grep -rn 'markOnline\|markOffline' \
+    apps/api/src/routes/agent-ws.ts \
+    apps/api/src/services/agent-session-registry.ts
+# → zero matches
+```
+
+The WS welcome handler attaches the session to the in-memory
+`agentSessionRegistry` but never propagates the state
+transition to Firestore.
+
+### Symptom (verified live, 2026-05-09 T1.4)
+
+After PR #44 deployed at 100% traffic, the agent
+`412eaea5-94b4-4777-ae45-d5d4bbb8074d` opened a real WS
+session (`c37b30a6-baa0-4425-8c6b-3cbe3d27d689`, log
+timestamp 1778321176272) and held it for 90+ seconds with
+continuous emit observed. Throughout the session, the user-
+JWT-protected status endpoint (`GET /v1/agent/:id/status`)
+returned:
+
+```json
+{
+  "agentId": "412eaea5-94b4-4777-ae45-d5d4bbb8074d",
+  "onlineState": "offline",
+  "lastHeartbeatAt": null,
+  "lastConnectAt": null,
+  "lastDisconnectAt": null,
+  ...
+}
+```
+
+The status projection reads from Firestore. Because the WS
+handler never writes `lastConnectAt` / `lastHeartbeatAt`, the
+Firestore record stays in its post-register-only state and
+the projection reports the agent as offline regardless of
+actual WS connectivity.
+
+### Acceptance criteria
+
+1. On WS welcome-frame ack: invoke
+   `agentRepository.markOnline(agentId, { sessionId,
+   connectedAt: now })`. Idempotent at the data layer
+   (re-welcomes don't break the state).
+2. On WS ping/pong: bump `lastHeartbeatAt` to the timestamp
+   of the latest received pong (or sent ping — whichever the
+   data model defines as "alive proof"). Throttled to one
+   write per ~30s so a busy session doesn't flood Firestore.
+3. On WS close (any close-code, any disconnect category):
+   invoke `markOffline(agentId, { lastDisconnectAt: now,
+   reason: closeCode + categoriser-output })`.
+4. The status endpoint reflects actual WS state within 5
+   seconds of any state transition (welcome / disconnect),
+   subject to Firestore propagation latency.
+5. Cross-instance state propagation is **out of scope** for
+   this TD — that's TD-058's Pub/Sub fan-out, which depends
+   on this TD's writes existing in the first place.
+
+### Implementation sketch (not blocking on user direction)
+
+The cleanest seam is to extend `agentSessionRegistry` (the
+in-memory map already wired into the WS handler) with two
+side effects on `register()` / `evict()`:
+
+- After `register()` succeeds, call `markOnline` (fire-and-
+  forget with a single pino warn on failure — never block
+  the WS loop).
+- After `evict()` (any reason), call `markOffline` similarly.
+
+Heartbeat updates from ping/pong should land via a separate
+throttled write — possibly a small per-agent debouncer in
+the registry.
+
+The agent record's repository interface already accepts
+these methods; the wiring is the missing piece, not new
+storage shape.
+
+### Estimated effort
+
+- Wire markOnline/markOffline into agentSessionRegistry: 30 min.
+- Heartbeat throttled write: 30 min.
+- Tests (pin the wiring contract per TD-066 prevention
+  pattern): 30 min.
+- Total: ~90 minutes.
+
+### Stale close condition
+
+The grep above returns non-zero matches in the WS path AND
+a real WS session causes the status endpoint to flip to
+`onlineState: "online"` within 5 seconds. Plus the four
+acceptance criteria above each have a passing test.
+
+### Related
+
+- TD-058 (Pub/Sub `agent-status-changes` fan-out) — depends
+  on this TD's writes existing. Without TD-068, TD-058 has
+  nothing to fan out.
+- TD-066 (test-strategy "wiring contract" gap) — the
+  recurrence-prevention plan from TD-066 would have caught
+  this gap at PR #38 review.
+- ADR-025 D2 — the design statement that requires online
+  state to derive from WS lifecycle.
+- ADR-025 amendment 5 — fixed the WS auth wiring; this TD
+  is the next-layer wiring gap exposed once auth started
+  working.
+- Part 9 T1.4 (where this surfaced — 2026-05-09).
+
+### History
+
+- 2026-05-09: filed at Phase 4.0 Part 9 T1.4 surfacing,
+  immediately after PR #44 deploy made WS welcome reachable.
+  Workaround for ongoing Part 9 testing: judge T-PASS on
+  agent-side log evidence (sessionId in `control channel
+  welcomed` line); status endpoint cannot be trusted as a
+  Phase 4.0 health signal until this TD lands.
+
+## TD-069: WS reconnect amplification — client-side self-perpetuating kick-loop
+
+Discovered: 2026-05-09 (Phase 4.0 Part 9 T3 setup, ~30 min
+    after PR #44 deployed at 100% traffic; surfaced by an
+    8-agent Opus 4.7 parallel investigation reading the
+    deployed Cloud Run logs and the dist binary)
+Type: agent / Phase 4.0 functional blocker
+Priority: P0 (Phase 4.0 cannot deliver value until this
+    lands — no agent can sustain a WS session past 5 min
+    today)
+Phase: Phase 4.0 closure (must fix before declaring Phase
+    4.0 functional)
+Status: open
+
+### Description
+
+The desktop agent's `ControlChannelWs` has two compounding
+leaks in its connection lifecycle. Together they produce a
+self-perpetuating kick-loop that's indistinguishable from
+"normal" Phase 5 reconnect behaviour to a casual log
+observer (a fresh welcome arrives every 1.8 seconds), but
+NO welcomed session survives long enough to do useful work.
+
+### Two converging defects
+
+**Defect A — `#connect()` doesn't close prior socket.**
+`apps/desktop-agent/src/providers/control-channel-ws.ts`
+around line 151-161:
+
+```ts
+#connect(): void {
+  // ...
+  const socket = factory(this.#opts.url, {...});
+  this.#socket = socket;   // ← overwrites unconditionally
+}
+```
+
+If `#connect()` is ever invoked while `this.#socket` is
+still pointing at a prior socket (in-flight handshake,
+race with reconnect timer, or any reason), the prior is
+leaked and TWO concurrent WS connections from the same
+process target the server with the same agentId.
+
+**Defect B — close handler doesn't scope to active socket.**
+Same file, lines 196-206:
+
+```ts
+socket.on('close', (code) => {
+  this.#socket = undefined;
+  this.#sessionId = undefined;
+  if (!this.#shuttingDown) this.#scheduleReconnect();
+});
+```
+
+The handler is attached on every socket the agent ever
+created. It does NOT check whether the closing socket is
+still `this.#socket`. So a STALE socket's close event:
+- nukes `this.#socket` even though it now points at a
+  newer, healthy socket
+- triggers `#scheduleReconnect()` which makes ANOTHER
+  connection on top of the still-alive newer one
+
+### How the loop self-perpetuates
+
+Once any single overlap event creates two concurrent
+sockets:
+
+1. Conn A welcomed (sessionId Sa registered in registry)
+2. Conn B arrives at server → `register()` kicks A with
+   close 4004 'duplicate-agent', registers Sb
+3. A's 4004 close arrives at agent → A's close-handler
+   fires → `#scheduleReconnect()` — ALSO nukes
+   `this.#socket` even if it now points at B
+4. ~1s later: Conn C arrives → kicks Sb, registers Sc
+5. B's 4004 close → fires another reconnect → Conn D
+6. Pattern locks at ~1.8s cycle forever
+
+`#reconnectAttempt` is reset to 0 on every welcome
+(line 244), so the exponential backoff never grows past
+~1s — the loop is self-perpetuating AND tight.
+
+### What initiates the first overlap (the trigger)
+
+Verified by reality-checker agent reading both
+`/tmp/agent-direct-fixed.log` (T1.4 evidence) and
+`/tmp/agent-t3.log` (T3 evidence) end-to-end:
+
+- T1.4 first welcome at 2026-05-09T10:06:13Z, session
+  c37b30a6-... held for **5.04 minutes** (303.0 sec) before
+  close code **1006** (TCP-level abnormal close, no close
+  frame). Cloud Run idle-timeout signature.
+- 5 more cycles, all ~5 min, all 1006.
+- At min 30.685 of the log (after the 6th 1006), the FIRST
+  4004 fires and the kick-loop begins. From that point
+  forward, NO session lives more than 2.21 seconds.
+
+Likely overlap-trigger: token-refresh-during-reconnect
+(agent's local OAuth token logged `expiresInSeconds:
+-1330656` = expired 15 days ago, refresh on every CLI
+spawn) OR Cloud Run autoscaler routing producing a brief
+two-instance window during the 5-min-cycle reconnect.
+
+### Server-side context (NOT the bug)
+
+8-agent fleet investigation confirmed the server's
+`agentSessionRegistry` semantics are **correct as designed**:
+
+- Per-instance in-memory map, single-source-of-truth per
+  Cloud Run instance.
+- "Newer register wins, kick prior with 4004" is the
+  documented Phase 3.2 + ADR-025 contract.
+- TD-058 (Pub/Sub fan-out) handles cross-instance state for
+  MOBILE visibility, not for cross-instance registry
+  coordination.
+- ADR-025 sunset trigger for the per-instance registry is
+  >1000 agents/instance. We're at 1 agent.
+
+The bug is purely client-side. The server is doing exactly
+what it was specified to do.
+
+### Acceptance criteria (3 layers)
+
+#### Client fix (primary, blocking) — defect A + B
+
+```ts
+// Defect A fix in #connect():
+if (this.#socket !== undefined) {
+  this.#socket.removeAllListeners();
+  try { this.#socket.terminate(); } catch (_) { /* logged */ }
+  this.#socket = undefined;
+}
+// then construct + assign new socket as before
+
+// Defect B fix in the close handler:
+const ownedSocket = socket; // capture at attach time
+socket.on('close', (code) => {
+  if (this.#socket !== ownedSocket) {
+    // stale socket's close — ignore
+    return;
+  }
+  this.#socket = undefined;
+  this.#sessionId = undefined;
+  if (!this.#shuttingDown) this.#scheduleReconnect();
+});
+```
+
+#### Client fix (defense in depth)
+
+- On `close(4004)` specifically: back off harder (5-10s
+  base) before reconnecting. The current 1s base is what
+  makes the loop tight.
+- Wire the existing `ConnectionStateMachine` (Phase 4.0
+  Part 5.A, source on `feat/phase-4.0-part-5-reconnection`
+  branch) into `ControlChannelWs` so reconnect is gated
+  on `state.canTransitionTo('CONNECTING')`.
+
+#### Server-side defense (orthogonal, not strictly needed
+once client fixed)
+
+Per Threat Detection agent's Fix A: change registry
+eviction policy from "newer wins" to "prior-alive wins":
+
+```ts
+// in agent-session-registry.ts register():
+const priorIsAlive =
+  prior.socket.readyState === prior.socket.OPEN &&
+  Date.now() - Date.parse(prior.lastActivityAt) < pongTimeoutMs;
+if (priorIsAlive) {
+  return { kind: 'rejected', reason: 'duplicate-agent-prior-alive' };
+}
+// else evict prior, admit new
+```
+
+Combined with a new close code (e.g. 4009) so client can
+distinguish "you got kicked because someone else showed
+up" from "you got rejected because someone else is already
+here" — and the agent backs off correspondingly.
+
+#### Tests
+
+- Add `agent-ws.test.ts` test that exercises overlap:
+  open WS A, while A is open mid-handshake open WS B with
+  same agentId, assert exactly one is welcomed and the
+  other is rejected. This is the heisenbug the existing
+  test suite explicitly avoided (line 218-228 acknowledges
+  the avoidance).
+- Add client-side test with a fake WS factory that can
+  produce two parallel sockets and assert the second one
+  isn't created without the first being closed.
+
+### Estimated effort
+
+- Client fix (defects A + B): 30 min code, 30 min tests.
+- Defense in depth (state-machine wiring + 4004 backoff):
+  60 min.
+- Server-side eviction policy change: 60 min code + tests.
+- Total: 3 hours for the full fix; 1 hour for the minimal
+  client-only fix.
+
+### Workaround for ongoing Part 9 testing
+
+None. The kick-loop is permanent once triggered, and the
+trigger fires within ~30 minutes of any agent process
+start. T3 / T6 / T2 / T5 / T4 cannot be exercised against
+the current build.
+
+Phase 4.0 closure is BLOCKED on this TD.
+
+### Stale close condition
+
+A single agent process can hold one continuous WS session
+for ≥ 30 minutes against the deployed backend with zero
+4004 close events in its log, AND the existing
+agent-ws.test.ts test suite has a passing test pinning
+the overlap-rejection contract.
+
+### Related
+
+- ADR-025 D2 (the design statement; this TD doesn't
+  violate it, just exposes a client implementation gap).
+- Phase 4.0 Part 5.A (`ConnectionStateMachine`) — should
+  have prevented this; needs to be wired into
+  ControlChannelWs.
+- TD-058 (Pub/Sub fan-out) — orthogonal; doesn't fix
+  this.
+- TD-066 (test-strategy wiring-contract gap) — the
+  overlap test was explicitly avoided in
+  agent-ws.test.ts:218-228 with a comment acknowledging
+  the heisenbug. That comment is the contract that
+  TD-066's process improvement would catch.
+- TD-068 (markOnline wiring) — orthogonal; this TD's fix
+  doesn't depend on or affect TD-068.
+- PR #44 (the WS auth fix that surfaced this — by
+  making the WS path actually carry real traffic for the
+  first time, the client's overlap leak became
+  observable).
+- 8-agent Opus 4.7 parallel investigation, 2026-05-09
+  (Backend Architect, Code Reviewer, SRE, silent-failure-
+  hunter, Software Architect, Threat Detection Engineer,
+  Reality Checker, general-purpose code-tracer).
+
+### History
+
+- 2026-05-09: filed after the 8-agent fleet investigation
+  consolidated into a coherent root cause. Phase 4.0
+  closure paused pending direction.
+
