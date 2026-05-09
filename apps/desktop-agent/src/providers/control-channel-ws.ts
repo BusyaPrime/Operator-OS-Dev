@@ -491,7 +491,28 @@ export class ControlChannelWs {
       this.#onFrame(frame);
     });
 
+    // TD-069 layer 1, defect B — capture the owner reference
+    // so the close + error handlers attached below can no-op
+    // when they fire for a SUPERSEDED socket (one that this.#socket
+    // no longer points at). Without this scoping, a stale socket's
+    // close event nukes this.#socket = undefined for the active
+    // socket, regresses state CONNECTED → DISCONNECTED, and
+    // schedules another reconnect — producing the production
+    // kick-loop documented in TD-069.
+    const ownerSocket = socket;
+
     socket.on('close', (code: number) => {
+      // TD-069 defect B fix: stale close events from a
+      // superseded socket must NOT mutate state or schedule
+      // reconnects. Only the close of the currently-active
+      // socket drives the lifecycle.
+      if (this.#socket !== ownerSocket) {
+        this.#logger.info(
+          { source: 'control-channel-ws', code, source_marker: 'stale-socket-close-ignored' },
+          'stale socket close ignored — newer socket is active'
+        );
+        return;
+      }
       const intentional =
         this.#stateMachine.state === 'DISCONNECTING' || code === 1000;
       const category = categorizeDisconnect({
@@ -538,6 +559,21 @@ export class ControlChannelWs {
     });
 
     socket.on('error', (err: Error) => {
+      // TD-069 defect B fix: stale errors from a superseded
+      // socket must NOT propagate as auth events or drive
+      // state transitions. Only the active socket's errors
+      // can flip the state machine to REVOKED.
+      if (this.#socket !== ownerSocket) {
+        this.#logger.warn(
+          {
+            err,
+            source: 'control-channel-ws',
+            source_marker: 'stale-socket-error-ignored'
+          },
+          'stale socket error ignored — newer socket is active'
+        );
+        return;
+      }
       const category = categorizeDisconnect({
         error: err as Error & { code?: string }
       });
