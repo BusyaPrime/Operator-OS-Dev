@@ -4509,3 +4509,198 @@ attacker artefact.
 - 2026-04-28: filed at Phase 4.0 Parts 6/8 spawn turn after
   the second consecutive injection observation; Akmal
   approved the file at that turn.
+
+## TD-069: WS reconnect amplification — client-side self-perpetuating kick-loop
+
+Discovered: 2026-05-09 (Phase 4.0 Part 9 T3 setup, ~30 min
+    after PR #44 deployed at 100% traffic; surfaced by an
+    8-agent Opus 4.7 parallel investigation reading the
+    deployed Cloud Run logs and the dist binary).
+Type: agent / Phase 4.0 functional blocker
+Priority: P0 (was)
+Phase: Phase 4.0 closure
+Status: **FIX LANDED ON `fix/phase-4.0-td-069-ws-lifecycle`,
+    re-verification in progress**
+
+### Description
+
+Two compounding leaks in `apps/desktop-agent/src/providers/control-channel-ws.ts`
+combine to produce a self-perpetuating WS kick-loop. Once a
+single overlap event creates two concurrent sockets, every
+welcome triggers a reconnect, every reconnect triggers a kick,
+indefinitely. Cadence locks at ~1.8 s.
+
+The 8-agent fleet's investigation (Backend Architect, Code
+Reviewer, SRE, silent-failure-hunter, Software Architect,
+Threat Detection Engineer, Reality Checker, general-purpose
+code-tracer) confirmed the server side is correct as designed:
+every kick fires within one Cloud Run instanceId; ADR-025 D2
++ Phase 3.2 ADR document per-instance newer-wins eviction;
+sunset trigger is `>1000 agents/instance`, not "two instances
+exist." The fix is fully client-side.
+
+### Two compounding defects (root cause)
+
+**Defect A — `#connect()` overwrites `this.#socket` without
+closing the prior.** The state-machine guard at the top of
+`#connectAsync` rejects most invariant-violating re-entries,
+but if defect B regresses state from CONNECTED → DISCONNECTED
+on a stale socket close, the guard un-gates and the new
+socket assignment can leak a prior reference.
+
+**Defect B — close + error handlers don't scope to the active
+socket.** Captured the local `socket` variable lexically but
+never compared it to `this.#socket` at fire time. A stale
+socket's close event nukes `this.#socket = undefined` for the
+ACTIVE socket, regresses state CONNECTED → DISCONNECTED, and
+schedules another reconnect — initiating the next cycle.
+
+**Plus a third amplifier — backoff reset on every welcome.**
+`this.#backoff.reset()` was called unconditionally in the
+welcome-frame handler. Combined with the kick-loop pattern,
+every kicked session received its welcome BEFORE the kick,
+so the backoff was reset on every iteration. Reconnect delay
+stayed at the base value (1 s + jitter) forever.
+
+### Production evidence
+
+Reality-checker agent read both `/tmp/agent-direct-fixed.log`
+(T1.4 evidence) and `/tmp/agent-t3.log` (T3 evidence)
+end-to-end:
+
+- T1.4 first welcome at 2026-05-09T10:06:13Z, session
+  `c37b30a6-...` held for **5.04 minutes** (303.0 s) before
+  close code **1006** (Cloud Run idle-timeout signature).
+- 5 more cycles, all ~5 min, all 1006.
+- At min 30.685 of the log (~382 ms after a fresh welcome on
+  sid `d1a43c35`), the FIRST 4004 fires and the kick-loop
+  begins. From that point, no session lives more than
+  2.21 seconds.
+- T3 log is just the tail of the same kick-loop, captured
+  from a different start time.
+
+The original T1.4 PASS was a FALSE PASS — the user observed a
+welcome line and stopped tailing.
+
+### Fix — three layers
+
+Each layer is a defense-in-depth contribution; defect B is
+load-bearing.
+
+**Layer 1 — defect A — defensive prior-socket close.**
+Before `this.#socket = socket`, check if a prior socket
+reference is present that isn't the new socket. If yes,
+explicitly call `priorSocket.close(1000, 'reconnect-supersede')`.
+Log a single warn line if observed. Belt-and-suspenders for
+any future regression that bypasses the state-machine guard.
+
+**Layer 2 — defect B — handler scoping (load-bearing).**
+Capture `const ownerSocket = socket` in the lexical scope
+where lifecycle handlers are attached. At the top of the
+close + error handlers, check
+`if (this.#socket !== ownerSocket) return`. Stale socket
+events become no-ops and cannot drive the state machine.
+
+**Layer 3 — backoff reset deferred to STABLE_CONNECTION_THRESHOLD_MS.**
+New const `STABLE_CONNECTION_THRESHOLD_MS = 60_000`. The
+welcome-frame handler arms a single-shot timer instead of
+calling `backoff.reset()` immediately. If the timer fires
+while still CONNECTED/DEGRADED, reset; if a close event
+arrives first, the close-handler clears the timer and
+backoff stays advanced. Caps any kick-loop at the
+exponential-backoff envelope (~1 s → 60 s ceiling)
+regardless of any defect-A/B regression.
+
+### Test coverage
+
+`apps/desktop-agent/src/providers/__tests__/control-channel-ws-lifecycle.test.ts`
+adds 6 deterministic tests (vi.useFakeTimers harness, with a
+custom FakeSocket re-implementation):
+
+1. Stale close on superseded socket A does NOT regress
+   active socket B state.
+2. Stale error on superseded socket A does NOT flip active
+   socket B to REVOKED.
+3. Session kicked under threshold leaves backoff advanced.
+4. Session that survives ≥60 s resets backoff via the
+   deferred timer.
+5. Rapid kick-cycle does NOT spawn unbounded reconnect
+   attempts.
+6. After kick-loop subsides, a fresh stable connection
+   resets backoff.
+
+The "heisenbug" the original `agent-ws.test.ts:218-263`
+comment dodged ("client-side close event races with the
+plugin's message delivery") is now deterministic against the
+FakeSocket harness — it was the production kick-loop all
+along.
+
+### Implementation refs
+
+- Branch: `fix/phase-4.0-td-069-ws-lifecycle` (off
+  `feat/phase-4.0-part-6-windows-startup`).
+- Commits:
+  - `1939a7a` defect A defensive close
+  - `00b7a0e` defect B handler scoping (load-bearing)
+  - `386cfe6` layer 3 backoff defer
+  - `3514cf5` lifecycle test coverage (+6 tests)
+  - `68f52f1` ADR-025 amendment 5
+  - this commit (TD-069 status update)
+- Test growth: 285 → 291 (+6).
+
+### Acceptance criteria (from re-verification)
+
+T1.4-EXTENDED: a single agent process holds one continuous
+WS session for ≥30 minutes against the deployed backend
+with zero close-code-4004 events in its log. Reconnect
+attempts ≤ 1-2 per 30-min window for legitimate Cloud Run
+idle, NOT hundreds.
+
+### Stale close condition
+
+T1.4-EXTENDED PASS evidence committed alongside the merged
+PR. Plus the existing `agent-ws.test.ts:218-263` comment is
+updated to reference the lifecycle test as the canonical
+heisenbug coverage.
+
+### Related
+
+- ADR-025 D2 (the design statement; this TD doesn't violate
+  it, just exposes a client implementation gap).
+- ADR-025 amendment 5 on this branch (will renumber to
+  amendment 6 at final merge).
+- Phase 4.0 Part 5.A (`ConnectionStateMachine`) — already
+  wired into Part 6's `ControlChannelWs`; TD-069 layers
+  preserve its invariants rather than replace them.
+- TD-058 (Pub/Sub fan-out) — orthogonal; doesn't fix this
+  bug or block on it.
+- TD-066 (test-strategy wiring-contract gap) — the overlap
+  test was explicitly avoided in `agent-ws.test.ts:218-228`
+  with a comment acknowledging the heisenbug. That comment
+  is the contract that TD-066's process improvement would
+  catch.
+- TD-068 (markOnline wiring) — orthogonal; this TD's fix
+  doesn't depend on or affect TD-068.
+- PR #44 (the WS auth fix that surfaced this — by making
+  the WS path actually carry real traffic for the first
+  time, the client's overlap leak became observable).
+- 8-agent Opus 4.7 parallel investigation, 2026-05-09.
+
+### History
+
+- 2026-05-09 first turn: filed on `feat/phase-4.0-ws-auth-fix`
+  branch (commit `443f0af`) after the 8-agent fleet
+  consolidated the root cause. Phase 4.0 closure paused
+  pending direction.
+- 2026-05-09 second turn: branch decision (Option B, off
+  Part 6) approved. Three-layer fix landed on
+  `fix/phase-4.0-td-069-ws-lifecycle`. Re-verification
+  via T1.4-EXTENDED in progress.
+
+### Merge-conflict note
+
+This entry will conflict on merge with the version of TD-069
+filed on `feat/phase-4.0-ws-auth-fix` (commit `443f0af`).
+The resolution is to keep this branch's version (it has the
+"FIX LANDED" status and the implementation refs section)
+and union the History blocks.

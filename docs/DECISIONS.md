@@ -3756,3 +3756,126 @@ Deferred:
   installation. The current wrapper falls back to a
   hard-coded path; users with non-default repo locations
   set the env var manually before reinstalling the task.
+
+### Amendment 5 — Client WS connection-lifecycle invariants (TD-069, hotfix)
+
+Surfaced during Phase 4.0 Part 9 T3 setup, ~30 minutes after
+PR #44 (the WS auth wiring fix) deployed at 100% traffic.
+Investigated by an 8-agent Opus 4.7 parallel fleet on
+2026-05-09 against the deployed Cloud Run logs and the agent's
+dist binary. The full incident analysis lives in TD-069 in
+`docs/TECH_DEBT.md`.
+
+#### Symptom
+
+Agent connects, gets welcomed (`control channel welcomed
+sessionId X`), then ~1.8 seconds later the same connection
+receives close code 4004 from the server. The agent
+reconnects, gets welcomed again (sessionId Y), kicked again,
+indefinitely. Cadence locks at ~1.8 s. No session ever holds
+long enough to do useful work. Phase 4.0 cannot deliver value
+in this state.
+
+#### Server-side: confirmed correct as designed
+
+The fleet's investigation read the Cloud Run logs end-to-end
+(`gcloud logging read --service=operator-os-api`) and proved
+every kick fires within a single Cloud Run `instanceId`.
+Cross-instance routing is NOT the cause; TD-058 (Pub/Sub
+fan-out) and a `--max-instances=1` workaround would not
+help. The `agentSessionRegistry` newcomer-wins eviction at
+`apps/api/src/services/agent-session-registry.ts:86-94` is
+correct per ADR-025 D2 and the Phase 3.2 ADR — the registry's
+sunset trigger is `>1000 agents/instance`, not "two instances
+exist." No server-side change in this amendment.
+
+#### Client-side: three layers of defense
+
+The bug is two compounding leaks in
+`apps/desktop-agent/src/providers/control-channel-ws.ts`,
+combined with a backoff-reset that never let exponential
+backoff grow. Three layers of defense, each pinned by tests
+in `apps/desktop-agent/src/providers/__tests__/control-channel-ws-lifecycle.test.ts`:
+
+**Layer 1 — defect A — defensive prior-socket close in #connect.**
+Before assigning `this.#socket = socket`, if a prior socket
+reference is present that isn't the new socket, close it
+explicitly with code `1000` and reason `'reconnect-supersede'`.
+The state-machine guard at the top of `#connectAsync`
+already prevents most invariant-violating re-entries; this
+layer is belt-and-suspenders for any future regression
+elsewhere.
+
+**Layer 2 — defect B — close + error handlers scoped to ownerSocket.**
+The load-bearing fix. Capture `const ownerSocket = socket`
+in the lexical scope where the lifecycle handlers are
+attached. At the top of the close + error handlers, check
+`if (this.#socket !== ownerSocket) return`. A stale socket's
+close event no longer nukes `this.#socket = undefined` for
+the active socket, no longer regresses state CONNECTED →
+DISCONNECTED, no longer schedules another reconnect. The
+state machine remains authoritative.
+
+**Layer 3 — backoff reset deferred to STABLE_CONNECTION_THRESHOLD_MS.**
+The welcome-frame handler used to call
+`this.#backoff.reset()` unconditionally. Combined with the
+kick-loop pattern (welcome → ~1.8 s → 4004 → reconnect →
+welcome ...), this kept the reconnect delay at the base
+value (1 s + jitter) forever — exponential backoff never
+grew. The fix arms a single-shot 60-second timer on welcome.
+Only if the connection holds past 60 s does the backoff
+reset fire; sub-60 s sessions leave the backoff counter
+advanced, so subsequent reconnects pick the next exponential
+bucket. This caps any future kick-loop variant at the
+exponential-backoff envelope (~60 s ceiling) regardless of
+defects elsewhere.
+
+#### Test coverage
+
+`apps/desktop-agent/src/providers/__tests__/control-channel-ws-lifecycle.test.ts`
+adds 6 tests across 3 groups: stale-close-ignored,
+backoff-deferred, heisenbug-overlap-rejection. The "heisenbug"
+the original `agent-ws.test.ts:218-263` comment explicitly
+dodged ("client-side close event races with the plugin's
+message delivery") is now deterministic against the
+FakeSocket harness — it was the production kick-loop all
+along.
+
+Total agent test count: 285 → 291 (+6).
+
+#### Implementation refs
+
+- Branch: `fix/phase-4.0-td-069-ws-lifecycle`
+- Commits:
+  - `1939a7a` defect A defensive close
+  - `00b7a0e` defect B handler scoping (load-bearing fix)
+  - `386cfe6` layer 3 backoff defer
+  - `3514cf5` TD-069 lifecycle test coverage
+  - this amendment + TD-069 status update commits
+- Stacks on: `feat/phase-4.0-part-6-windows-startup` (Part 6
+  branch, which carries the full Part 4-6 lifecycle stack
+  in its `control-channel-ws.ts`).
+
+#### Merge-order note
+
+This branch (off Part 6) currently has Amendments 1, 2, 4 in
+its `docs/DECISIONS.md`. Amendment 3 (Part 8 deprecation,
+on PR #42) and the WS-auth wiring fix amendment (on PR #44)
+are NOT on this branch. The numbering "Amendment 5" reflects
+"next sequential slot on THIS branch's view of the file".
+
+The intended final ordering on the integration tip after all
+three PRs land is:
+- 1: Token rotation overlap (Part 3, on main already)
+- 2: Connection state machine + reconnect resilience (Part 5)
+- 3: Phase 4.0 Part 8 — Legacy REST deprecation execution (PR #42)
+- 4: Phase 4.0 Part 6 startup implementation (Part 6)
+- 5: WS upgrade auth wiring fix (PR #44, Amendment 5 on its branch)
+- 6: Client WS connection-lifecycle invariants — TD-069 (THIS PR)
+
+So at final merge time this amendment will need a single-line
+header rebase from "Amendment 5" to "Amendment 6". The body
+is independent of every prior amendment — Part 8 is
+server-side REST sunset, the WS-auth fix is server-side WS
+auth wiring, this amendment is client-side WS lifecycle —
+so the rebase is purely cosmetic on the section header.

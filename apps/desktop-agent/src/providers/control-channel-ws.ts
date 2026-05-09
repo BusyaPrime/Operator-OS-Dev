@@ -163,6 +163,19 @@ const DEFAULT_RECONNECT_BASE_MS = 1_000;
 const DEFAULT_RECONNECT_MAX_MS = 60_000;
 
 /**
+ * TD-069 layer 3 — minimum CONNECTED-state lifetime before the
+ * reconnect-backoff counter is reset. Sessions that get kicked
+ * sooner than this threshold do NOT reset the backoff, so a
+ * hypothetical kick-loop is automatically capped at the
+ * exponential-backoff envelope (1s → 2s → 4s → ... → 60s ceiling)
+ * regardless of any other lifecycle bug. 60 seconds chosen
+ * because legitimate Cloud Run idle-timeout reconnects happen
+ * on a ~5-minute cadence, so 60s is a generous "the connection
+ * actually worked" floor.
+ */
+const STABLE_CONNECTION_THRESHOLD_MS = 60_000;
+
+/**
  * Symmetric counterpart of `apps/api/src/routes/agent-ws.ts`. Connects
  * the desktop-agent to the api's control-channel WS, performs the
  * hello handshake, and dispatches inbound `task-assign` frames to the
@@ -203,6 +216,17 @@ export class ControlChannelWs {
   #queue: TaskQueue = createTaskQueue();
   #sessionId?: string;
   #reconnectTimer?: NodeJS.Timeout;
+  /**
+   * TD-069 layer 3 — defer backoff reset until the connection
+   * has held for STABLE_CONNECTION_THRESHOLD_MS. Armed in the
+   * welcome-frame handler, cleared on any close. If the
+   * connection survives long enough for the timer to fire,
+   * the backoff counter resets; if not, the backoff continues
+   * to grow exponentially. This caps any kick-loop at the
+   * exponential-backoff envelope even if defects A + B were
+   * to regress.
+   */
+  #stableConnectionTimer?: NodeJS.Timeout;
 
   constructor(options: ControlChannelWsOptions) {
     if (
@@ -278,6 +302,13 @@ export class ControlChannelWs {
     if (this.#reconnectTimer) {
       clearTimeout(this.#reconnectTimer);
       this.#reconnectTimer = undefined;
+    }
+    // TD-069 layer 3 — also clear the stable-connection timer
+    // so it can't fire after stop() and accidentally reset
+    // backoff state of a soon-to-be-restarted instance.
+    if (this.#stableConnectionTimer !== undefined) {
+      clearTimeout(this.#stableConnectionTimer);
+      this.#stableConnectionTimer = undefined;
     }
     if (this.#socket) {
       try {
@@ -405,6 +436,27 @@ export class ControlChannelWs {
     const socket = factory(this.#url, {
       authorization: `Bearer ${token}`
     });
+
+    // TD-069 layer 1, defect A — defensive prior-socket close
+    // before overwrite. The state-machine guard at the top of
+    // #connectAsync already rejects re-entry when state is in
+    // CONNECTING / CONNECTED / DEGRADED / DISCONNECTING, but we
+    // belt-and-suspenders close any prior socket reference here
+    // so a future bug elsewhere cannot leak overlapping sockets.
+    // The prior socket's lifecycle handlers are no-oped via the
+    // ownerSocket scoping introduced in defect B (commit 2.3).
+    const priorSocket = this.#socket;
+    if (priorSocket !== undefined && priorSocket !== socket) {
+      this.#logger.warn(
+        { source: 'control-channel-ws' },
+        'TD-069 defensive close — found prior #socket reference at #connect; closing it'
+      );
+      try {
+        priorSocket.close(1000, 'reconnect-supersede');
+      } catch {
+        /* prior may already be in CLOSING state — ignore */
+      }
+    }
     this.#socket = socket;
 
     // Observe the upgrade response for the rotation header.
@@ -470,7 +522,28 @@ export class ControlChannelWs {
       this.#onFrame(frame);
     });
 
+    // TD-069 layer 1, defect B — capture the owner reference
+    // so the close + error handlers attached below can no-op
+    // when they fire for a SUPERSEDED socket (one that this.#socket
+    // no longer points at). Without this scoping, a stale socket's
+    // close event nukes this.#socket = undefined for the active
+    // socket, regresses state CONNECTED → DISCONNECTED, and
+    // schedules another reconnect — producing the production
+    // kick-loop documented in TD-069.
+    const ownerSocket = socket;
+
     socket.on('close', (code: number) => {
+      // TD-069 defect B fix: stale close events from a
+      // superseded socket must NOT mutate state or schedule
+      // reconnects. Only the close of the currently-active
+      // socket drives the lifecycle.
+      if (this.#socket !== ownerSocket) {
+        this.#logger.info(
+          { source: 'control-channel-ws', code, source_marker: 'stale-socket-close-ignored' },
+          'stale socket close ignored — newer socket is active'
+        );
+        return;
+      }
       const intentional =
         this.#stateMachine.state === 'DISCONNECTING' || code === 1000;
       const category = categorizeDisconnect({
@@ -483,6 +556,16 @@ export class ControlChannelWs {
       );
       this.#socket = undefined;
       this.#sessionId = undefined;
+      // TD-069 layer 3 — clear the stable-connection timer so
+      // it can't fire and reset the backoff after the
+      // connection has already died. If the timer was about to
+      // fire, this close means the connection didn't actually
+      // hit the threshold; the backoff counter must NOT be
+      // reset.
+      if (this.#stableConnectionTimer !== undefined) {
+        clearTimeout(this.#stableConnectionTimer);
+        this.#stableConnectionTimer = undefined;
+      }
       // 4001 = unauthorized per agent-ws.ts close-code map.
       // We treat that as a fatal auth event and bubble it
       // up. The subsequent reconnect scheduling is suppressed
@@ -517,6 +600,21 @@ export class ControlChannelWs {
     });
 
     socket.on('error', (err: Error) => {
+      // TD-069 defect B fix: stale errors from a superseded
+      // socket must NOT propagate as auth events or drive
+      // state transitions. Only the active socket's errors
+      // can flip the state machine to REVOKED.
+      if (this.#socket !== ownerSocket) {
+        this.#logger.warn(
+          {
+            err,
+            source: 'control-channel-ws',
+            source_marker: 'stale-socket-error-ignored'
+          },
+          'stale socket error ignored — newer socket is active'
+        );
+        return;
+      }
       const category = categorizeDisconnect({
         error: err as Error & { code?: string }
       });
@@ -601,7 +699,32 @@ export class ControlChannelWs {
         const welcome = typed as { sessionId?: string };
         if (typeof welcome.sessionId === 'string') {
           this.#sessionId = welcome.sessionId;
-          this.#backoff.reset();
+          // TD-069 layer 3 — defer backoff reset until the
+          // connection has held for STABLE_CONNECTION_THRESHOLD_MS.
+          // Sessions kicked sooner than the threshold (e.g. a
+          // duplicate-agent 4004 within 2 seconds of welcome)
+          // do NOT reset the backoff counter — the next reconnect
+          // attempt then progresses to the next exponential
+          // bucket (1s → 2s → 4s ...). This caps any kick-loop
+          // at the backoff envelope even if defects A + B were
+          // to regress.
+          if (this.#stableConnectionTimer !== undefined) {
+            clearTimeout(this.#stableConnectionTimer);
+          }
+          this.#stableConnectionTimer = setTimeout(() => {
+            this.#stableConnectionTimer = undefined;
+            const state = this.#stateMachine.state;
+            if (state === 'CONNECTED' || state === 'DEGRADED') {
+              this.#backoff.reset();
+              this.#logger.debug(
+                { source: 'control-channel-ws' },
+                'connection stable past threshold — backoff reset'
+              );
+            }
+          }, STABLE_CONNECTION_THRESHOLD_MS);
+          if (typeof this.#stableConnectionTimer.unref === 'function') {
+            this.#stableConnectionTimer.unref();
+          }
           this.#stateMachine.request({
             to: 'CONNECTED',
             reason: 'welcome-frame',
